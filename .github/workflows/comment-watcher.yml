@@ -2,8 +2,7 @@ name: Comment Watcher
 
 on:
   schedule:
-    # Poll every minute
-    - cron: '* * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       since_hours:
