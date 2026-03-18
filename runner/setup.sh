@@ -57,7 +57,7 @@ BUILDDIR=$(mktemp -d)
 echo "==> Building in ${BUILDDIR}..."
 
 cat > "${BUILDDIR}/Dockerfile" << 'DOCKERFILE'
-FROM ubuntu:24.04
+FROM python:3.12-slim
 
 ARG RUNNER_VERSION=2.323.0
 ARG TARGETARCH=x64
@@ -65,10 +65,10 @@ ARG TARGETARCH=x64
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates git jq \
-    python3 python3-venv python3-pip \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
+    curl ca-certificates git jq libicu-dev \
     && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir anthropic httpx requests
 
 RUN useradd -m runner
 
@@ -77,11 +77,7 @@ WORKDIR /home/runner/actions-runner
 RUN curl -fsSL \
     "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${TARGETARCH}-${RUNNER_VERSION}.tar.gz" \
     | tar xz \
-    && ./bin/installdependencies.sh \
     && chown -R runner:runner /home/runner
-
-RUN pip install --no-cache-dir --break-system-packages \
-    anthropic httpx requests
 
 USER runner
 
