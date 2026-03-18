@@ -27,7 +27,7 @@ Runs entirely from a **separate personal repo** using GitHub Actions + GitHub RE
 | CI Failure Monitor | `monitor_ci.py` | Cron (every 8h) or manual | Monitors nightly CI workflows, analyzes failures with progressive step-by-step analysis, posts daily issue reports |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Fetches PR diff, sends to Claude for structured code review, posts as PR comment |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI checks for a PR, downloads failure logs, analyzes with Claude |
-| Comment Watcher | `watch_comments.py` | Cron (every 15min) | Polls sglang PRs for `@amd-bot` commands, dispatches the appropriate action |
+| Comment Watcher | `watch_comments.py` | Cron (every 5min) | Polls sglang PRs for `@amd-bot` commands, dispatches the appropriate action |
 
 ---
 
@@ -129,6 +129,9 @@ python scripts/monitor_ci.py --output daily-issue --bot-repo user/sglang-ci-bot 
 # Monitor specific workflows only
 python scripts/monitor_ci.py --output stdout --workflows nightly-test-amd.yml amd-aiter-scout.yml
 
+# Only analyze a specific job by name
+python scripts/monitor_ci.py --output stdout --job-name nightly-8-gpu-grok2
+
 # Save to a local file for review
 python scripts/monitor_ci.py --output stdout --hours-back 48 2>&1 | tee report.md
 ```
@@ -140,6 +143,7 @@ python scripts/monitor_ci.py --output stdout --hours-back 48 2>&1 | tee report.m
 | `--output` | `stdout` | Output mode: `stdout` or `daily-issue` |
 | `--hours-back` | `24` | How many hours back to search for failures |
 | `--workflows` | (all monitored) | Space-separated list of workflow files to check |
+| `--job-name` | (none) | Only analyze jobs whose name contains this string |
 | `--bot-repo` | (none) | Bot repo for posting issues (required for `daily-issue` mode) |
 | `--github-token` | `$GH_PAT` | GitHub token (can also set via env var) |
 
@@ -269,7 +273,7 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 
 **Script**: `scripts/watch_comments.py`
 **Workflow**: `.github/workflows/comment-watcher.yml`
-**Schedule**: Every 15 minutes
+**Schedule**: Every 5 minutes
 
 ### What it does
 
@@ -291,7 +295,7 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 
 ### How to use
 
-The comment watcher runs automatically every 15 minutes. To trigger manually:
+The comment watcher runs automatically every 5 minutes. To trigger manually:
 
 ```bash
 # Check comments from the last 1 hour
@@ -382,7 +386,7 @@ sglang-ci-bot/
     ci-monitor.yml         Scheduled CI monitor (cron every 8h)
     ci-status-check.yml    PR CI check (triggered by repository_dispatch)
     pr-review.yml          PR review (triggered by repository_dispatch)
-    comment-watcher.yml    Comment poller (cron every 15min)
+    comment-watcher.yml    Comment poller (cron every 5min)
   runner/
     Dockerfile             Self-hosted runner Docker image
     setup.sh               Runner registration and setup
@@ -437,7 +441,7 @@ AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai"]
 Edit the `cron` expressions in the workflow files:
 
 - `ci-monitor.yml`: `'0 0,8,16 * * *'` (every 8 hours)
-- `comment-watcher.yml`: `'* * * * *'` (every minute)
+- `comment-watcher.yml`: `'*/5 * * * *'` (every 5 minutes)
 
 ### Pre-filter Threshold
 
