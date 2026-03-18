@@ -2,9 +2,8 @@
 # One-command setup for amd-bot self-hosted GitHub Actions runner.
 #
 # Usage:
-#   curl -fsSL <raw-url>/runner/setup.sh | bash -s -- --pat <GH_PAT>
-#   OR
-#   bash setup.sh --pat <GH_PAT> [--name <runner-name>] [--repo <owner/repo>]
+#   git clone https://github.com/bingxche/sglang-ci-bot.git
+#   bash sglang-ci-bot/runner/setup.sh --pat <GH_PAT> [--name <runner-name>]
 set -euo pipefail
 
 REPO="bingxche/sglang-ci-bot"
