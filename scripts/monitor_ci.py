@@ -480,6 +480,7 @@ def monitor_workflow(
     workflow_file: str,
     hours_back: int = 24,
     processed_run_ids: set[int] | None = None,
+    job_name_filter: str | None = None,
 ) -> tuple[str | None, list[int]]:
     """Monitor a single workflow. Returns (report_body | None, new_run_ids)."""
     print(f"\n{'='*60}")
@@ -512,6 +513,12 @@ def monitor_workflow(
         if not failed_jobs:
             print("    No failed jobs (run may have been retried)")
             continue
+
+        if job_name_filter:
+            failed_jobs = [j for j in failed_jobs if job_name_filter in j["name"]]
+            if not failed_jobs:
+                print(f"    No jobs matching '{job_name_filter}'")
+                continue
 
         for job in failed_jobs:
             job_name = job["name"]
@@ -623,6 +630,10 @@ def main():
         help="Bot repo for posting issues (e.g. 'user/sglang-ci-bot')",
     )
     parser.add_argument(
+        "--job-name",
+        help="Only analyze jobs whose name contains this string",
+    )
+    parser.add_argument(
         "--github-token",
         default=os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")),
         help="GitHub token",
@@ -652,6 +663,7 @@ def main():
                 wf,
                 hours_back=args.hours_back,
                 processed_run_ids=processed_run_ids,
+                job_name_filter=args.job_name,
             )
             processed_run_ids.update(new_ids)
             if body:
