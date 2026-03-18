@@ -123,7 +123,16 @@ def analyze_failures_with_claude(
 ) -> str:
     """Send failure info to Claude for analysis."""
     base_url = os.environ.get("ANTHROPIC_BASE_URL")
-    client = anthropic.Anthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
+    apim_key = os.environ.get("APIM_SUBSCRIPTION_KEY")
+    kwargs = {}
+    if base_url:
+        kwargs["base_url"] = base_url
+    if apim_key:
+        kwargs["api_key"] = "dummy"
+        kwargs["default_headers"] = {"Ocp-Apim-Subscription-Key": apim_key}
+    else:
+        kwargs["api_key"] = api_key
+    client = anthropic.Anthropic(**kwargs)
 
     failure_details = []
     for f in failures:
