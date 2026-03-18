@@ -39,6 +39,8 @@ def _create_anthropic_client(api_key: str) -> anthropic.Anthropic:
         )
 
     return anthropic.Anthropic(api_key=api_key)
+
+
 MAX_LOG_CHARS = 60000
 
 
@@ -214,7 +216,8 @@ def main():
     )
     parser.add_argument(
         "--anthropic-key",
-        default=os.environ.get("ANTHROPIC_API_KEY", ""),
+        default=os.environ.get("ANTHROPIC_API_KEY", "")
+                or os.environ.get("LLM_GATEWAY_KEY", ""),
     )
 
     args = parser.parse_args()
@@ -222,8 +225,8 @@ def main():
     if not args.github_token:
         print("Error: GitHub token required.", file=sys.stderr)
         sys.exit(1)
-    if not args.anthropic_key:
-        print("Error: Anthropic API key required.", file=sys.stderr)
+    if not args.anthropic_key and not os.environ.get("LLM_GATEWAY_KEY"):
+        print("Error: API key required. Set ANTHROPIC_API_KEY or LLM_GATEWAY_KEY.", file=sys.stderr)
         sys.exit(1)
 
     check_ci_for_pr(

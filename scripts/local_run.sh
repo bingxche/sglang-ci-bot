@@ -16,16 +16,27 @@ source "$VENV_DIR/bin/activate"
 
 # AMD Gateway config
 export ANTHROPIC_BASE_URL="https://llm-api.amd.com/Anthropic"
-export LLM_GATEWAY_KEY="1101fd81e54947c8a6b71fbf400b419e"
+export LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY:-}"
 export GH_PAT="${GH_PAT:-}"
 
-# Read GH_PAT from file if not in env
+# Read secrets from files if not in env
+if [ -z "$LLM_GATEWAY_KEY" ] && [ -f "$PROJECT_DIR/.secrets/llm_gateway_key" ]; then
+    export LLM_GATEWAY_KEY="$(cat "$PROJECT_DIR/.secrets/llm_gateway_key")"
+fi
 if [ -z "$GH_PAT" ] && [ -f "$PROJECT_DIR/.secrets/gh_pat" ]; then
     export GH_PAT="$(cat "$PROJECT_DIR/.secrets/gh_pat")"
 fi
 
+if [ -z "$LLM_GATEWAY_KEY" ]; then
+    echo "ERROR: LLM_GATEWAY_KEY not set."
+    echo "  Run: echo 'your_key' > $PROJECT_DIR/.secrets/llm_gateway_key"
+    echo "  Or:  export LLM_GATEWAY_KEY='your_key'"
+    exit 1
+fi
 if [ -z "$GH_PAT" ]; then
-    echo "ERROR: GH_PAT not set. Run: echo 'your_token' > $PROJECT_DIR/.secrets/gh_pat"
+    echo "ERROR: GH_PAT not set."
+    echo "  Run: echo 'your_token' > $PROJECT_DIR/.secrets/gh_pat"
+    echo "  Or:  export GH_PAT='your_token'"
     exit 1
 fi
 

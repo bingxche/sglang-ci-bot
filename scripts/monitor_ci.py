@@ -363,8 +363,9 @@ def main():
     )
     parser.add_argument(
         "--anthropic-key",
-        default=os.environ.get("ANTHROPIC_API_KEY", ""),
-        help="Anthropic API key",
+        default=os.environ.get("ANTHROPIC_API_KEY", "")
+                or os.environ.get("LLM_GATEWAY_KEY", ""),
+        help="Anthropic API key (or LLM_GATEWAY_KEY for AMD gateway)",
     )
 
     args = parser.parse_args()
@@ -372,8 +373,8 @@ def main():
     if not args.github_token:
         print("Error: GitHub token required. Set GH_PAT or GITHUB_TOKEN env var.", file=sys.stderr)
         sys.exit(1)
-    if not args.anthropic_key:
-        print("Error: Anthropic API key required. Set ANTHROPIC_API_KEY env var.", file=sys.stderr)
+    if not args.anthropic_key and not os.environ.get("LLM_GATEWAY_KEY"):
+        print("Error: API key required. Set ANTHROPIC_API_KEY or LLM_GATEWAY_KEY env var.", file=sys.stderr)
         sys.exit(1)
 
     results = []
