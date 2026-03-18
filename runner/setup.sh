@@ -1,29 +1,44 @@
 #!/bin/bash
-# One-command setup for amd-bot self-hosted GitHub Actions runner.
+# One-command setup for sglang-ci-bot self-hosted GitHub Actions runner.
 #
 # Usage:
-#   git clone https://github.com/bingxche/sglang-ci-bot.git
-#   bash sglang-ci-bot/runner/setup.sh --pat <GH_PAT> [--name <runner-name>]
+#   bash setup.sh --pat <GH_PAT> [--name <runner-name>] [--image <dockerhub-image>] [--build]
+#
+# Examples:
+#   # First time: build locally
+#   bash setup.sh --pat ghp_xxxx --build
+#
+#   # Push to Docker Hub after build (manual):
+#   docker tag sglang-ci-runner:latest bingxche/sglang-ci-runner:latest
+#   docker push bingxche/sglang-ci-runner:latest
+#
+#   # Other machines: pull from Docker Hub (no build needed)
+#   bash setup.sh --pat ghp_xxxx --image bingxche/sglang-ci-runner:latest
 set -euo pipefail
 
 REPO="bingxche/sglang-ci-bot"
 RUNNER_NAME="amd-ci-runner"
 GH_PAT=""
 RUNNER_VERSION="2.323.0"
+IMAGE=""
+FORCE_BUILD=false
 MIN_DISK_MB=3000
+LOCAL_TAG="sglang-ci-runner:latest"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --pat)  GH_PAT="$2"; shift 2 ;;
-        --name) RUNNER_NAME="$2"; shift 2 ;;
-        --repo) REPO="$2"; shift 2 ;;
-        *)      echo "Unknown option: $1"; exit 1 ;;
+        --pat)   GH_PAT="$2"; shift 2 ;;
+        --name)  RUNNER_NAME="$2"; shift 2 ;;
+        --repo)  REPO="$2"; shift 2 ;;
+        --image) IMAGE="$2"; shift 2 ;;
+        --build) FORCE_BUILD=true; shift ;;
+        *)       echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
 if [ -z "$GH_PAT" ]; then
     echo "ERROR: --pat <GH_PAT> is required"
-    echo "Usage: bash setup.sh --pat ghp_xxxx [--name my-runner] [--repo owner/repo]"
+    echo "Usage: bash setup.sh --pat ghp_xxxx [--name my-runner] [--image user/repo:tag] [--build]"
     exit 1
 fi
 
@@ -53,40 +68,54 @@ if [ "$HTTP_CODE" != "200" ]; then
 fi
 echo "    Token verified."
 
-BUILDDIR=$(mktemp -d)
-echo "==> Building in ${BUILDDIR}..."
+# --- Get the image: pull from registry or build locally ---
+RUN_IMAGE="${LOCAL_TAG}"
 
-cat > "${BUILDDIR}/Dockerfile" << 'DOCKERFILE'
+if [ -n "$IMAGE" ] && [ "$FORCE_BUILD" = false ]; then
+    echo "==> Pulling image ${IMAGE}..."
+    if docker pull "$IMAGE"; then
+        docker tag "$IMAGE" "$LOCAL_TAG"
+        RUN_IMAGE="${LOCAL_TAG}"
+        echo "    Pull succeeded."
+    else
+        echo "    Pull failed, falling back to local build..."
+        FORCE_BUILD=true
+    fi
+else
+    FORCE_BUILD=true
+fi
+
+if [ "$FORCE_BUILD" = true ]; then
+    BUILDDIR=$(mktemp -d)
+    trap "rm -rf ${BUILDDIR}" EXIT
+
+    cat > "${BUILDDIR}/Dockerfile" << 'DOCKERFILE'
 FROM python:3.12-slim
 
 ARG RUNNER_VERSION=2.323.0
 ARG TARGETARCH=x64
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates git jq libicu-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir anthropic httpx requests
-
-RUN useradd -m runner
-
-WORKDIR /home/runner/actions-runner
-
-RUN curl -fsSL \
-    "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${TARGETARCH}-${RUNNER_VERSION}.tar.gz" \
-    | tar xz \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates git jq \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir anthropic httpx requests \
+    && useradd -m runner \
+    && mkdir -p /home/runner/actions-runner \
+    && curl -fsSL \
+       "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${TARGETARCH}-${RUNNER_VERSION}.tar.gz" \
+       | tar xz -C /home/runner/actions-runner \
     && chown -R runner:runner /home/runner
 
+WORKDIR /home/runner/actions-runner
 USER runner
-
 COPY entrypoint.sh /entrypoint.sh
-
 ENTRYPOINT ["/entrypoint.sh"]
 DOCKERFILE
 
-cat > "${BUILDDIR}/entrypoint.sh" << 'ENTRYPOINT'
+    cat > "${BUILDDIR}/entrypoint.sh" << 'ENTRYPOINT'
 #!/bin/bash
 set -euo pipefail
 
@@ -132,14 +161,19 @@ trap cleanup EXIT SIGTERM SIGINT
 
 exec ./run.sh
 ENTRYPOINT
-chmod +x "${BUILDDIR}/entrypoint.sh"
+    chmod +x "${BUILDDIR}/entrypoint.sh"
 
-echo "==> Building Docker image..."
-docker build -t sglang-ci-runner:latest \
-    --build-arg RUNNER_VERSION="${RUNNER_VERSION}" \
-    "${BUILDDIR}"
+    echo "==> Building Docker image..."
+    docker build -t "${LOCAL_TAG}" \
+        --build-arg RUNNER_VERSION="${RUNNER_VERSION}" \
+        "${BUILDDIR}"
 
-rm -rf "${BUILDDIR}"
+    echo ""
+    echo "    TIP: Push to Docker Hub to skip builds on other machines:"
+    echo "      docker tag ${LOCAL_TAG} <your-dockerhub-user>/sglang-ci-runner:latest"
+    echo "      docker push <your-dockerhub-user>/sglang-ci-runner:latest"
+    echo ""
+fi
 
 echo "==> Stopping old container (if any)..."
 docker rm -f sglang-ci-runner 2>/dev/null || true
@@ -149,14 +183,14 @@ docker run -d \
     --name sglang-ci-runner \
     --restart unless-stopped \
     --log-driver json-file \
-    --log-opt max-size=50m \
-    --log-opt max-file=3 \
+    --log-opt max-size=100m \
+    --log-opt max-file=100 \
     -v sglang-runner-toolcache:/home/runner/actions-runner/_tool \
     -e REPO_URL="https://github.com/${REPO}" \
     -e GH_PAT="${GH_PAT}" \
     -e RUNNER_NAME="${RUNNER_NAME}" \
     -e LABELS="self-hosted,amd-internal" \
-    sglang-ci-runner:latest
+    "${RUN_IMAGE}"
 
 echo ""
 echo "============================================"
@@ -166,8 +200,7 @@ echo "  Container : sglang-ci-runner"
 echo "  Runner    : ${RUNNER_NAME}"
 echo "  Repo      : ${REPO}"
 echo "  Labels    : self-hosted, amd-internal"
-echo "  Log limit : 50MB x 3 files"
-echo "  Tool cache: docker volume 'sglang-runner-toolcache'"
+echo "  Log limit : 100MB x 100 files (10GB max)"
 echo ""
 echo "  View logs : docker logs -f sglang-ci-runner"
 echo "  Stop      : docker stop sglang-ci-runner"
