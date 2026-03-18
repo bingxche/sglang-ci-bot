@@ -1,0 +1,55 @@
+name: Comment Watcher
+
+on:
+  schedule:
+    # Poll every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      since_hours:
+        description: 'Hours to look back for comments'
+        required: false
+        default: '1'
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: .state/
+          key: comment-watcher-state-${{ github.run_id }}
+          restore-keys: |
+            comment-watcher-state-
+
+      - name: Watch for commands
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          HOURS="${{ github.event.inputs.since_hours || '1' }}"
+          python scripts/watch_comments.py \
+            --bot-repo "${{ github.repository }}" \
+            --since-hours "$HOURS"
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state/
+          key: comment-watcher-state-${{ github.run_id }}

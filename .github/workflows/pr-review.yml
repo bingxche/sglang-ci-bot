@@ -1,0 +1,72 @@
+name: PR Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: number
+      focus:
+        description: 'Specific areas to focus on (optional)'
+        required: false
+        default: ''
+      no_post:
+        description: 'Print to stdout only (do not post comment)'
+        required: false
+        default: 'false'
+        type: boolean
+
+  repository_dispatch:
+    types: [pr-review]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
+            echo "focus=${{ github.event.client_payload.focus }}" >> $GITHUB_OUTPUT
+            echo "no_post=false" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+            echo "focus=${{ github.event.inputs.focus }}" >> $GITHUB_OUTPUT
+            echo "no_post=${{ github.event.inputs.no_post }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Review PR
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          ARGS="${{ steps.pr.outputs.number }}"
+
+          FOCUS="${{ steps.pr.outputs.focus }}"
+          if [ -n "$FOCUS" ]; then
+            ARGS="$ARGS --focus \"$FOCUS\""
+          fi
+
+          NO_POST="${{ steps.pr.outputs.no_post }}"
+          if [ "$NO_POST" = "true" ]; then
+            ARGS="$ARGS --no-post"
+          fi
+
+          eval python scripts/review_pr.py $ARGS

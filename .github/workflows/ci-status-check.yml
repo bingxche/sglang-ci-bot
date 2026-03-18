@@ -1,0 +1,44 @@
+name: CI Status Check
+
+on:
+  repository_dispatch:
+    types: [ci-status]
+
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to check CI status'
+        required: true
+        type: number
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check CI Status
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/check_ci_for_pr.py ${{ steps.pr.outputs.number }}

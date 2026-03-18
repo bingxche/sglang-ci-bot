@@ -1,0 +1,63 @@
+name: CI Failure Monitor
+
+on:
+  schedule:
+    # Run every 8 hours
+    - cron: '0 0,8,16 * * *'
+  workflow_dispatch:
+    inputs:
+      hours_back:
+        description: 'Hours to look back for failures'
+        required: false
+        default: '24'
+      workflows:
+        description: 'Comma-separated workflow files to monitor (empty = all defaults)'
+        required: false
+        default: ''
+      output_mode:
+        description: 'Output mode'
+        required: false
+        default: 'issue'
+        type: choice
+        options:
+          - issue
+          - comment
+          - stdout
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run CI Monitor
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          HOURS="${{ github.event.inputs.hours_back || '24' }}"
+          OUTPUT="${{ github.event.inputs.output_mode || 'issue' }}"
+          WORKFLOWS="${{ github.event.inputs.workflows }}"
+
+          ARGS="--hours-back $HOURS --output $OUTPUT --bot-repo ${{ github.repository }}"
+
+          if [ -n "$WORKFLOWS" ]; then
+            IFS=',' read -ra WF_ARRAY <<< "$WORKFLOWS"
+            ARGS="$ARGS --workflows ${WF_ARRAY[*]}"
+          fi
+
+          python scripts/monitor_ci.py $ARGS
