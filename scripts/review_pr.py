@@ -7,7 +7,6 @@ and posts the review as a PR comment.
 """
 
 import argparse
-import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -21,30 +20,28 @@ REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
 CLAUDE_MODEL = "claude-opus-4-6"
 
+MAX_DIFF_CHARS = 120000
 
-def _create_anthropic_client(api_key: str) -> anthropic.Anthropic:
-    """Create Anthropic client, supporting AMD LLM Gateway (Azure APIM) or direct API."""
-    gateway_key = os.environ.get("LLM_GATEWAY_KEY") or os.environ.get("APIM_SUBSCRIPTION_KEY")
-    base_url = os.environ.get("ANTHROPIC_BASE_URL")
 
-    if gateway_key and base_url:
-        import getpass
-        headers = {
-            "Ocp-Apim-Subscription-Key": gateway_key,
+def _create_anthropic_client() -> anthropic.Anthropic:
+    """Create Anthropic client via AMD LLM Gateway.
+
+    Env vars:
+      - LLM_GATEWAY_KEY (required) — gateway subscription key
+      - LLM_GATEWAY_URL (required) — gateway endpoint
+    """
+    import getpass
+
+    return anthropic.Anthropic(
+        base_url=os.environ["LLM_GATEWAY_URL"],
+        api_key="dummy",
+        http_client=httpx.Client(verify=False),
+        default_headers={
+            "Ocp-Apim-Subscription-Key": os.environ["LLM_GATEWAY_KEY"],
             "user": getpass.getuser(),
             "anthropic-version": "vertex-2023-10-16",
-        }
-        return anthropic.Anthropic(
-            base_url=base_url,
-            api_key="dummy",
-            http_client=httpx.Client(verify=False),
-            default_headers=headers,
-        )
-
-    return anthropic.Anthropic(api_key=api_key)
-
-
-MAX_DIFF_CHARS = 120000
+        },
+    )
 
 
 def gh_headers(token: str) -> dict:
@@ -112,7 +109,6 @@ def get_file_content(token: str, path: str, ref: str) -> str | None:
 
 
 def review_pr_with_claude(
-    api_key: str,
     pr_info: dict,
     diff: str,
     files: list[dict],
@@ -120,7 +116,7 @@ def review_pr_with_claude(
     review_context: str | None = None,
 ) -> str:
     """Send PR info to Claude for review."""
-    client = _create_anthropic_client(api_key)
+    client = _create_anthropic_client()
 
     files_summary = "\n".join(
         f"- `{f['filename']}` (+{f['additions']}/-{f['deletions']}, {f['status']})"
@@ -188,7 +184,6 @@ def post_pr_review_comment(token: str, pr_number: int, body: str) -> dict:
 
 def review_pr(
     token: str,
-    anthropic_key: str,
     pr_number: int,
     focus_areas: str | None = None,
     review_context: str | None = None,
@@ -209,9 +204,7 @@ def review_pr(
     print(f"  Files changed: {len(files)}")
 
     print("  Sending to Claude for review...")
-    review = review_pr_with_claude(
-        anthropic_key, pr_info, diff, files, focus_areas, review_context
-    )
+    review = review_pr_with_claude(pr_info, diff, files, focus_areas, review_context)
 
     requester_line = ""
     if comment_author:
@@ -257,24 +250,21 @@ def main():
         "--github-token",
         default=os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")),
     )
-    parser.add_argument(
-        "--anthropic-key",
-        default=os.environ.get("ANTHROPIC_API_KEY", "")
-                or os.environ.get("LLM_GATEWAY_KEY", ""),
-    )
 
     args = parser.parse_args()
 
     if not args.github_token:
-        print("Error: GitHub token required.", file=sys.stderr)
+        print("Error: GitHub token required. Set GH_PAT.", file=sys.stderr)
         sys.exit(1)
-    if not args.anthropic_key and not os.environ.get("LLM_GATEWAY_KEY"):
-        print("Error: API key required. Set ANTHROPIC_API_KEY or LLM_GATEWAY_KEY.", file=sys.stderr)
+    if not os.environ.get("LLM_GATEWAY_KEY"):
+        print("Error: LLM_GATEWAY_KEY env var required.", file=sys.stderr)
+        sys.exit(1)
+    if not os.environ.get("LLM_GATEWAY_URL"):
+        print("Error: LLM_GATEWAY_URL env var required.", file=sys.stderr)
         sys.exit(1)
 
     review_pr(
         args.github_token,
-        args.anthropic_key,
         args.pr_number,
         focus_areas=args.focus,
         review_context=args.context,

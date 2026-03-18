@@ -42,7 +42,7 @@ jobs:
       - name: Check CI Status
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
-          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
-          LLM_GATEWAY_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
+          LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
           COMMENT_AUTHOR: ${{ steps.pr.outputs.comment_author }}
         run: python scripts/check_ci_for_pr.py ${{ steps.pr.outputs.number }}

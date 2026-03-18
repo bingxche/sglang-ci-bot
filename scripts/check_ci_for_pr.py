@@ -19,29 +19,25 @@ REPO = f"{REPO_OWNER}/{REPO_NAME}"
 CLAUDE_MODEL = "claude-opus-4-6"
 
 
-def _create_anthropic_client(api_key: str) -> anthropic.Anthropic:
-    """Create Anthropic client, supporting AMD LLM Gateway (Azure APIM) or direct API."""
-    gateway_key = os.environ.get("LLM_GATEWAY_KEY") or os.environ.get("APIM_SUBSCRIPTION_KEY")
-    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+def _create_anthropic_client() -> anthropic.Anthropic:
+    """Create Anthropic client via AMD LLM Gateway.
 
-    if gateway_key and base_url:
-        import getpass
-        headers = {
-            "Ocp-Apim-Subscription-Key": gateway_key,
+    Env vars:
+      - LLM_GATEWAY_KEY (required) — gateway subscription key
+      - LLM_GATEWAY_URL (required) — gateway endpoint
+    """
+    import getpass
+
+    return anthropic.Anthropic(
+        base_url=os.environ["LLM_GATEWAY_URL"],
+        api_key="dummy",
+        http_client=httpx.Client(verify=False),
+        default_headers={
+            "Ocp-Apim-Subscription-Key": os.environ["LLM_GATEWAY_KEY"],
             "user": getpass.getuser(),
             "anthropic-version": "vertex-2023-10-16",
-        }
-        return anthropic.Anthropic(
-            base_url=base_url,
-            api_key="dummy",
-            http_client=httpx.Client(verify=False),
-            default_headers=headers,
-        )
-
-    return anthropic.Anthropic(api_key=api_key)
-
-
-MAX_LOG_CHARS = 60000
+        },
+    )
 
 
 def gh_headers(token: str) -> dict:
@@ -79,35 +75,17 @@ def get_pr_statuses(token: str, pr_number: int) -> list[dict]:
 
 
 def download_job_logs(token: str, job_id: int) -> str:
-    """Download logs for a job."""
+    """Download full logs for a job — no truncation."""
     url = f"https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs"
     resp = requests.get(url, headers=gh_headers(token), allow_redirects=True)
     if resp.status_code == 200:
-        text = resp.text
-        if len(text) > MAX_LOG_CHARS:
-            head = text[:MAX_LOG_CHARS // 5]
-            tail = text[-(MAX_LOG_CHARS - MAX_LOG_CHARS // 5 - 200):]
-            return head + "\n\n... [TRUNCATED] ...\n\n" + tail
-        return text
+        return resp.text
     return f"[Could not fetch logs: HTTP {resp.status_code}]"
 
 
-def find_workflow_run_for_check(token: str, check_run: dict) -> int | None:
-    """Try to find the workflow run ID from a check run."""
-    details_url = check_run.get("details_url", "")
-    if "/runs/" in details_url:
-        import re
-        m = re.search(r"/runs/(\d+)", details_url)
-        if m:
-            return int(m.group(1))
-    return None
-
-
-def analyze_ci_with_claude(
-    api_key: str, pr_number: int, checks_summary: str, failure_logs: str
-) -> str:
+def analyze_ci_with_claude(pr_number: int, checks_summary: str, failure_logs: str) -> str:
     """Ask Claude to summarize CI status."""
-    client = _create_anthropic_client(api_key)
+    client = _create_anthropic_client()
 
     prompt = f"""You are a CI/CD expert analyzing the CI status for PR #{pr_number} in the sglang project.
 
@@ -136,7 +114,6 @@ Format as clear Markdown for a GitHub comment."""
 
 def check_ci_for_pr(
     token: str,
-    anthropic_key: str,
     pr_number: int,
     post_comment: bool = True,
 ) -> str:
@@ -150,7 +127,6 @@ def check_ci_for_pr(
     passed = [c for c in checks if c.get("conclusion") == "success"]
     failed = [c for c in checks if c.get("conclusion") == "failure"]
     pending = [c for c in checks if c.get("status") == "in_progress" or c.get("conclusion") is None]
-    other = [c for c in checks if c not in passed and c not in failed and c not in pending]
 
     checks_summary = f"Total: {len(checks)} checks\n"
     checks_summary += f"- Passed: {len(passed)}\n"
@@ -182,9 +158,7 @@ def check_ci_for_pr(
         body += "\n\n---\n*Automated check by amd-bot*"
     else:
         print("  Analyzing failures with Claude...")
-        analysis = analyze_ci_with_claude(
-            anthropic_key, pr_number, checks_summary, failure_logs
-        )
+        analysis = analyze_ci_with_claude(pr_number, checks_summary, failure_logs)
         body = f"""{requester_line}## CI Status for PR #{pr_number}
 
 {checks_summary}
@@ -219,24 +193,21 @@ def main():
         "--github-token",
         default=os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")),
     )
-    parser.add_argument(
-        "--anthropic-key",
-        default=os.environ.get("ANTHROPIC_API_KEY", "")
-                or os.environ.get("LLM_GATEWAY_KEY", ""),
-    )
 
     args = parser.parse_args()
 
     if not args.github_token:
-        print("Error: GitHub token required.", file=sys.stderr)
+        print("Error: GitHub token required. Set GH_PAT.", file=sys.stderr)
         sys.exit(1)
-    if not args.anthropic_key and not os.environ.get("LLM_GATEWAY_KEY"):
-        print("Error: API key required. Set ANTHROPIC_API_KEY or LLM_GATEWAY_KEY.", file=sys.stderr)
+    if not os.environ.get("LLM_GATEWAY_KEY"):
+        print("Error: LLM_GATEWAY_KEY env var required.", file=sys.stderr)
+        sys.exit(1)
+    if not os.environ.get("LLM_GATEWAY_URL"):
+        print("Error: LLM_GATEWAY_URL env var required.", file=sys.stderr)
         sys.exit(1)
 
     check_ci_for_pr(
         args.github_token,
-        args.anthropic_key,
         args.pr_number,
         post_comment=not args.no_post,
     )

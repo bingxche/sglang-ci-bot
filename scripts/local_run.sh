@@ -14,8 +14,8 @@ mkdir -p "$LOG_DIR"
 # Activate venv
 source "$VENV_DIR/bin/activate"
 
-# AMD Gateway config
-export ANTHROPIC_BASE_URL="https://llm-api.amd.com/Anthropic"
+# AMD LLM Gateway config
+export LLM_GATEWAY_URL="${LLM_GATEWAY_URL:-https://llm-api.amd.com/Anthropic}"
 export LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY:-}"
 export GH_PAT="${GH_PAT:-}"
 
@@ -46,7 +46,7 @@ case "${1:-help}" in
     monitor)
         echo "[$(date)] Running CI monitor..."
         python "$SCRIPT_DIR/monitor_ci.py" \
-            --output "${2:-issue}" \
+            --output "${2:-stdout}" \
             --bot-repo "${BOT_REPO:-bingxche/sglang-ci-bot}" \
             --hours-back "${3:-24}" \
             2>&1 | tee "$LOG_DIR/monitor_${TIMESTAMP}.log"
@@ -82,13 +82,13 @@ case "${1:-help}" in
         echo "Usage: $0 <command> [args]"
         echo ""
         echo "Commands:"
-        echo "  monitor [output_mode] [hours_back]  - Monitor CI failures (default: issue, 24h)"
+        echo "  monitor [output_mode] [hours_back]  - Monitor CI failures (default: stdout, 24h)"
         echo "  review <pr_number> [focus]           - Review a PR"
         echo "  ci-status <pr_number>                - Check CI status for a PR"
         echo "  watch [hours_back]                   - Watch for bot commands in comments"
         echo ""
         echo "Examples:"
-        echo "  $0 monitor                    # Monitor last 24h, create issues"
+        echo "  $0 monitor                    # Monitor last 24h, print to stdout"
         echo "  $0 monitor stdout 48          # Monitor last 48h, print to terminal"
         echo "  $0 review 1234                # Review PR #1234"
         echo "  $0 review 1234 'AMD ROCm'     # Review with focus area"
