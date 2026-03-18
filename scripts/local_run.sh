@@ -1,5 +1,5 @@
 #!/bin/bash
-# Local runner for sglang-ci-bot
+# Local runner for amd-bot
 # Sets up environment and runs the specified script
 
 set -euo pipefail

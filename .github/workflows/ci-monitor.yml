@@ -26,7 +26,7 @@ on:
 
 jobs:
   monitor:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, amd-internal]
     permissions:
       issues: write
       contents: read
@@ -43,6 +43,14 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: .state/
+          key: ci-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            ci-monitor-state-
 
       - name: Run CI Monitor
         env:
@@ -62,3 +70,10 @@ jobs:
           fi
 
           python scripts/monitor_ci.py $ARGS
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state/
+          key: ci-monitor-state-${{ github.run_id }}

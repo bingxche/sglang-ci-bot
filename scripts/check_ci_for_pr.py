@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Check CI status for a specific PR and summarize failures.
+amd-bot CI status checker for a specific PR.
 Triggered via repository_dispatch from the comment watcher.
 """
 
@@ -141,6 +141,7 @@ def check_ci_for_pr(
     post_comment: bool = True,
 ) -> str:
     """Main function to check CI and summarize."""
+    comment_author = os.environ.get("COMMENT_AUTHOR", "")
     print(f"Checking CI for PR #{pr_number}...")
 
     checks = get_pr_check_runs(token, pr_number)
@@ -152,9 +153,9 @@ def check_ci_for_pr(
     other = [c for c in checks if c not in passed and c not in failed and c not in pending]
 
     checks_summary = f"Total: {len(checks)} checks\n"
-    checks_summary += f"- ✅ Passed: {len(passed)}\n"
-    checks_summary += f"- ❌ Failed: {len(failed)}\n"
-    checks_summary += f"- ⏳ Pending: {len(pending)}\n"
+    checks_summary += f"- Passed: {len(passed)}\n"
+    checks_summary += f"- Failed: {len(failed)}\n"
+    checks_summary += f"- Pending: {len(pending)}\n"
 
     if failed:
         checks_summary += "\n### Failed Checks:\n"
@@ -170,17 +171,21 @@ def check_ci_for_pr(
 
     print(f"  Passed: {len(passed)}, Failed: {len(failed)}, Pending: {len(pending)}")
 
+    requester_line = ""
+    if comment_author:
+        requester_line = f"> @{comment_author} requested CI status check\n\n"
+
     if not failed:
-        body = f"## ✅ CI Status for PR #{pr_number}\n\nAll {len(passed)} checks passed! "
+        body = f"{requester_line}## CI Status for PR #{pr_number}\n\nAll {len(passed)} checks passed! "
         if pending:
             body += f"({len(pending)} still pending)"
-        body += "\n\n---\n*Automated check by sglang-ci-bot*"
+        body += "\n\n---\n*Automated check by amd-bot*"
     else:
         print("  Analyzing failures with Claude...")
         analysis = analyze_ci_with_claude(
             anthropic_key, pr_number, checks_summary, failure_logs
         )
-        body = f"""## 🔍 CI Status for PR #{pr_number}
+        body = f"""{requester_line}## CI Status for PR #{pr_number}
 
 {checks_summary}
 
@@ -191,7 +196,7 @@ def check_ci_for_pr(
 {analysis}
 
 ---
-*Automated CI analysis by sglang-ci-bot using Claude*
+*Automated CI analysis by amd-bot using Claude*
 """
 
     if post_comment:

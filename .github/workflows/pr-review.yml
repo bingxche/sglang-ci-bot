@@ -22,7 +22,7 @@ on:
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, amd-internal]
     permissions:
       contents: read
 
@@ -46,10 +46,12 @@ jobs:
             echo "number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
             echo "focus=${{ github.event.client_payload.focus }}" >> $GITHUB_OUTPUT
             echo "no_post=false" >> $GITHUB_OUTPUT
+            echo "comment_author=${{ github.event.client_payload.comment_author }}" >> $GITHUB_OUTPUT
           else
             echo "number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
             echo "focus=${{ github.event.inputs.focus }}" >> $GITHUB_OUTPUT
             echo "no_post=${{ github.event.inputs.no_post }}" >> $GITHUB_OUTPUT
+            echo "comment_author=" >> $GITHUB_OUTPUT
           fi
 
       - name: Review PR
@@ -57,6 +59,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
           LLM_GATEWAY_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          COMMENT_AUTHOR: ${{ steps.pr.outputs.comment_author }}
         run: |
           ARGS="${{ steps.pr.outputs.number }}"
 

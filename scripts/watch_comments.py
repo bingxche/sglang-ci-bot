@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Comment Watcher for sglang PRs.
+amd-bot Comment Watcher for sglang PRs.
 
-Polls for new comments mentioning the bot trigger keyword,
+Polls for new comments mentioning @amd-bot trigger keyword,
 then dispatches PR review or other actions.
 """
 
@@ -21,7 +21,8 @@ REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
 
-BOT_TRIGGER = "@sglang-ci-bot"
+BOT_TRIGGER = "@amd-bot"
+AUTHORIZED_USERS = ["bingxche"]
 COMMANDS = {
     "review": "Perform a full code review of this PR",
     "review-focus": "Review with focus on specific areas (provide after the command)",
@@ -97,7 +98,7 @@ def is_pull_request(token: str, issue_url: str) -> bool:
     return "pull_request" in data
 
 
-def dispatch_review(token: str, bot_repo: str, pr_number: int, focus: str = ""):
+def dispatch_review(token: str, bot_repo: str, pr_number: int, focus: str = "", comment_author: str = ""):
     """Trigger the PR review workflow via repository_dispatch."""
     url = f"https://api.github.com/repos/{bot_repo}/dispatches"
     payload = {
@@ -105,6 +106,7 @@ def dispatch_review(token: str, bot_repo: str, pr_number: int, focus: str = ""):
         "client_payload": {
             "pr_number": str(pr_number),
             "focus": focus,
+            "comment_author": comment_author,
         },
     }
     resp = requests.post(url, headers=gh_headers(token), json=payload)
@@ -112,13 +114,14 @@ def dispatch_review(token: str, bot_repo: str, pr_number: int, focus: str = ""):
     print(f"  Dispatched review for PR #{pr_number}")
 
 
-def dispatch_ci_status(token: str, bot_repo: str, pr_number: int):
+def dispatch_ci_status(token: str, bot_repo: str, pr_number: int, comment_author: str = ""):
     """Trigger CI status check workflow."""
     url = f"https://api.github.com/repos/{bot_repo}/dispatches"
     payload = {
         "event_type": "ci-status",
         "client_payload": {
             "pr_number": str(pr_number),
+            "comment_author": comment_author,
         },
     }
     resp = requests.post(url, headers=gh_headers(token), json=payload)
@@ -128,7 +131,7 @@ def dispatch_ci_status(token: str, bot_repo: str, pr_number: int):
 
 def post_help_comment(token: str, pr_number: int):
     """Post a help message listing available commands."""
-    help_text = f"## 🤖 sglang-ci-bot Help\n\nAvailable commands (mention `{BOT_TRIGGER}` followed by a command):\n\n"
+    help_text = f"## amd-bot Help\n\nAvailable commands (mention `{BOT_TRIGGER}` followed by a command):\n\n"
     for cmd, desc in COMMANDS.items():
         help_text += f"- `{BOT_TRIGGER} {cmd}` - {desc}\n"
     help_text += f"\n### Examples\n"
@@ -163,6 +166,10 @@ def process_comments(token: str, bot_repo: str, since: str | None = None):
         if comment_id in processed_ids:
             continue
 
+        author = comment["user"]["login"]
+        if author not in AUTHORIZED_USERS:
+            continue
+
         parsed = parse_command(comment["body"])
         if not parsed:
             continue
@@ -181,7 +188,7 @@ def process_comments(token: str, bot_repo: str, since: str | None = None):
                 "pr_number": pr_number,
                 "command": parsed["command"],
                 "args": parsed["args"],
-                "author": comment["user"]["login"],
+                "author": author,
                 "created_at": comment["created_at"],
             }
         )
@@ -192,11 +199,11 @@ def process_comments(token: str, bot_repo: str, since: str | None = None):
         add_reaction(token, cmd["comment_id"], "eyes")
 
         if cmd["command"] == "review":
-            dispatch_review(token, bot_repo, cmd["pr_number"])
+            dispatch_review(token, bot_repo, cmd["pr_number"], comment_author=cmd["author"])
         elif cmd["command"] == "review-focus":
-            dispatch_review(token, bot_repo, cmd["pr_number"], focus=cmd["args"])
+            dispatch_review(token, bot_repo, cmd["pr_number"], focus=cmd["args"], comment_author=cmd["author"])
         elif cmd["command"] == "ci-status":
-            dispatch_ci_status(token, bot_repo, cmd["pr_number"])
+            dispatch_ci_status(token, bot_repo, cmd["pr_number"], comment_author=cmd["author"])
         elif cmd["command"] == "help":
             post_help_comment(token, cmd["pr_number"])
         else:
@@ -217,7 +224,7 @@ def main():
     parser.add_argument(
         "--bot-repo",
         required=True,
-        help="Your bot repo (e.g., 'username/sglang-ci-bot')",
+        help="Your bot repo (e.g., 'username/amd-bot')",
     )
     parser.add_argument(
         "--since-hours",

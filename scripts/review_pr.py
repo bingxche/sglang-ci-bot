@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PR Review Bot for sglang.
+amd-bot PR Review for sglang.
 
 Fetches PR diff and file changes, sends to Claude for review,
 and posts the review as a PR comment.
@@ -195,6 +195,7 @@ def review_pr(
     post_comment: bool = True,
 ) -> str:
     """Main function to review a PR."""
+    comment_author = os.environ.get("COMMENT_AUTHOR", "")
     print(f"Reviewing PR #{pr_number}...")
 
     pr_info = get_pr_info(token, pr_number)
@@ -212,15 +213,19 @@ def review_pr(
         anthropic_key, pr_info, diff, files, focus_areas, review_context
     )
 
-    body = f"""## 🤖 Claude Code Review
+    requester_line = ""
+    if comment_author:
+        requester_line = f"> @{comment_author} requested a review\n\n"
+
+    body = f"""{requester_line}## Claude Code Review
 
 > PR #{pr_number}: {pr_info['title']}
-> Requested review at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+> Reviewed at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
 
 {review}
 
 ---
-*Automated review by sglang-ci-bot using Claude. This is an AI-generated review — please use your judgment.*
+*Automated review by amd-bot using Claude. This is an AI-generated review — please use your judgment.*
 """
 
     if post_comment:

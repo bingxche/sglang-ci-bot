@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CI Failure Monitor for sglang.
+amd-bot CI Failure Monitor for sglang.
 
 Monitors specified CI workflows, fetches logs from failed jobs,
 uses Claude to analyze failures and propose fixes, then posts
@@ -29,14 +29,30 @@ REPO = f"{REPO_OWNER}/{REPO_NAME}"
 MONITORED_WORKFLOWS = [
     "nightly-test-amd.yml",
     "nightly-test-amd-rocm720.yml",
-    "nightly-test-nvidia.yml",
-    "pr-test-amd.yml",
-    "pr-test.yml",
     "release-docker-amd-nightly.yml",
+    "release-docker-amd-rocm720-nightly.yml",
+    "amd-aiter-scout.yml",
 ]
+
+STATE_FILE = Path(__file__).parent.parent / ".state" / "ci_monitor.json"
+MAX_STATE_IDS = 500
 
 MAX_LOG_CHARS = 80000
 CLAUDE_MODEL = "claude-opus-4-6"
+
+
+def load_state() -> dict:
+    """Load processed run IDs from state file."""
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {"processed_run_ids": []}
+
+
+def save_state(state: dict):
+    """Save state, keeping only the most recent run IDs."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    state["processed_run_ids"] = state["processed_run_ids"][-MAX_STATE_IDS:]
+    STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 def _create_anthropic_client(api_key: str) -> anthropic.Anthropic:
@@ -233,8 +249,9 @@ def monitor_workflow(
     hours_back: int = 24,
     bot_repo: str | None = None,
     output_mode: str = "issue",
-) -> str | None:
-    """Monitor a single workflow for failures."""
+    processed_run_ids: set[int] | None = None,
+) -> tuple[str | None, list[int]]:
+    """Monitor a single workflow for failures. Returns (result, new_run_ids)."""
     print(f"\n{'='*60}")
     print(f"Monitoring: {workflow_file}")
     print(f"{'='*60}")
@@ -242,9 +259,17 @@ def monitor_workflow(
     runs = get_workflow_runs(token, workflow_file, hours_back=hours_back)
     if not runs:
         print(f"  No failed runs in the last {hours_back} hours.")
-        return None
+        return None, []
 
-    print(f"  Found {len(runs)} failed run(s)")
+    if processed_run_ids:
+        runs = [r for r in runs if r["id"] not in processed_run_ids]
+
+    if not runs:
+        print(f"  All failed runs already processed.")
+        return None, []
+
+    new_run_ids = [r["id"] for r in runs]
+    print(f"  Found {len(runs)} new failed run(s)")
 
     all_failures = []
     for run in runs:
@@ -281,7 +306,7 @@ def monitor_workflow(
 
     if not all_failures:
         print("  No actionable failures found.")
-        return None
+        return None, new_run_ids
 
     print(f"  Analyzing {len(all_failures)} failure(s) with Claude...")
     analysis = analyze_failures_with_claude(anthropic_key, workflow_file, all_failures)
@@ -310,26 +335,26 @@ def monitor_workflow(
 {analysis}
 
 ---
-*Generated automatically by sglang-ci-bot*
+*Generated automatically by amd-bot*
 """
 
     if output_mode == "stdout":
         print(body)
-        return body
+        return body, new_run_ids
 
     if output_mode == "issue" and bot_repo:
         issue = create_github_issue(token, title, body, labels=["ci-monitor"], repo=bot_repo)
         print(f"  Created issue: {issue['html_url']}")
-        return issue["html_url"]
+        return issue["html_url"], new_run_ids
 
     if output_mode == "comment" and bot_repo:
         issue_num = find_or_create_tracking_issue(token, workflow_file, bot_repo)
         comment = post_comment_on_issue(token, issue_num, body, repo=bot_repo)
         print(f"  Posted comment: {comment['html_url']}")
-        return comment["html_url"]
+        return comment["html_url"], new_run_ids
 
     print(body)
-    return body
+    return body, new_run_ids
 
 
 def main():
@@ -354,7 +379,7 @@ def main():
     )
     parser.add_argument(
         "--bot-repo",
-        help="Your bot repo (e.g., 'username/sglang-ci-bot') for posting issues",
+        help="Your bot repo (e.g., 'username/amd-bot') for posting issues",
     )
     parser.add_argument(
         "--github-token",
@@ -377,21 +402,29 @@ def main():
         print("Error: API key required. Set ANTHROPIC_API_KEY or LLM_GATEWAY_KEY env var.", file=sys.stderr)
         sys.exit(1)
 
+    state = load_state()
+    processed_run_ids = set(state.get("processed_run_ids", []))
+
     results = []
     for wf in args.workflows:
         try:
-            result = monitor_workflow(
+            result, new_ids = monitor_workflow(
                 args.github_token,
                 args.anthropic_key,
                 wf,
                 hours_back=args.hours_back,
                 bot_repo=args.bot_repo,
                 output_mode=args.output,
+                processed_run_ids=processed_run_ids,
             )
+            processed_run_ids.update(new_ids)
             if result:
                 results.append(result)
         except Exception as e:
             print(f"Error monitoring {wf}: {e}", file=sys.stderr)
+
+    state["processed_run_ids"] = list(processed_run_ids)
+    save_state(state)
 
     if results:
         summary = json.dumps(results, indent=2)
