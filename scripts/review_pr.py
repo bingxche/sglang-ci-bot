@@ -18,7 +18,7 @@ import requests
 REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-opus-4-6"
 MAX_DIFF_CHARS = 120000
 
 
@@ -95,7 +95,8 @@ def review_pr_with_claude(
     review_context: str | None = None,
 ) -> str:
     """Send PR info to Claude for review."""
-    client = anthropic.Anthropic(api_key=api_key)
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+    client = anthropic.Anthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
 
     files_summary = "\n".join(
         f"- `{f['filename']}` (+{f['additions']}/-{f['deletions']}, {f['status']})"

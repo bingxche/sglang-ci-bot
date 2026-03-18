@@ -15,7 +15,7 @@ import requests
 REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-opus-4-6"
 MAX_LOG_CHARS = 60000
 
 
@@ -82,7 +82,8 @@ def analyze_ci_with_claude(
     api_key: str, pr_number: int, checks_summary: str, failure_logs: str
 ) -> str:
     """Ask Claude to summarize CI status."""
-    client = anthropic.Anthropic(api_key=api_key)
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+    client = anthropic.Anthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
 
     prompt = f"""You are a CI/CD expert analyzing the CI status for PR #{pr_number} in the sglang project.
 

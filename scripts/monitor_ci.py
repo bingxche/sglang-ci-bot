@@ -35,7 +35,7 @@ MONITORED_WORKFLOWS = [
 ]
 
 MAX_LOG_CHARS = 80000
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-opus-4-6"
 
 
 def gh_headers(token: str) -> dict:
@@ -122,7 +122,8 @@ def analyze_failures_with_claude(
     api_key: str, workflow_name: str, failures: list[dict]
 ) -> str:
     """Send failure info to Claude for analysis."""
-    client = anthropic.Anthropic(api_key=api_key)
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+    client = anthropic.Anthropic(api_key=api_key, **({"base_url": base_url} if base_url else {}))
 
     failure_details = []
     for f in failures:

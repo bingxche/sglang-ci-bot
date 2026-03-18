@@ -56,6 +56,7 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
         run: |
           ARGS="${{ steps.pr.outputs.number }}"
 
