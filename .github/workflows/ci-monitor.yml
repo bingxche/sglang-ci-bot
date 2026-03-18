@@ -2,7 +2,6 @@ name: CI Failure Monitor
 
 on:
   schedule:
-    # Run every 8 hours
     - cron: '0 0,8,16 * * *'
   workflow_dispatch:
     inputs:
@@ -17,11 +16,10 @@ on:
       output_mode:
         description: 'Output mode'
         required: false
-        default: 'issue'
+        default: 'daily-issue'
         type: choice
         options:
-          - issue
-          - comment
+          - daily-issue
           - stdout
 
 jobs:
@@ -49,11 +47,11 @@ jobs:
       - name: Run CI Monitor
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
-          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
-          LLM_GATEWAY_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
+          LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
         run: |
           HOURS="${{ github.event.inputs.hours_back || '24' }}"
-          OUTPUT="${{ github.event.inputs.output_mode || 'issue' }}"
+          OUTPUT="${{ github.event.inputs.output_mode || 'daily-issue' }}"
           WORKFLOWS="${{ github.event.inputs.workflows }}"
 
           ARGS="--hours-back $HOURS --output $OUTPUT --bot-repo ${{ github.repository }}"
