@@ -47,9 +47,8 @@ jobs:
       - name: Run CI Monitor
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
-          APIM_SUBSCRIPTION_KEY: ${{ secrets.APIM_SUBSCRIPTION_KEY }}
+          LLM_GATEWAY_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           HOURS="${{ github.event.inputs.hours_back || '24' }}"
           OUTPUT="${{ github.event.inputs.output_mode || 'issue' }}"
