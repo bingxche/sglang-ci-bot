@@ -13,12 +13,35 @@ import sys
 from datetime import datetime, timezone
 
 import anthropic
+import httpx
 import requests
 
 REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
 CLAUDE_MODEL = "claude-opus-4-6"
+
+
+def _create_anthropic_client(api_key: str) -> anthropic.Anthropic:
+    """Create Anthropic client, supporting AMD LLM Gateway (Azure APIM) or direct API."""
+    gateway_key = os.environ.get("LLM_GATEWAY_KEY") or os.environ.get("APIM_SUBSCRIPTION_KEY")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+
+    if gateway_key and base_url:
+        import getpass
+        headers = {
+            "Ocp-Apim-Subscription-Key": gateway_key,
+            "user": getpass.getuser(),
+            "anthropic-version": "vertex-2023-10-16",
+        }
+        return anthropic.Anthropic(
+            base_url=base_url,
+            api_key="dummy",
+            http_client=httpx.Client(verify=False),
+            default_headers=headers,
+        )
+
+    return anthropic.Anthropic(api_key=api_key)
 MAX_DIFF_CHARS = 120000
 
 
@@ -95,17 +118,7 @@ def review_pr_with_claude(
     review_context: str | None = None,
 ) -> str:
     """Send PR info to Claude for review."""
-    base_url = os.environ.get("ANTHROPIC_BASE_URL")
-    apim_key = os.environ.get("APIM_SUBSCRIPTION_KEY")
-    kwargs = {}
-    if base_url:
-        kwargs["base_url"] = base_url
-    if apim_key:
-        kwargs["api_key"] = "dummy"
-        kwargs["default_headers"] = {"Ocp-Apim-Subscription-Key": apim_key}
-    else:
-        kwargs["api_key"] = api_key
-    client = anthropic.Anthropic(**kwargs)
+    client = _create_anthropic_client(api_key)
 
     files_summary = "\n".join(
         f"- `{f['filename']}` (+{f['additions']}/-{f['deletions']}, {f['status']})"
