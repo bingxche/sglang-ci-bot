@@ -282,20 +282,11 @@ def progressive_step_analysis(
 {log}
 ```
 
-Summarize this step's key information concisely. Focus on:
-- **Environment / Config**: Docker image tags, GPU info, OS version, env vars
-- **Dependencies**: Package versions (PyTorch, Triton, Aiter, ROCm, vLLM, etc.)
-- **Build output**: Compilation results, warnings
-- **Test results**: Pass/fail counts, specific failures with error messages
-- **Errors**: Full error messages, stack traces, exit codes
-- **Anything relevant for understanding subsequent steps or failures**
-
-{"This step FAILED — provide detailed error analysis including full error messages and stack traces." if is_failed else "This step passed — extract key contextual information briefly."}
-Keep the summary concise but do NOT omit version numbers or error details."""
+{"This step FAILED. Extract: (1) the full error message and stack trace verbatim, (2) which test(s) failed with pass/fail counts, (3) exit code. Be thorough on errors but skip non-error details." if is_failed else "This step passed. In 2-4 bullet points, note ONLY information that could be relevant to understanding a later failure (e.g. key package versions, dependency conflicts/warnings, GPU/Docker info). Skip routine output."}"""
 
         msg = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=2048,
+            max_tokens=1024 if not is_failed else 2048,
             messages=[{"role": "user", "content": prompt}],
         )
         summary = msg.content[0].text
@@ -310,27 +301,41 @@ def final_job_analysis(
     run_url: str,
     accumulated_summary: str,
 ) -> str:
-    """Produce a root-cause analysis for a job from its accumulated step summaries."""
-    prompt = f"""You are a CI/CD expert. Below is a complete step-by-step summary of a FAILED CI job in the sglang project (LLM serving framework on AMD GPUs).
+    """Produce a concise, results-first analysis for a failed job."""
+    prompt = f"""You are a CI/CD expert analyzing a FAILED CI job in the sglang project (LLM serving framework on AMD GPUs).
 
 ## Job: {job_name}
 ## Run: {run_url}
 
 {accumulated_summary}
 
-Based on ALL information gathered from every step, provide:
+Produce a CONCISE report in the following format. Be brief — engineers will read this quickly and then go look at the logs themselves.
 
-1. **Root Cause Analysis**: Most likely root cause, considering the full pipeline (image version, dependency versions, environment).
-2. **Failure Details**: Specific error messages, stack traces, which tests failed.
-3. **Suggested Fixes**: Concrete, actionable steps. Reference specific versions, configs, or code.
-4. **Priority**: Critical / High / Medium / Low.
-5. **Environment Context**: Key environment details relevant to the failure.
+### Failure Summary
+One or two sentences: what failed and why.
 
-Format in clear Markdown suitable for a GitHub issue."""
+### Failure Reasons
+List ALL distinct failure reasons as bullet points. Do NOT omit any. Each bullet should be one concise sentence.
+
+### Stack Traces
+Include the key error messages and stack traces verbatim (in code blocks). Engineers need these to locate the issue. Only include the relevant portions — not the entire log.
+
+### Suggested Fix Directions
+List potential fix directions as bullet points. Only state the DIRECTION (e.g. "pin transformers to <5.0.0", "add default value to vision_config field"). Do NOT write out code implementations or detailed steps.
+
+### Priority
+One word: Critical / High / Medium / Low — with a single sentence justification.
+
+IMPORTANT RULES:
+- Do NOT include environment tables, version tables, or lengthy context sections.
+- Do NOT write code examples for fixes.
+- Do NOT include "Environment Context" sections.
+- Keep the entire output under 300 lines of markdown.
+- Be direct and factual — no filler."""
 
     msg = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=2048,
         messages=[{"role": "user", "content": prompt}],
     )
     return msg.content[0].text
@@ -341,29 +346,25 @@ def cross_job_analysis(
     workflow_name: str,
     job_analyses: list[dict],
 ) -> str:
-    """Find common patterns across multiple failed jobs."""
+    """Find common patterns across multiple failed jobs — concise summary."""
     jobs_text = "\n\n---\n\n".join(
-        f"## Job: {ja['job_name']}\n{ja['analysis']}" for ja in job_analyses
+        f"### Job: {ja['job_name']}\n{ja['analysis']}" for ja in job_analyses
     )
 
-    prompt = f"""You are a CI/CD expert. Multiple jobs failed in workflow `{workflow_name}` of the sglang project.
-
-Failed jobs: {len(job_analyses)}
+    prompt = f"""You are a CI/CD expert. {len(job_analyses)} jobs failed in workflow `{workflow_name}` (sglang project, AMD GPUs).
 
 {jobs_text}
 
-Provide:
-1. **Common Patterns**: Are the failures related? Shared root cause?
-2. **Cross-Job Dependencies**: Did one failure cause or relate to another?
-3. **Unified Root Cause**: Is there a single underlying issue (broken dep update, infra problem)?
-4. **Priority Ranking**: Which failures to fix first?
-5. **Overall Recommendation**: One-paragraph executive summary.
+Write a SHORT cross-job summary (under 30 lines). Include:
+1. **Common Root Cause** (if any): one or two sentences.
+2. **Distinct vs Shared Failures**: which jobs share the same root cause, and which have unique issues.
+3. **Fix Priority**: one sentence on what to fix first and why.
 
-Format in clear Markdown."""
+Do NOT repeat per-job analysis. Do NOT write code. Be brief."""
 
     msg = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
     return msg.content[0].text

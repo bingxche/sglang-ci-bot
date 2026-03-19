@@ -9,12 +9,10 @@ arbitrarily large logs without exceeding token limits.
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
 
 import requests
 
 from utils import (
-    CLAUDE_MODEL,
     REPO,
     create_anthropic_client,
     cross_job_analysis,
@@ -113,25 +111,13 @@ def check_ci_for_pr(
 
     print(f"  Passed: {len(passed)}, Failed: {len(failed)}, Pending: {len(pending)}")
 
-    checks_summary = f"Total: {len(checks)} checks\n"
-    checks_summary += f"- Passed: {len(passed)}\n"
-    checks_summary += f"- Failed: {len(failed)}\n"
-    checks_summary += f"- Pending: {len(pending)}\n"
-
-    if failed:
-        checks_summary += "\n### Failed Checks:\n"
-        for c in failed:
-            checks_summary += f"- **{c['name']}** ({c.get('html_url', 'N/A')})\n"
-
     requester_line = ""
     if comment_author:
-        requester_line = f"> @{comment_author} requested CI status check\n\n"
+        requester_line = f"> @{comment_author}\n\n"
 
     if not failed:
-        body = f"{requester_line}## CI Status for PR #{pr_number}\n\nAll {len(passed)} checks passed! "
-        if pending:
-            body += f"({len(pending)} still pending)"
-        body += "\n\n---\n*Automated check by amd-bot*"
+        pending_note = f" ({len(pending)} still pending)" if pending else ""
+        body = f"{requester_line}## CI Status for PR #{pr_number}\n\nAll {len(passed)} checks passed!{pending_note}\n"
     else:
         client = create_anthropic_client()
         all_job_analyses: list[dict] = []
@@ -146,34 +132,35 @@ def check_ci_for_pr(
             print(f"\n  Cross-job analysis ({len(all_job_analyses)} jobs)...")
             cross = cross_job_analysis(client, f"PR #{pr_number}", all_job_analyses)
 
+        failed_table_rows = "\n".join(
+            f"| [`{ja['job_name']}`]({ja['run_url']}) | {', '.join(ja['failed_steps']) or 'N/A'} |"
+            for ja in all_job_analyses
+        )
+
         per_job = ""
         for ja in all_job_analyses:
-            failed_str = ", ".join(ja["failed_steps"]) or "N/A"
             per_job += f"""
-### Job: `{ja['job_name']}`
-- **Link**: [{ja['job_name']}]({ja['run_url']})
-- **Failed Steps**: {failed_str}
+<details>
+<summary><b>{ja['job_name']}</b> — failed step(s): {', '.join(ja['failed_steps']) or 'N/A'}</summary>
 
 {ja['analysis']}
 
----
+</details>
 """
 
         body = f"""{requester_line}## CI Status for PR #{pr_number}
 
-{checks_summary}
+Passed: {len(passed)} | Failed: {len(failed)} | Pending: {len(pending)}
 
----
+| Failed Job | Failed Steps |
+|-----------|-------------|
+{failed_table_rows}
 
-## Detailed Analysis
-
-**Method**: Progressive step-by-step analysis (all steps examined per job)
-{per_job}
 """
         if cross:
-            body += f"\n## Cross-Job Analysis\n\n{cross}\n\n---\n"
+            body += f"### Cross-Job Summary\n\n{cross}\n\n---\n\n"
 
-        body += "\n*Automated CI analysis by amd-bot — progressive step analysis*\n"
+        body += f"### Per-Job Analysis\n{per_job}\n"
 
     if post_comment_flag:
         result = post_comment(token, REPO, pr_number, body)
