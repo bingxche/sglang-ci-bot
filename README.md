@@ -27,7 +27,7 @@ Runs entirely from a **separate personal repo** using GitHub Actions + GitHub RE
 | CI Failure Monitor | `monitor_ci.py` | Cron (every 8h) or manual | Monitors nightly CI workflows, analyzes failures with progressive step-by-step analysis, posts daily issue reports |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Fetches PR diff, sends to Claude for structured code review, posts as PR comment |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI checks for a PR, downloads failure logs, analyzes with Claude |
-| Comment Watcher | `watch_comments.py` | Cron (every 5min) | Polls sglang PRs for `@amd-bot` commands, dispatches the appropriate action |
+| Comment Watcher | `watch_comments.py` | Daemon or Cron (every 15min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches the appropriate action |
 
 ---
 
@@ -273,11 +273,10 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 
 **Script**: `scripts/watch_comments.py`
 **Workflow**: `.github/workflows/comment-watcher.yml`
-**Schedule**: Every 5 minutes
 
 ### What it does
 
-1. Polls the sglang repo for recent issue/PR comments (last 1 hour by default)
+1. Polls the sglang repo for recent issue/PR comments
 2. Filters for comments by authorized users containing the `@amd-bot` trigger
 3. Parses the command (`review`, `review-focus`, `ci-status`, `help`)
 4. Verifies the comment is on a PR (not a plain issue)
@@ -293,27 +292,71 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 | `@amd-bot ci-status` | Check and analyze CI status |
 | `@amd-bot help` | Post a help message with available commands |
 
-### How to use
+### Running modes
 
-The comment watcher runs automatically every 5 minutes. To trigger manually:
+The comment watcher supports two running modes:
+
+#### Mode 1: Daemon (recommended)
+
+Run as a persistent background process on your self-hosted runner. Polls every 30 seconds for near-instant response to `@amd-bot` commands.
 
 ```bash
-# Check comments from the last 1 hour
+# Start in foreground (for testing)
+export GH_PAT=ghp_your_token
+python3 scripts/watch_comments.py \
+  --daemon \
+  --poll-interval 30 \
+  --bot-repo bingxche/sglang-ci-bot
+
+# Start as background process
+nohup python3 scripts/watch_comments.py \
+  --daemon \
+  --poll-interval 30 \
+  --bot-repo bingxche/sglang-ci-bot \
+  > /tmp/comment-watcher.log 2>&1 &
+
+# Monitor logs
+tail -f /tmp/comment-watcher.log
+
+# Stop the daemon
+pkill -f "watch_comments.py --daemon"
+```
+
+Resource usage is minimal: ~25 MB memory, ~0% CPU, 120 GitHub API calls/hour (2.4% of rate limit).
+
+The daemon handles errors gracefully with exponential backoff and responds to SIGTERM/SIGINT for clean shutdown.
+
+#### Mode 2: GitHub Actions cron (fallback)
+
+The workflow runs every 15 minutes as a fallback in case the daemon is not running. This has higher latency (15–40 min) due to GitHub Actions cron scheduling delays.
+
+```bash
+# Trigger manually
 gh workflow run comment-watcher.yml
 
 # Check further back
 gh workflow run comment-watcher.yml -f since_hours=4
 ```
 
-**Via command line:**
+#### One-shot via command line
 
 ```bash
-python scripts/watch_comments.py --bot-repo user/sglang-ci-bot --since-hours 1
+python scripts/watch_comments.py --bot-repo bingxche/sglang-ci-bot --since-hours 1
 ```
+
+**CLI options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bot-repo` | (required) | Bot repo for dispatching workflows |
+| `--daemon` | false | Run as a long-lived daemon instead of one-shot |
+| `--poll-interval` | `30` | Seconds between polls in daemon mode |
+| `--since-hours` | `1` | How many hours back to check in one-shot mode |
+| `--github-token` | `$GH_PAT` | GitHub token |
 
 ### Authorization
 
-Only users listed in `AUTHORIZED_USERS` in `watch_comments.py` can trigger commands. Currently: `["bingxche", "yctseng0211", "michaelzhang-ai"]`.
+Only users listed in `AUTHORIZED_USERS` in `watch_comments.py` can trigger commands. Currently: `["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226"]`.
 
 ### State Management
 
@@ -386,7 +429,7 @@ sglang-ci-bot/
     ci-monitor.yml         Scheduled CI monitor (cron every 8h)
     ci-status-check.yml    PR CI check (triggered by repository_dispatch)
     pr-review.yml          PR review (triggered by repository_dispatch)
-    comment-watcher.yml    Comment poller (cron every 5min)
+    comment-watcher.yml    Comment poller (cron every 15min, fallback for daemon)
   runner/
     Dockerfile             Self-hosted runner Docker image
     setup.sh               Runner registration and setup
@@ -433,7 +476,7 @@ BOT_TRIGGER = "@amd-bot"
 Edit `AUTHORIZED_USERS` in `scripts/watch_comments.py`:
 
 ```python
-AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai"]
+AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226"]
 ```
 
 ### Schedules
@@ -441,7 +484,7 @@ AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai"]
 Edit the `cron` expressions in the workflow files:
 
 - `ci-monitor.yml`: `'0 0,8,16 * * *'` (every 8 hours)
-- `comment-watcher.yml`: `'*/5 * * * *'` (every 5 minutes)
+- `comment-watcher.yml`: `'*/15 * * * *'` (every 15 minutes, fallback for daemon mode)
 
 ### Pre-filter Threshold
 
