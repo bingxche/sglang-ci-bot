@@ -11,45 +11,17 @@ import os
 import sys
 from datetime import datetime, timezone
 
-import anthropic
-import httpx
 import requests
 
-REPO_OWNER = "sgl-project"
-REPO_NAME = "sglang"
-REPO = f"{REPO_OWNER}/{REPO_NAME}"
-CLAUDE_MODEL = "claude-opus-4-6"
+from utils import (
+    CLAUDE_MODEL,
+    REPO,
+    create_anthropic_client,
+    gh_headers,
+    post_comment,
+)
 
 MAX_DIFF_CHARS = 120000
-
-
-def _create_anthropic_client() -> anthropic.Anthropic:
-    """Create Anthropic client via AMD LLM Gateway.
-
-    Env vars:
-      - LLM_GATEWAY_KEY (required) — gateway subscription key
-      - LLM_GATEWAY_URL (required) — gateway endpoint
-    """
-    import getpass
-
-    return anthropic.Anthropic(
-        base_url=os.environ["LLM_GATEWAY_URL"],
-        api_key="dummy",
-        http_client=httpx.Client(verify=False),
-        default_headers={
-            "Ocp-Apim-Subscription-Key": os.environ["LLM_GATEWAY_KEY"],
-            "user": getpass.getuser(),
-            "anthropic-version": "vertex-2023-10-16",
-        },
-    )
-
-
-def gh_headers(token: str) -> dict:
-    return {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
 
 
 def get_pr_info(token: str, pr_number: int) -> dict:
@@ -116,7 +88,7 @@ def review_pr_with_claude(
     review_context: str | None = None,
 ) -> str:
     """Send PR info to Claude for review."""
-    client = _create_anthropic_client()
+    client = create_anthropic_client()
 
     files_summary = "\n".join(
         f"- `{f['filename']}` (+{f['additions']}/-{f['deletions']}, {f['status']})"
@@ -174,20 +146,12 @@ Format as clear Markdown. Be constructive and specific. Reference file names and
     return message.content[0].text
 
 
-def post_pr_review_comment(token: str, pr_number: int, body: str) -> dict:
-    """Post a comment on the PR."""
-    url = f"https://api.github.com/repos/{REPO}/issues/{pr_number}/comments"
-    resp = requests.post(url, headers=gh_headers(token), json={"body": body})
-    resp.raise_for_status()
-    return resp.json()
-
-
 def review_pr(
     token: str,
     pr_number: int,
     focus_areas: str | None = None,
     review_context: str | None = None,
-    post_comment: bool = True,
+    post_comment_flag: bool = True,
 ) -> str:
     """Main function to review a PR."""
     comment_author = os.environ.get("COMMENT_AUTHOR", "")
@@ -221,10 +185,10 @@ def review_pr(
 *Automated review by amd-bot using Claude. This is an AI-generated review — please use your judgment.*
 """
 
-    if post_comment:
-        comment = post_pr_review_comment(token, pr_number, body)
-        print(f"  Posted review: {comment['html_url']}")
-        return comment["html_url"]
+    if post_comment_flag:
+        result = post_comment(token, REPO, pr_number, body)
+        print(f"  Posted review: {result['html_url']}")
+        return result["html_url"]
     else:
         print(body)
         return body
@@ -268,7 +232,7 @@ def main():
         args.pr_number,
         focus_areas=args.focus,
         review_context=args.context,
-        post_comment=not args.no_post,
+        post_comment_flag=not args.no_post,
     )
 
 
