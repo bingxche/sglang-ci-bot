@@ -4,18 +4,26 @@ amd-bot Comment Watcher for sglang PRs.
 
 Polls for new comments mentioning @amd-bot trigger keyword,
 then dispatches PR review or other actions.
+
+Supports three modes:
+  1. One-shot (default): poll once and exit (for GitHub Actions cron)
+  2. Daemon (--daemon):   poll continuously in a loop (for self-hosted runner)
 """
 
 import argparse
 import json
+import logging
 import os
 import re
+import signal
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+
+log = logging.getLogger("comment-watcher")
 
 REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
@@ -111,7 +119,7 @@ def dispatch_review(token: str, bot_repo: str, pr_number: int, focus: str = "", 
     }
     resp = requests.post(url, headers=gh_headers(token), json=payload)
     resp.raise_for_status()
-    print(f"  Dispatched review for PR #{pr_number}")
+    log.info("Dispatched review for PR #%d", pr_number)
 
 
 def dispatch_ci_status(token: str, bot_repo: str, pr_number: int, comment_author: str = ""):
@@ -126,7 +134,7 @@ def dispatch_ci_status(token: str, bot_repo: str, pr_number: int, comment_author
     }
     resp = requests.post(url, headers=gh_headers(token), json=payload)
     resp.raise_for_status()
-    print(f"  Dispatched CI status check for PR #{pr_number}")
+    log.info("Dispatched CI status check for PR #%d", pr_number)
 
 
 def post_help_comment(token: str, pr_number: int):
@@ -151,7 +159,7 @@ def add_reaction(token: str, comment_id: int, reaction: str = "eyes"):
     headers["Accept"] = "application/vnd.github.squirrel-girl-preview+json"
     resp = requests.post(url, headers=headers, json={"content": reaction})
     if resp.status_code not in (200, 201):
-        print(f"  Warning: Could not add reaction: {resp.status_code}")
+        log.warning("Could not add reaction: HTTP %d", resp.status_code)
 
 
 def process_comments(token: str, bot_repo: str, since: str | None = None):
@@ -194,7 +202,7 @@ def process_comments(token: str, bot_repo: str, since: str | None = None):
         )
 
     for cmd in new_commands:
-        print(f"Processing: PR #{cmd['pr_number']} - {cmd['command']} (by @{cmd['author']})")
+        log.info("Processing: PR #%d - %s (by @%s)", cmd["pr_number"], cmd["command"], cmd["author"])
 
         add_reaction(token, cmd["comment_id"], "eyes")
 
@@ -207,7 +215,7 @@ def process_comments(token: str, bot_repo: str, since: str | None = None):
         elif cmd["command"] == "help":
             post_help_comment(token, cmd["pr_number"])
         else:
-            print(f"  Unknown command: {cmd['command']}")
+            log.warning("Unknown command: %s", cmd["command"])
 
         processed_ids.add(cmd["comment_id"])
 
@@ -215,8 +223,63 @@ def process_comments(token: str, bot_repo: str, since: str | None = None):
     state["last_check"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
 
-    print(f"Processed {len(new_commands)} new command(s)")
+    log.info("Processed %d new command(s)", len(new_commands))
     return new_commands
+
+
+_shutdown = False
+
+
+def _handle_signal(signum, _frame):
+    global _shutdown
+    log.info("Received signal %s, shutting down gracefully...", signal.Signals(signum).name)
+    _shutdown = True
+
+
+def run_daemon(token: str, bot_repo: str, poll_interval: int):
+    """Run the comment watcher as a long-lived daemon process."""
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    log.info(
+        "Daemon started — polling %s every %ds, dispatching to %s",
+        REPO, poll_interval, bot_repo,
+    )
+
+    consecutive_errors = 0
+    max_backoff = 300  # 5 min cap on error backoff
+
+    while not _shutdown:
+        since = (datetime.now(timezone.utc) - timedelta(seconds=poll_interval * 3)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        try:
+            cmds = process_comments(token, bot_repo, since=since)
+            consecutive_errors = 0
+            if cmds:
+                log.info("Dispatched %d command(s)", len(cmds))
+        except requests.exceptions.RequestException as exc:
+            consecutive_errors += 1
+            backoff = min(poll_interval * (2 ** consecutive_errors), max_backoff)
+            log.warning("API error (%d in a row): %s — retrying in %ds", consecutive_errors, exc, backoff)
+            _interruptible_sleep(backoff)
+            continue
+        except Exception:
+            consecutive_errors += 1
+            log.exception("Unexpected error (%d in a row)", consecutive_errors)
+            _interruptible_sleep(min(60 * consecutive_errors, max_backoff))
+            continue
+
+        _interruptible_sleep(poll_interval)
+
+    log.info("Daemon stopped.")
+
+
+def _interruptible_sleep(seconds: int):
+    """Sleep that can be interrupted by SIGTERM/SIGINT."""
+    end = time.monotonic() + seconds
+    while not _shutdown and time.monotonic() < end:
+        time.sleep(min(1, end - time.monotonic()))
 
 
 def main():
@@ -230,7 +293,18 @@ def main():
         "--since-hours",
         type=int,
         default=1,
-        help="How many hours back to check (default: 1)",
+        help="How many hours back to check for one-shot mode (default: 1)",
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Run as a long-lived daemon instead of one-shot",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=int,
+        default=30,
+        help="Seconds between polls in daemon mode (default: 30)",
     )
     parser.add_argument(
         "--github-token",
@@ -239,15 +313,25 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.github_token:
-        print("Error: GitHub token required.", file=sys.stderr)
-        sys.exit(1)
-
-    since = (datetime.now(timezone.utc) - timedelta(hours=args.since_hours)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
+    level = logging.INFO
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=level,
+        stream=sys.stdout,
     )
 
-    process_comments(args.github_token, args.bot_repo, since=since)
+    if not args.github_token:
+        log.error("GitHub token required. Set GH_PAT env var.")
+        sys.exit(1)
+
+    if args.daemon:
+        run_daemon(args.github_token, args.bot_repo, args.poll_interval)
+    else:
+        since = (datetime.now(timezone.utc) - timedelta(hours=args.since_hours)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        process_comments(args.github_token, args.bot_repo, since=since)
 
 
 if __name__ == "__main__":

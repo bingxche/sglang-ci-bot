@@ -1,0 +1,22 @@
+[Unit]
+Description=amd-bot Comment Watcher Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/sglang-ci-bot
+EnvironmentFile=/home/%i/sglang-ci-bot/deploy/.env
+ExecStart=/usr/bin/python3 scripts/watch_comments.py \
+    --daemon \
+    --poll-interval 30 \
+    --bot-repo bingxche/sglang-ci-bot
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=comment-watcher
+
+[Install]
+WantedBy=multi-user.target
