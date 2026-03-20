@@ -37,7 +37,11 @@ MONITORED_WORKFLOWS = [
     "release-docker-amd-nightly.yml",
     "release-docker-amd-rocm720-nightly.yml",
     "amd-aiter-scout.yml",
+    "pr-test-amd-rocm720.yml",
 ]
+
+SUCCESS_CONCLUSIONS = {"success"}
+SKIP_JOB_CONCLUSIONS = {"success", "skipped"}
 
 STATE_FILE = Path(__file__).parent.parent / ".state" / "ci_monitor.json"
 MAX_STATE_IDS = 500
@@ -66,31 +70,32 @@ def save_state(state: dict):
 def get_workflow_runs(
     token: str,
     workflow_file: str,
-    status: str = "failure",
     hours_back: int = 24,
     max_runs: int = 5,
 ) -> list[dict]:
-    """Fetch recent workflow runs with the given status."""
+    """Fetch recent completed workflow runs whose conclusion is not success."""
     since = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     url = f"https://api.github.com/repos/{REPO}/actions/workflows/{workflow_file}/runs"
     params = {
-        "status": status,
-        "per_page": max_runs,
+        "status": "completed",
+        "per_page": min(max_runs * 10, 100),
         "created": f">={since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
     }
     resp = requests.get(url, headers=gh_headers(token), params=params)
     resp.raise_for_status()
-    return resp.json().get("workflow_runs", [])
+    runs = resp.json().get("workflow_runs", [])
+    non_success = [r for r in runs if r.get("conclusion") not in SUCCESS_CONCLUSIONS]
+    return non_success[:max_runs]
 
 
 def get_failed_jobs(token: str, run_id: int) -> list[dict]:
-    """Get all failed jobs for a workflow run."""
+    """Get all non-success, non-skipped jobs for a workflow run."""
     url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
     params = {"filter": "latest", "per_page": 100}
     resp = requests.get(url, headers=gh_headers(token), params=params)
     resp.raise_for_status()
     jobs = resp.json().get("jobs", [])
-    return [j for j in jobs if j["conclusion"] == "failure"]
+    return [j for j in jobs if j.get("conclusion") not in SKIP_JOB_CONCLUSIONS]
 
 
 # ---------------------------------------------------------------------------
@@ -145,17 +150,18 @@ def monitor_workflow(
 
     runs = get_workflow_runs(token, workflow_file, hours_back=hours_back)
     if not runs:
-        print(f"  No failed runs in the last {hours_back} hours.")
+        print(f"  No non-success runs in the last {hours_back} hours.")
         return None, []
 
     if processed_run_ids:
         runs = [r for r in runs if r["id"] not in processed_run_ids]
     if not runs:
-        print("  All failed runs already processed.")
+        print("  All non-success runs already processed.")
         return None, []
 
     new_run_ids = [r["id"] for r in runs]
-    print(f"  Found {len(runs)} new failed run(s)")
+    conclusions = {r.get("conclusion", "unknown") for r in runs}
+    print(f"  Found {len(runs)} new non-success run(s) (conclusions: {', '.join(sorted(conclusions))})")
 
     client = create_anthropic_client()
     all_job_analyses: list[dict] = []
@@ -165,9 +171,12 @@ def monitor_workflow(
         run_url = run["html_url"]
         print(f"\n  Run {run_id}: {run_url}")
 
+        run_conclusion = run.get("conclusion", "unknown")
+        print(f"  Run conclusion: {run_conclusion}")
+
         failed_jobs = get_failed_jobs(token, run_id)
         if not failed_jobs:
-            print("    No failed jobs (run may have been retried)")
+            print("    No actionable jobs (all succeeded or skipped)")
             continue
 
         if job_name_filter:
@@ -184,7 +193,7 @@ def monitor_workflow(
             failed_step_names = {
                 s["name"]
                 for s in job.get("steps", [])
-                if s.get("conclusion") == "failure"
+                if s.get("conclusion") not in ("success", "skipped", None)
             }
 
             print("    Downloading full job log...")
