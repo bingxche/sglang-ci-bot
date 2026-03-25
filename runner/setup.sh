@@ -22,7 +22,7 @@ set -euo pipefail
 REPO="bingxche/sglang-ci-bot"
 RUNNER_NAME="amd-ci-bot-runner"
 GH_PAT=""
-RUNNER_VERSION="2.323.0"
+RUNNER_VERSION="2.333.0"
 IMAGE=""
 FORCE_BUILD=false
 MIN_DISK_MB=3000
@@ -102,7 +102,7 @@ if [ "$FORCE_BUILD" = true ]; then
     cat > "${BUILDDIR}/Dockerfile" << 'DOCKERFILE'
 FROM python:3.12-slim
 
-ARG RUNNER_VERSION=2.323.0
+ARG RUNNER_VERSION=2.333.0
 ARG TARGETARCH=x64
 
 ENV DEBIAN_FRONTEND=noninteractive \

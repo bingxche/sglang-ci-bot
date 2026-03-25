@@ -124,6 +124,141 @@ def create_github_issue(
     return resp.json()
 
 
+def get_workflow_runs_for_sha(token: str, head_sha: str) -> list[dict]:
+    """List all workflow runs triggered for a given commit SHA."""
+    url = f"https://api.github.com/repos/{REPO}/actions/runs"
+    all_runs: list[dict] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            url,
+            headers=gh_headers(token),
+            params={"head_sha": head_sha, "per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        runs = resp.json().get("workflow_runs", [])
+        if not runs:
+            break
+        all_runs.extend(runs)
+        if len(runs) < 100:
+            break
+        page += 1
+    return all_runs
+
+
+def get_run_jobs(token: str, run_id: int) -> list[dict]:
+    """Get all jobs for a workflow run."""
+    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
+    all_jobs: list[dict] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            url,
+            headers=gh_headers(token),
+            params={"filter": "latest", "per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        jobs = resp.json().get("jobs", [])
+        if not jobs:
+            break
+        all_jobs.extend(jobs)
+        if len(jobs) < 100:
+            break
+        page += 1
+    return all_jobs
+
+
+def get_pr_diff(token: str, pr_number: int) -> str:
+    """Fetch the unified diff for a PR."""
+    url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}"
+    headers = gh_headers(token)
+    headers["Accept"] = "application/vnd.github.diff"
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 200:
+        return resp.text
+    return ""
+
+
+def get_pr_changed_files(token: str, pr_number: int) -> list[dict]:
+    """Fetch the list of files changed in a PR."""
+    url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}/files"
+    all_files: list[dict] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            url,
+            headers=gh_headers(token),
+            params={"per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        files = resp.json()
+        if not files:
+            break
+        all_files.extend(files)
+        if len(files) < 100:
+            break
+        page += 1
+    return all_files
+
+
+def extract_error_lines(
+    raw_log: str,
+    job_steps_api: list[dict],
+    run_id: int,
+    job_id: int,
+    max_errors_per_step: int = 5,
+) -> list[dict]:
+    """Extract error lines from a job log with deep-link URLs.
+
+    Maps parsed log steps to the GitHub API step numbers, scans for
+    ``ERROR_PATTERNS``, and builds URLs of the form::
+
+        https://github.com/{REPO}/actions/runs/{run_id}/job/{job_id}#step:{N}:{L}
+
+    Returns a list of dicts with keys: step_name, preview, url, line_number.
+    """
+    parsed_steps = parse_log_by_steps(raw_log)
+
+    step_num_map: dict[str, int] = {}
+    for s in job_steps_api:
+        step_num_map[s["name"]] = s["number"]
+
+    errors: list[dict] = []
+    for parsed_step in parsed_steps:
+        step_name = parsed_step["name"]
+        step_num = step_num_map.get(step_name)
+        lines = parsed_step["content"].split("\n")
+
+        step_error_count = 0
+        for line_idx, line in enumerate(lines):
+            if ERROR_PATTERNS.search(line):
+                clean = _TIMESTAMP_RE.sub("", line).strip()
+                preview = clean[:200]
+
+                if step_num is not None:
+                    url = (
+                        f"https://github.com/{REPO}/actions/runs/"
+                        f"{run_id}/job/{job_id}#step:{step_num}:{line_idx + 1}"
+                    )
+                else:
+                    url = (
+                        f"https://github.com/{REPO}/actions/runs/"
+                        f"{run_id}/job/{job_id}"
+                    )
+
+                errors.append({
+                    "step_name": step_name,
+                    "preview": preview,
+                    "url": url,
+                    "line_number": line_idx + 1,
+                })
+                step_error_count += 1
+                if step_error_count >= max_errors_per_step:
+                    break
+
+    return errors
+
+
 # ---------------------------------------------------------------------------
 # Log parsing and pre-filtering
 # ---------------------------------------------------------------------------
