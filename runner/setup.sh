@@ -28,6 +28,7 @@ FORCE_BUILD=false
 MIN_DISK_MB=3000
 LOCAL_TAG="sglang-ci-bot-runner:latest"
 RUNNER_COUNT=10
+POLL_INTERVAL=15
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -195,6 +196,11 @@ echo "==> Starting ${RUNNER_COUNT} runners..."
 for i in $(seq 1 "$RUNNER_COUNT"); do
     CONTAINER_NAME="${RUNNER_NAME}-${i}"
     echo "    Starting ${CONTAINER_NAME}..."
+    WATCHER_ARGS=()
+    if [ "$i" -eq 1 ]; then
+        WATCHER_ARGS=(-e ENABLE_WATCHER=true -e POLL_INTERVAL="${POLL_INTERVAL}")
+    fi
+
     docker run -d \
         --name "${CONTAINER_NAME}" \
         --restart unless-stopped \
@@ -206,6 +212,7 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
         -e GH_PAT="${GH_PAT}" \
         -e RUNNER_NAME="${CONTAINER_NAME}" \
         -e LABELS="self-hosted,amd-internal" \
+        "${WATCHER_ARGS[@]}" \
         "${RUN_IMAGE}"
 done
 
@@ -214,12 +221,10 @@ echo "============================================"
 echo "  ${RUNNER_COUNT} runners deployed successfully!"
 echo "============================================"
 echo "  Containers : ${RUNNER_NAME}-{1..${RUNNER_COUNT}}"
+echo "  Watcher    : ${RUNNER_NAME}-1 (polling every ${POLL_INTERVAL}s)"
 echo "  Repo       : ${REPO}"
 echo "  Labels     : self-hosted, amd-internal"
-echo "  Log limit  : 100MB x 100 files per container"
 echo ""
 echo "  View logs  : docker logs -f ${RUNNER_NAME}-1"
-echo "  Stop all   : for i in \$(seq 1 ${RUNNER_COUNT}); do docker stop ${RUNNER_NAME}-\$i; done"
-echo "  Remove all : for i in \$(seq 1 ${RUNNER_COUNT}); do docker rm -f ${RUNNER_NAME}-\$i; done"
-echo "  Cleanup    : for i in \$(seq 1 ${RUNNER_COUNT}); do docker volume rm sglang-runner-toolcache-\$i; done"
+echo "  Stop all   : for i in \$(seq 1 ${RUNNER_COUNT}); do docker rm -f ${RUNNER_NAME}-\$i; done"
 echo "============================================"

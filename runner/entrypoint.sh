@@ -41,4 +41,14 @@ trap cleanup EXIT SIGTERM SIGINT
     --unattended \
     --replace
 
+if [ "${ENABLE_WATCHER:-}" = "true" ]; then
+    echo "Starting comment watcher daemon (poll every ${POLL_INTERVAL:-15}s)..."
+    git clone "https://${GH_PAT}@github.com/${REPO_PATH}.git" /tmp/bot
+    pip install -q -r /tmp/bot/requirements.txt 2>/dev/null
+    python3 /tmp/bot/scripts/watch_comments.py \
+        --daemon \
+        --poll-interval "${POLL_INTERVAL:-15}" \
+        --bot-repo "${REPO_PATH}" &
+fi
+
 exec ./run.sh

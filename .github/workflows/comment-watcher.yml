@@ -2,7 +2,7 @@ name: Comment Watcher
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       since_hours:
