@@ -1,29 +1,33 @@
 #!/bin/bash
-# One-command setup for sglang-ci-bot self-hosted GitHub Actions runner.
+# One-command setup for sglang-ci-bot self-hosted GitHub Actions runners.
 #
 # Usage:
-#   bash setup.sh --pat <GH_PAT> [--name <runner-name>] [--image <dockerhub-image>] [--build]
+#   bash setup.sh --pat <GH_PAT> [--count N] [--name <runner-prefix>] [--image <dockerhub-image>] [--build]
 #
 # Examples:
-#   # First time: build locally
+#   # First time: build locally, spawn 10 runners (default)
 #   bash setup.sh --pat ghp_xxxx --build
 #
+#   # Spawn 5 runners with custom prefix
+#   bash setup.sh --pat ghp_xxxx --count 5 --name my-runner --build
+#
 #   # Push to Docker Hub after build (manual):
-#   docker tag sglang-ci-runner:latest bingxche/sglang-ci-runner:latest
-#   docker push bingxche/sglang-ci-runner:latest
+#   docker tag sglang-ci-bot-runner:latest bingxche/sglang-ci-bot-runner:latest
+#   docker push bingxche/sglang-ci-bot-runner:latest
 #
 #   # Other machines: pull from Docker Hub (no build needed)
-#   bash setup.sh --pat ghp_xxxx --image bingxche/sglang-ci-runner:latest
+#   bash setup.sh --pat ghp_xxxx --image bingxche/sglang-ci-bot-runner:latest
 set -euo pipefail
 
 REPO="bingxche/sglang-ci-bot"
-RUNNER_NAME="amd-ci-runner"
+RUNNER_NAME="amd-ci-bot-runner"
 GH_PAT=""
 RUNNER_VERSION="2.323.0"
 IMAGE=""
 FORCE_BUILD=false
 MIN_DISK_MB=3000
-LOCAL_TAG="sglang-ci-runner:latest"
+LOCAL_TAG="sglang-ci-bot-runner:latest"
+RUNNER_COUNT=10
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -31,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --name)  RUNNER_NAME="$2"; shift 2 ;;
         --repo)  REPO="$2"; shift 2 ;;
         --image) IMAGE="$2"; shift 2 ;;
+        --count) RUNNER_COUNT="$2"; shift 2 ;;
         --build) FORCE_BUILD=true; shift ;;
         *)       echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -38,7 +43,12 @@ done
 
 if [ -z "$GH_PAT" ]; then
     echo "ERROR: --pat <GH_PAT> is required"
-    echo "Usage: bash setup.sh --pat ghp_xxxx [--name my-runner] [--image user/repo:tag] [--build]"
+    echo "Usage: bash setup.sh --pat ghp_xxxx [--count 10] [--name my-runner] [--image user/repo:tag] [--build]"
+    exit 1
+fi
+
+if ! [[ "$RUNNER_COUNT" =~ ^[0-9]+$ ]] || [ "$RUNNER_COUNT" -lt 1 ]; then
+    echo "ERROR: --count must be a positive integer (got: $RUNNER_COUNT)"
     exit 1
 fi
 
@@ -170,40 +180,46 @@ ENTRYPOINT
 
     echo ""
     echo "    TIP: Push to Docker Hub to skip builds on other machines:"
-    echo "      docker tag ${LOCAL_TAG} <your-dockerhub-user>/sglang-ci-runner:latest"
-    echo "      docker push <your-dockerhub-user>/sglang-ci-runner:latest"
+    echo "      docker tag ${LOCAL_TAG} bingxche/sglang-ci-bot-runner:latest"
+    echo "      docker push bingxche/sglang-ci-bot-runner:latest"
     echo ""
 fi
 
-echo "==> Stopping old container (if any)..."
-docker rm -f sglang-ci-runner 2>/dev/null || true
+echo "==> Stopping old containers (if any)..."
+for i in $(seq 1 "$RUNNER_COUNT"); do
+    docker rm -f "${RUNNER_NAME}-${i}" 2>/dev/null || true
+done
+docker rm -f sglang-ci-bot-runner 2>/dev/null || true
 
-echo "==> Starting runner..."
-docker run -d \
-    --name sglang-ci-runner \
-    --restart unless-stopped \
-    --log-driver json-file \
-    --log-opt max-size=100m \
-    --log-opt max-file=100 \
-    -v sglang-runner-toolcache:/home/runner/actions-runner/_tool \
-    -e REPO_URL="https://github.com/${REPO}" \
-    -e GH_PAT="${GH_PAT}" \
-    -e RUNNER_NAME="${RUNNER_NAME}" \
-    -e LABELS="self-hosted,amd-internal" \
-    "${RUN_IMAGE}"
+echo "==> Starting ${RUNNER_COUNT} runners..."
+for i in $(seq 1 "$RUNNER_COUNT"); do
+    CONTAINER_NAME="${RUNNER_NAME}-${i}"
+    echo "    Starting ${CONTAINER_NAME}..."
+    docker run -d \
+        --name "${CONTAINER_NAME}" \
+        --restart unless-stopped \
+        --log-driver json-file \
+        --log-opt max-size=100m \
+        --log-opt max-file=100 \
+        -v "sglang-runner-toolcache-${i}:/home/runner/actions-runner/_tool" \
+        -e REPO_URL="https://github.com/${REPO}" \
+        -e GH_PAT="${GH_PAT}" \
+        -e RUNNER_NAME="${CONTAINER_NAME}" \
+        -e LABELS="self-hosted,amd-internal" \
+        "${RUN_IMAGE}"
+done
 
 echo ""
 echo "============================================"
-echo "  Runner deployed successfully!"
+echo "  ${RUNNER_COUNT} runners deployed successfully!"
 echo "============================================"
-echo "  Container : sglang-ci-runner"
-echo "  Runner    : ${RUNNER_NAME}"
-echo "  Repo      : ${REPO}"
-echo "  Labels    : self-hosted, amd-internal"
-echo "  Log limit : 100MB x 100 files (10GB max)"
+echo "  Containers : ${RUNNER_NAME}-{1..${RUNNER_COUNT}}"
+echo "  Repo       : ${REPO}"
+echo "  Labels     : self-hosted, amd-internal"
+echo "  Log limit  : 100MB x 100 files per container"
 echo ""
-echo "  View logs : docker logs -f sglang-ci-runner"
-echo "  Stop      : docker stop sglang-ci-runner"
-echo "  Remove    : docker rm -f sglang-ci-runner"
-echo "  Cleanup   : docker volume rm sglang-runner-toolcache"
+echo "  View logs  : docker logs -f ${RUNNER_NAME}-1"
+echo "  Stop all   : for i in \$(seq 1 ${RUNNER_COUNT}); do docker stop ${RUNNER_NAME}-\$i; done"
+echo "  Remove all : for i in \$(seq 1 ${RUNNER_COUNT}); do docker rm -f ${RUNNER_NAME}-\$i; done"
+echo "  Cleanup    : for i in \$(seq 1 ${RUNNER_COUNT}); do docker volume rm sglang-runner-toolcache-\$i; done"
 echo "============================================"

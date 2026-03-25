@@ -20,6 +20,10 @@ on:
   repository_dispatch:
     types: [pr-review]
 
+concurrency:
+  group: pr-review-${{ github.event.client_payload.pr_number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
 jobs:
   review:
     runs-on: [self-hosted, amd-internal]

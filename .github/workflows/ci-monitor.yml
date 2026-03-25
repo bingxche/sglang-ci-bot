@@ -22,6 +22,10 @@ on:
           - daily-issue
           - stdout
 
+concurrency:
+  group: ci-monitor
+  cancel-in-progress: false
+
 jobs:
   monitor:
     runs-on: [self-hosted, amd-internal]

@@ -10,6 +10,10 @@ on:
         required: false
         default: '1'
 
+concurrency:
+  group: comment-watcher
+  cancel-in-progress: false
+
 jobs:
   watch:
     runs-on: [self-hosted, amd-internal]
