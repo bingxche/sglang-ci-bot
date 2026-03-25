@@ -10,6 +10,8 @@ Runs entirely from a **separate personal repo** using GitHub Actions + GitHub RE
 
 - [Features Overview](#features-overview)
 - [Setup](#setup)
+  - [Deploy Self-Hosted Runner](#3-deploy-self-hosted-runner)
+  - [Concurrency](#concurrency)
 - [Feature 1: CI Failure Monitor](#feature-1-ci-failure-monitor)
 - [Feature 2: PR Code Review](#feature-2-pr-code-review)
 - [Feature 3: CI Status Check for a PR](#feature-3-ci-status-check-for-a-pr)
@@ -53,9 +55,50 @@ In your bot repo, go to **Settings > Secrets and variables > Actions** and add:
 | `LLM_GATEWAY_KEY` | AMD LLM Gateway subscription key |
 | `LLM_GATEWAY_URL` | AMD LLM Gateway endpoint (e.g. `https://llm-api.amd.com/Anthropic`) |
 
-### 3. Enable Workflows
+### 3. Deploy Self-Hosted Runner
+
+All workflows run on self-hosted runners with the `amd-internal` label. The `runner/setup.sh` script builds a Docker image and spawns multiple runner containers (default: 10) so jobs can execute in parallel.
+
+```bash
+# First time: build image and start 10 runners
+bash runner/setup.sh --pat ghp_xxxx --build
+
+# Custom count
+bash runner/setup.sh --pat ghp_xxxx --count 5 --build
+
+# On other machines: pull pre-built image from Docker Hub
+bash runner/setup.sh --pat ghp_xxxx --image bingxche/sglang-ci-bot-runner:latest
+```
+
+This creates containers `amd-ci-bot-runner-1` through `amd-ci-bot-runner-10`, each registered as an independent GitHub Actions runner. GitHub distributes queued jobs across idle runners automatically.
+
+```bash
+# View logs for a specific runner
+docker logs -f amd-ci-bot-runner-1
+
+# Stop all runners
+for i in $(seq 1 10); do docker stop amd-ci-bot-runner-$i; done
+
+# Remove all runners
+for i in $(seq 1 10); do docker rm -f amd-ci-bot-runner-$i; done
+```
+
+### 4. Enable Workflows
 
 Push the code to your repo. GitHub Actions will automatically pick up the workflow files and start running on their cron schedules.
+
+### Concurrency
+
+Each workflow has a `concurrency` group to prevent redundant or conflicting runs:
+
+| Workflow | Concurrency group | Behavior |
+|----------|-------------------|----------|
+| `pr-review.yml` | Per PR number | If the same PR is requested again, the old run is cancelled |
+| `ci-status-check.yml` | Per PR number | Same as above |
+| `comment-watcher.yml` | Single instance | Only one watcher runs at a time (stateful, prevents duplicate dispatches) |
+| `ci-monitor.yml` | Single instance | Only one monitor runs at a time (stateful, prevents duplicate issues) |
+
+Different PRs are processed in parallel across the available runners.
 
 ---
 
@@ -370,7 +413,7 @@ Processed comment IDs are stored in `.state/last_check.json` to avoid re-process
 
 ```bash
 # Clone the repo
-git clone https://github.com/user/sglang-ci-bot.git
+git clone https://github.com/bingxche/sglang-ci-bot.git
 cd sglang-ci-bot
 
 # Create venv and install dependencies
@@ -432,8 +475,8 @@ sglang-ci-bot/
     comment-watcher.yml    Comment poller (cron every 15min, fallback for daemon)
   runner/
     Dockerfile             Self-hosted runner Docker image
-    setup.sh               Runner registration and setup
-    entrypoint.sh          Runner container entrypoint
+    setup.sh               Multi-runner deployment (spawns N containers, default 10)
+    entrypoint.sh          Runner container entrypoint (register + run)
   .state/                  Persisted state files (gitignored, cached in Actions)
   .secrets/                Local secret files (gitignored)
   requirements.txt         Python dependencies (anthropic, httpx, requests)
