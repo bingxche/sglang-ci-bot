@@ -109,7 +109,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates git jq \
+    && apt-get install -y --no-install-recommends curl ca-certificates git jq libicu-dev \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir anthropic httpx requests \
     && useradd -m runner \
