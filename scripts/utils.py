@@ -51,6 +51,25 @@ ERROR_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+EXCEPTION_PATTERNS = re.compile(
+    r"|".join([
+        r"Traceback \(most recent call last\)",
+        r"AssertionError",
+        r"RuntimeError",
+        r"ValueError",
+        r"TypeError",
+        r"ModuleNotFoundError",
+        r"ImportError",
+        r"FileNotFoundError",
+        r"ConnectionError",
+        r"OOM|Out\s*[Oo]f\s*[Mm]emory",
+        r"[Ss]egmentation\s+fault|segfault|SEGFAULT",
+        r"FATAL",
+        r"exit\s+code\s+[1-9]",
+    ]),
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Anthropic client

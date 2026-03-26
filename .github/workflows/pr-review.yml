@@ -21,7 +21,7 @@ on:
     types: [pr-review]
 
 concurrency:
-  group: pr-review-${{ github.event.client_payload.pr_number || github.event.inputs.pr_number }}
+  group: pr-review-${{ github.event.client_payload.comment_id || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:

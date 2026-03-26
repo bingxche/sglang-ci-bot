@@ -12,7 +12,7 @@ on:
         type: number
 
 concurrency:
-  group: ci-status-${{ github.event.client_payload.pr_number || github.event.inputs.pr_number }}
+  group: ci-status-${{ github.event.client_payload.comment_id || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:

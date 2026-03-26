@@ -10,11 +10,13 @@ import argparse
 import os
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
 from utils import (
     CLAUDE_MODEL,
+    EXCEPTION_PATTERNS,
     REPO,
     create_anthropic_client,
     cross_job_analysis,
@@ -228,18 +230,33 @@ Rules:
 # ---------------------------------------------------------------------------
 
 def _pick_best_error(ja: dict) -> dict | None:
-    """Pick the most relevant error line — prefer one from a failed step."""
+    """Pick the most relevant error line.
+
+    Priority order:
+      1. Exception-class errors in a failed step
+      2. Any error in a failed step
+      3. Exception-class errors in any step
+      4. First error overall
+    """
     if not ja["error_lines"]:
         return None
+
+    failed = ja["failed_steps"]
     for el in ja["error_lines"]:
-        if el["step_name"] in ja["failed_steps"]:
+        if el["step_name"] in failed and EXCEPTION_PATTERNS.search(el["preview"]):
+            return el
+    for el in ja["error_lines"]:
+        if el["step_name"] in failed:
+            return el
+    for el in ja["error_lines"]:
+        if EXCEPTION_PATTERNS.search(el["preview"]):
             return el
     return ja["error_lines"][0]
 
 
 def _format_error_table(analyses: list[dict]) -> str:
     """Build a markdown table of failed jobs with error previews."""
-    rows = "| Job | Failed Step | Error Preview | Log |\n"
+    rows = "| Job | Failed Step | Error Message | Log |\n"
     rows += "|-----|-----------|---------------|-----|\n"
 
     for ja in analyses:
@@ -248,13 +265,13 @@ def _format_error_table(analyses: list[dict]) -> str:
 
         if best:
             preview = best["preview"]
-            if len(preview) > 100:
-                preview = preview[:100] + "..."
+            if len(preview) > 150:
+                preview = preview[:150] + "..."
             preview = preview.replace("|", "\\|")
-            log_link = f"[View log]({best['url']})"
+            log_link = f"[View]({best['url']})"
         else:
             preview = "*(see detailed analysis)*"
-            log_link = f"[View log]({ja['job_url']})"
+            log_link = f"[View]({ja['job_url']})"
 
         rows += (
             f"| `{ja['job_name']}` | {failed_steps_str} "
@@ -326,26 +343,44 @@ def check_ci_for_pr(
         client = create_anthropic_client()
         all_job_analyses: list[dict] = []
 
-        # Build a flat queue of (workflow_info, job) across all failed workflows
         job_queue: list[tuple[dict, dict]] = []
         for wf in failed_workflows:
             for job in wf["failed_jobs"]:
                 job_queue.append((wf, job))
 
-        for wf, job in job_queue[:MAX_FAILED_JOBS]:
-            ja = analyze_failed_job(
-                client, job, wf["run_id"], wf["run_url"], token,
-            )
-            if ja:
-                ja["workflow_name"] = wf["name"]
-                all_job_analyses.append(ja)
+        jobs_to_analyze = job_queue[:MAX_FAILED_JOBS]
+        n_jobs = len(jobs_to_analyze)
+        max_workers = min(n_jobs + 2, 6)
+        print(f"\n  Analyzing {n_jobs} job(s) concurrently (workers={max_workers})...")
 
-        # Fetch PR diff for correlation analysis
-        print("\n  Fetching PR diff for correlation analysis...")
-        pr_diff = get_pr_diff(token, pr_number)
-        changed_files = get_pr_changed_files(token, pr_number)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            job_futures = {}
+            for wf, job in jobs_to_analyze:
+                fut = executor.submit(
+                    analyze_failed_job, client, job,
+                    wf["run_id"], wf["run_url"], token,
+                )
+                job_futures[fut] = wf
+
+            diff_future = executor.submit(get_pr_diff, token, pr_number)
+            files_future = executor.submit(get_pr_changed_files, token, pr_number)
+
+            for fut in as_completed(job_futures):
+                wf = job_futures[fut]
+                try:
+                    ja = fut.result()
+                except Exception as exc:
+                    print(f"  ERROR analyzing job in {wf['name']}: {exc}")
+                    continue
+                if ja:
+                    ja["workflow_name"] = wf["name"]
+                    all_job_analyses.append(ja)
+
+            pr_diff = diff_future.result()
+            changed_files = files_future.result()
+
         print(
-            f"  PR diff: {len(pr_diff):,} chars, "
+            f"\n  PR diff: {len(pr_diff):,} chars, "
             f"{len(changed_files)} file(s) changed"
         )
 

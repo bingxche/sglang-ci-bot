@@ -106,35 +106,43 @@ def is_pull_request(token: str, issue_url: str) -> bool:
     return "pull_request" in data
 
 
-def dispatch_review(token: str, bot_repo: str, pr_number: int, focus: str = "", comment_author: str = ""):
+def dispatch_review(
+    token: str, bot_repo: str, pr_number: int,
+    focus: str = "", comment_author: str = "", comment_id: int = 0,
+):
     """Trigger the PR review workflow via repository_dispatch."""
     url = f"https://api.github.com/repos/{bot_repo}/dispatches"
     payload = {
         "event_type": "pr-review",
         "client_payload": {
             "pr_number": str(pr_number),
+            "comment_id": str(comment_id),
             "focus": focus,
             "comment_author": comment_author,
         },
     }
     resp = requests.post(url, headers=gh_headers(token), json=payload)
     resp.raise_for_status()
-    log.info("Dispatched review for PR #%d", pr_number)
+    log.info("Dispatched review for PR #%d (comment %d)", pr_number, comment_id)
 
 
-def dispatch_ci_status(token: str, bot_repo: str, pr_number: int, comment_author: str = ""):
+def dispatch_ci_status(
+    token: str, bot_repo: str, pr_number: int,
+    comment_author: str = "", comment_id: int = 0,
+):
     """Trigger CI status check workflow."""
     url = f"https://api.github.com/repos/{bot_repo}/dispatches"
     payload = {
         "event_type": "ci-status",
         "client_payload": {
             "pr_number": str(pr_number),
+            "comment_id": str(comment_id),
             "comment_author": comment_author,
         },
     }
     resp = requests.post(url, headers=gh_headers(token), json=payload)
     resp.raise_for_status()
-    log.info("Dispatched CI status check for PR #%d", pr_number)
+    log.info("Dispatched CI status check for PR #%d (comment %d)", pr_number, comment_id)
 
 
 def post_help_comment(token: str, pr_number: int):
@@ -160,6 +168,26 @@ def add_reaction(token: str, comment_id: int, reaction: str = "eyes"):
     resp = requests.post(url, headers=headers, json={"content": reaction})
     if resp.status_code not in (200, 201):
         log.warning("Could not add reaction: HTTP %d", resp.status_code)
+
+
+def has_bot_claimed(token: str, comment_id: int, reaction: str = "rocket") -> bool:
+    """Check if the bot has already claimed this comment via a reaction.
+
+    Uses GitHub reactions as a distributed idempotency mechanism so that
+    both the cron watcher and the daemon watcher can share state without
+    needing a common filesystem or cache.
+    """
+    url = f"https://api.github.com/repos/{REPO}/issues/comments/{comment_id}/reactions"
+    headers = gh_headers(token)
+    headers["Accept"] = "application/vnd.github.squirrel-girl-preview+json"
+    resp = requests.get(url, headers=headers, params={"content": reaction, "per_page": 100})
+    if resp.status_code != 200:
+        log.warning("Could not check reactions: HTTP %d", resp.status_code)
+        return False
+    for r in resp.json():
+        if r.get("content") == reaction and r.get("user", {}).get("type") == "User":
+            return True
+    return False
 
 
 def process_comments(token: str, bot_repo: str, since: str | None = None):
@@ -202,22 +230,30 @@ def process_comments(token: str, bot_repo: str, since: str | None = None):
         )
 
     for cmd in new_commands:
+        cid = cmd["comment_id"]
+
+        if has_bot_claimed(token, cid, "rocket"):
+            log.info("Skipping PR #%d - %s (already claimed by another watcher)", cmd["pr_number"], cmd["command"])
+            processed_ids.add(cid)
+            continue
+
         log.info("Processing: PR #%d - %s (by @%s)", cmd["pr_number"], cmd["command"], cmd["author"])
 
-        add_reaction(token, cmd["comment_id"], "eyes")
+        add_reaction(token, cid, "rocket")
+        add_reaction(token, cid, "eyes")
 
         if cmd["command"] == "review":
-            dispatch_review(token, bot_repo, cmd["pr_number"], comment_author=cmd["author"])
+            dispatch_review(token, bot_repo, cmd["pr_number"], comment_author=cmd["author"], comment_id=cid)
         elif cmd["command"] == "review-focus":
-            dispatch_review(token, bot_repo, cmd["pr_number"], focus=cmd["args"], comment_author=cmd["author"])
+            dispatch_review(token, bot_repo, cmd["pr_number"], focus=cmd["args"], comment_author=cmd["author"], comment_id=cid)
         elif cmd["command"] == "ci-status":
-            dispatch_ci_status(token, bot_repo, cmd["pr_number"], comment_author=cmd["author"])
+            dispatch_ci_status(token, bot_repo, cmd["pr_number"], comment_author=cmd["author"], comment_id=cid)
         elif cmd["command"] == "help":
             post_help_comment(token, cmd["pr_number"])
         else:
             log.warning("Unknown command: %s", cmd["command"])
 
-        processed_ids.add(cmd["comment_id"])
+        processed_ids.add(cid)
 
     state["processed_comment_ids"] = list(processed_ids)[-500:]
     state["last_check"] = datetime.now(timezone.utc).isoformat()
