@@ -2,22 +2,25 @@
 # One-command setup for sglang-ci-bot self-hosted GitHub Actions runners.
 #
 # Usage:
-#   bash setup.sh --pat <GH_PAT> [--count N] [--name <runner-prefix>] [--image <dockerhub-image>] [--build]
+#   bash runner/setup.sh --pat <GH_PAT> [--count N] [--name <runner-prefix>] [--image <dockerhub-image>] [--build]
 #
 # Examples:
 #   # First time: build locally, spawn 10 runners (default)
-#   bash setup.sh --pat ghp_xxxx --build
+#   bash runner/setup.sh --pat ghp_xxxx --build
 #
 #   # Spawn 5 runners with custom prefix
-#   bash setup.sh --pat ghp_xxxx --count 5 --name my-runner --build
+#   bash runner/setup.sh --pat ghp_xxxx --count 5 --name my-runner --build
 #
 #   # Push to Docker Hub after build (manual):
 #   docker tag sglang-ci-bot-runner:latest bingxche/sglang-ci-bot-runner:latest
 #   docker push bingxche/sglang-ci-bot-runner:latest
 #
 #   # Other machines: pull from Docker Hub (no build needed)
-#   bash setup.sh --pat ghp_xxxx --image bingxche/sglang-ci-bot-runner:latest
+#   bash runner/setup.sh --pat ghp_xxxx --image bingxche/sglang-ci-bot-runner:latest
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 REPO="bingxche/sglang-ci-bot"
 RUNNER_NAME="amd-ci-bot-runner"
@@ -44,7 +47,7 @@ done
 
 if [ -z "$GH_PAT" ]; then
     echo "ERROR: --pat <GH_PAT> is required"
-    echo "Usage: bash setup.sh --pat ghp_xxxx [--count 10] [--name my-runner] [--image user/repo:tag] [--build]"
+    echo "Usage: bash runner/setup.sh --pat ghp_xxxx [--count 10] [--name my-runner] [--image user/repo:tag] [--build]"
     exit 1
 fi
 
@@ -97,87 +100,10 @@ else
 fi
 
 if [ "$FORCE_BUILD" = true ]; then
-    BUILDDIR=$(mktemp -d)
-    trap "rm -rf ${BUILDDIR}" EXIT
-
-    cat > "${BUILDDIR}/Dockerfile" << 'DOCKERFILE'
-FROM python:3.12-slim
-
-ARG RUNNER_VERSION=2.333.0
-ARG TARGETARCH=x64
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates git jq libicu-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir anthropic httpx requests \
-    && useradd -m runner \
-    && mkdir -p /home/runner/actions-runner \
-    && curl -fsSL \
-       "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${TARGETARCH}-${RUNNER_VERSION}.tar.gz" \
-       | tar xz -C /home/runner/actions-runner \
-    && chown -R runner:runner /home/runner
-
-WORKDIR /home/runner/actions-runner
-USER runner
-COPY entrypoint.sh /entrypoint.sh
-ENTRYPOINT ["/entrypoint.sh"]
-DOCKERFILE
-
-    cat > "${BUILDDIR}/entrypoint.sh" << 'ENTRYPOINT'
-#!/bin/bash
-set -euo pipefail
-
-REPO_URL="${REPO_URL:?REPO_URL is required}"
-GH_PAT="${GH_PAT:?GH_PAT is required}"
-RUNNER_NAME="${RUNNER_NAME:-$(hostname)}"
-LABELS="${LABELS:-self-hosted,amd-internal}"
-
-WORKDIR_CLEANUP="${WORKDIR_CLEANUP:-true}"
-if [ "$WORKDIR_CLEANUP" = "true" ] && [ -d "_work" ]; then
-    echo "Cleaning up previous workspace..."
-    rm -rf _work/*
-fi
-
-REPO_PATH="${REPO_URL#https://github.com/}"
-
-echo "Requesting registration token for ${REPO_PATH}..."
-RUNNER_TOKEN=$(curl -fsSL \
-    -X POST \
-    -H "Authorization: token ${GH_PAT}" \
-    -H "Accept: application/vnd.github+json" \
-    "https://api.github.com/repos/${REPO_PATH}/actions/runners/registration-token" \
-    | jq -r .token)
-
-if [ -z "$RUNNER_TOKEN" ] || [ "$RUNNER_TOKEN" = "null" ]; then
-    echo "ERROR: Failed to get registration token. Check your GH_PAT." >&2
-    exit 1
-fi
-
-cleanup() {
-    echo "Removing runner..."
-    ./config.sh remove --token "$RUNNER_TOKEN" 2>/dev/null || true
-}
-trap cleanup EXIT SIGTERM SIGINT
-
-./config.sh \
-    --url "$REPO_URL" \
-    --token "$RUNNER_TOKEN" \
-    --name "$RUNNER_NAME" \
-    --labels "$LABELS" \
-    --unattended \
-    --replace
-
-exec ./run.sh
-ENTRYPOINT
-    chmod +x "${BUILDDIR}/entrypoint.sh"
-
-    echo "==> Building Docker image..."
+    echo "==> Building Docker image from ${SCRIPT_DIR}..."
     docker build -t "${LOCAL_TAG}" \
         --build-arg RUNNER_VERSION="${RUNNER_VERSION}" \
-        "${BUILDDIR}"
+        "${SCRIPT_DIR}"
 
     echo ""
     echo "    TIP: Push to Docker Hub to skip builds on other machines:"
@@ -186,19 +112,32 @@ ENTRYPOINT
     echo ""
 fi
 
+# --- Pre-download runner tarball for offline updates ---
+RUNNER_TARBALL="/tmp/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+RUNNER_MOUNT_ARGS=()
+if [ -f "$RUNNER_TARBALL" ]; then
+    echo "==> Found runner tarball: ${RUNNER_TARBALL}"
+    RUNNER_MOUNT_ARGS=(-v "${RUNNER_TARBALL}:/tmp/runner-update.tar.gz:ro")
+else
+    echo "==> No pre-downloaded runner tarball at ${RUNNER_TARBALL} (optional, skipping)"
+fi
+
 echo "==> Stopping old containers (if any)..."
 for i in $(seq 1 "$RUNNER_COUNT"); do
     docker rm -f "${RUNNER_NAME}-${i}" 2>/dev/null || true
 done
 docker rm -f sglang-ci-bot-runner 2>/dev/null || true
 
+ENTRYPOINT_PATH="${SCRIPT_DIR}/entrypoint.sh"
+
 echo "==> Starting ${RUNNER_COUNT} runners..."
 for i in $(seq 1 "$RUNNER_COUNT"); do
     CONTAINER_NAME="${RUNNER_NAME}-${i}"
     echo "    Starting ${CONTAINER_NAME}..."
-    WATCHER_ARGS=()
+
+    EXTRA_ARGS=()
     if [ "$i" -eq 1 ]; then
-        WATCHER_ARGS=(-e ENABLE_WATCHER=true -e POLL_INTERVAL="${POLL_INTERVAL}")
+        EXTRA_ARGS=(-e ENABLE_WATCHER=true -e POLL_INTERVAL="${POLL_INTERVAL}")
     fi
 
     docker run -d \
@@ -208,11 +147,13 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
         --log-opt max-size=100m \
         --log-opt max-file=100 \
         -v "sglang-runner-toolcache-${i}:/home/runner/actions-runner/_tool" \
+        -v "${ENTRYPOINT_PATH}:/entrypoint.sh:ro" \
+        "${RUNNER_MOUNT_ARGS[@]}" \
         -e REPO_URL="https://github.com/${REPO}" \
         -e GH_PAT="${GH_PAT}" \
         -e RUNNER_NAME="${CONTAINER_NAME}" \
         -e LABELS="self-hosted,amd-internal" \
-        "${WATCHER_ARGS[@]}" \
+        "${EXTRA_ARGS[@]}" \
         "${RUN_IMAGE}"
 done
 
@@ -221,10 +162,12 @@ echo "============================================"
 echo "  ${RUNNER_COUNT} runners deployed successfully!"
 echo "============================================"
 echo "  Containers : ${RUNNER_NAME}-{1..${RUNNER_COUNT}}"
-echo "  Watcher    : ${RUNNER_NAME}-1 (polling every ${POLL_INTERVAL}s)"
+echo "  Watcher    : ${RUNNER_NAME}-1 (daemon polling every ${POLL_INTERVAL}s)"
 echo "  Repo       : ${REPO}"
 echo "  Labels     : self-hosted, amd-internal"
+echo "  Entrypoint : ${ENTRYPOINT_PATH} (bind-mounted, restart to apply changes)"
 echo ""
 echo "  View logs  : docker logs -f ${RUNNER_NAME}-1"
+echo "  Restart all: for i in \$(seq 1 ${RUNNER_COUNT}); do docker restart ${RUNNER_NAME}-\$i; done"
 echo "  Stop all   : for i in \$(seq 1 ${RUNNER_COUNT}); do docker rm -f ${RUNNER_NAME}-\$i; done"
 echo "============================================"
