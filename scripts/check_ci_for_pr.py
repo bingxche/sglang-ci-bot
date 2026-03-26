@@ -16,13 +16,14 @@ import requests
 
 from utils import (
     CLAUDE_MODEL,
-    EXCEPTION_PATTERNS,
+    GATE_STEP_PATTERNS,
     REPO,
+    analyze_failed_job_focused,
     create_anthropic_client,
     cross_job_analysis,
     download_job_logs,
+    extract_env_context,
     extract_error_lines,
-    final_job_analysis,
     get_pr_changed_files,
     get_pr_diff,
     get_run_jobs,
@@ -30,7 +31,6 @@ from utils import (
     gh_headers,
     parse_log_by_steps,
     post_comment,
-    progressive_step_analysis,
 )
 
 MAX_FAILED_JOBS = 8
@@ -108,27 +108,41 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Gate job detection
+# ---------------------------------------------------------------------------
+
+def _is_gate_job(job: dict) -> bool:
+    """Return True if the job is a coordinator/gate job.
+
+    Gate jobs (e.g. pr-test-finish, wait-for-stage-b) only check whether
+    dependent jobs passed. Their failure is always "a dependent job failed"
+    and they carry no diagnostic value worth an LLM call.
+    """
+    failed_steps = [
+        s for s in job.get("steps", [])
+        if s.get("conclusion") == "failure"
+    ]
+    if not failed_steps:
+        return False
+    return all(GATE_STEP_PATTERNS.search(s["name"]) for s in failed_steps)
+
+
+# ---------------------------------------------------------------------------
 # Per-job analysis
 # ---------------------------------------------------------------------------
 
 def analyze_failed_job(
     client, job: dict, run_id: int, run_url: str, token: str,
 ) -> dict | None:
-    """Analyze a single failed job: extract error previews + LLM analysis."""
+    """Analyze a single failed job: extract error previews + LLM analysis.
+
+    Gate/coordinator jobs are returned with a minimal static analysis
+    instead of consuming an LLM call.
+    """
     job_name = job["name"]
     job_id = job["id"]
     job_url = job.get("html_url", run_url)
     api_steps = job.get("steps", [])
-
-    print(f"\n  Job: {job_name} (ID: {job_id})")
-
-    print("    Downloading job log...")
-    raw_log = download_job_logs(token, job_id)
-    print(f"    Log size: {len(raw_log):,} chars")
-
-    print("    Extracting error lines...")
-    error_lines = extract_error_lines(raw_log, api_steps, run_id, job_id)
-    print(f"    Found {len(error_lines)} error line(s)")
 
     failed_step_names: set[str] = set()
     for s in api_steps:
@@ -137,14 +151,50 @@ def analyze_failed_job(
     if not failed_step_names:
         failed_step_names = {"(unknown)"}
 
+    if _is_gate_job(job):
+        print(f"\n  Job: {job_name} (ID: {job_id}) — gate job, skipping LLM analysis")
+        return {
+            "job_name": job_name,
+            "job_id": job_id,
+            "run_id": run_id,
+            "run_url": run_url,
+            "job_url": job_url,
+            "failed_steps": sorted(failed_step_names),
+            "error_lines": [],
+            "analysis": "Gate/coordinator job — failed because a dependent job failed. See the actual failing job(s) above.",
+            "is_gate": True,
+        }
+
+    print(f"\n  Job: {job_name} (ID: {job_id})")
+
+    print("    Downloading job log...")
+    raw_log = download_job_logs(token, job_id)
+    print(f"    Log size: {len(raw_log):,} chars")
+
     steps = parse_log_by_steps(raw_log)
     print(f"    Parsed {len(steps)} step(s)")
-    print("    Running progressive step analysis...")
-    accumulated = progressive_step_analysis(
-        client, job_name, steps, failed_step_names,
+
+    print("    Extracting error lines (failed steps only)...")
+    error_lines = extract_error_lines(
+        raw_log, api_steps, run_id, job_id,
+        failed_step_names=failed_step_names,
     )
-    print("    Generating job analysis...")
-    analysis = final_job_analysis(client, job_name, run_url, accumulated)
+    print(f"    Found {len(error_lines)} error line(s)")
+
+    print("    Extracting environment context...")
+    env_context = extract_env_context(steps)
+    print(f"    {env_context}")
+
+    failed_step_logs = [
+        s for s in steps if s["name"] in failed_step_names
+    ]
+    if not failed_step_logs:
+        failed_step_logs = steps[-2:] if len(steps) >= 2 else steps
+
+    print(f"    Running focused analysis on {len(failed_step_logs)} failed step(s)...")
+    analysis = analyze_failed_job_focused(
+        client, job_name, run_url, failed_step_logs, env_context,
+    )
 
     return {
         "job_name": job_name,
@@ -155,6 +205,7 @@ def analyze_failed_job(
         "failed_steps": sorted(failed_step_names),
         "error_lines": error_lines,
         "analysis": analysis,
+        "is_gate": False,
     }
 
 
@@ -184,6 +235,8 @@ def analyze_pr_correlation(
 
     errors_summary = ""
     for ja in all_job_analyses:
+        if ja.get("is_gate"):
+            continue
         errors_summary += f"\n#### Job: `{ja['job_name']}`\n"
         errors_summary += f"Failed step(s): {', '.join(ja['failed_steps'])}\n"
         if ja["error_lines"]:
@@ -208,12 +261,13 @@ For EACH failed job, provide your assessment in this exact markdown table format
 
 | Job | Verdict | Explanation |
 |-----|---------|-------------|
-| job_name / failed_step | Likely related / Possibly related / Unlikely related | One sentence explanation |
+| job_name / failed_step | :red_circle: **Likely related** | One sentence explanation |
 
 Rules:
-- "Likely related" = the error clearly involves code paths touched by the PR
-- "Possibly related" = the error could be influenced by the PR but also has other explanations
-- "Unlikely related" = the error is in unrelated code, infrastructure, or a known flaky test
+- Use ":red_circle: **Likely related**" = the error clearly involves code paths touched by the PR
+- Use ":yellow_circle: **Possibly related**" = the error could be influenced by the PR but also has other explanations
+- Use ":green_circle: **Unlikely related**" = the error is in unrelated code, infrastructure, or a known flaky test
+- You MUST include both the emoji AND the bold text for every verdict
 - Keep explanations to ONE concise sentence each
 - Do NOT add any text outside the table"""
 
@@ -232,26 +286,24 @@ Rules:
 def _pick_best_error(ja: dict) -> dict | None:
     """Pick the most relevant error line.
 
-    Priority order:
-      1. Exception-class errors in a failed step
-      2. Any error in a failed step
-      3. Exception-class errors in any step
-      4. First error overall
+    With structural extraction, errors are already ordered with the most
+    specific at the end (root cause exception, not Traceback header).
+
+    Priority: ##[error] annotations > Python exceptions > tail lines.
+    Within each source, the last match wins (it's the most specific).
     """
     if not ja["error_lines"]:
         return None
 
-    failed = ja["failed_steps"]
-    for el in ja["error_lines"]:
-        if el["step_name"] in failed and EXCEPTION_PATTERNS.search(el["preview"]):
-            return el
-    for el in ja["error_lines"]:
-        if el["step_name"] in failed:
-            return el
-    for el in ja["error_lines"]:
-        if EXCEPTION_PATTERNS.search(el["preview"]):
-            return el
-    return ja["error_lines"][0]
+    annotations = [e for e in ja["error_lines"] if e.get("source") == "annotation"]
+    if annotations:
+        return annotations[-1]
+
+    exceptions = [e for e in ja["error_lines"] if e.get("source") == "exception"]
+    if exceptions:
+        return exceptions[-1]
+
+    return ja["error_lines"][-1]
 
 
 def _format_error_table(analyses: list[dict]) -> str:
@@ -265,8 +317,8 @@ def _format_error_table(analyses: list[dict]) -> str:
 
         if best:
             preview = best["preview"]
-            if len(preview) > 150:
-                preview = preview[:150] + "..."
+            if len(preview) > 200:
+                preview = preview[:200] + "..."
             preview = preview.replace("|", "\\|")
             log_link = f"[View]({best['url']})"
         else:
@@ -282,12 +334,32 @@ def _format_error_table(analyses: list[dict]) -> str:
 
 
 def _format_details(ja: dict) -> str:
-    """Build a collapsible per-job detail section."""
+    """Build a collapsible per-job detail section.
+
+    Only shows error locations from failed steps (not preamble/passed
+    step noise), limited to the 5 most relevant lines.
+    """
+    if ja.get("is_gate"):
+        return f"""
+<details>
+<summary><b>{ja['job_name']}</b> — gate job (dependent job failed)</summary>
+
+{ja['analysis']}
+
+</details>
+"""
+
+    failed = set(ja["failed_steps"])
+    relevant_errors = [
+        el for el in ja["error_lines"]
+        if el["step_name"] in failed
+    ]
+
     error_listing = ""
-    if ja["error_lines"]:
+    if relevant_errors:
         error_listing = "**Error locations:**\n"
-        for el in ja["error_lines"][:10]:
-            short = el["preview"][:120]
+        for el in relevant_errors[:5]:
+            short = el["preview"][:150]
             error_listing += (
                 f"- [{el['step_name']} L{el['line_number']}]({el['url']})"
                 f": `{short}`\n"
@@ -384,18 +456,20 @@ def check_ci_for_pr(
             f"{len(changed_files)} file(s) changed"
         )
 
+        real_analyses = [ja for ja in all_job_analyses if not ja.get("is_gate")]
+
         correlation = ""
-        if all_job_analyses and pr_diff:
+        if real_analyses and pr_diff:
             print("\n  Running PR correlation analysis...")
             correlation = analyze_pr_correlation(
-                client, pr_number, changed_files, pr_diff, all_job_analyses,
+                client, pr_number, changed_files, pr_diff, real_analyses,
             )
 
         cross = ""
-        if len(all_job_analyses) > 1:
-            print(f"\n  Cross-job analysis ({len(all_job_analyses)} jobs)...")
+        if len(real_analyses) > 1:
+            print(f"\n  Cross-job analysis ({len(real_analyses)} jobs)...")
             cross = cross_job_analysis(
-                client, f"PR #{pr_number}", all_job_analyses,
+                client, f"PR #{pr_number}", real_analyses,
             )
 
         # --- Build comment body ---

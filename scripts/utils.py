@@ -70,6 +70,25 @@ EXCEPTION_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Structural error signals — instead of enumerating error keywords,
+# rely on CI log structure and Python language conventions.
+_GH_ANNOTATION_RE = re.compile(r"##\[error\](.*)")
+_PYTHON_EXCEPTION_RE = re.compile(r"\w+(?:Error|Exception)\b\s*:.+")
+
+GATE_STEP_PATTERNS = re.compile(
+    r"Check all dependent job statuses|Wait for .* jobs to complete",
+    re.IGNORECASE,
+)
+
+_ENV_PATTERNS = {
+    "python": re.compile(r"Python\s+([\d.]+)"),
+    "torch": re.compile(r"torch(?:==|\s+)([\d.]+\S*)"),
+    "rocm": re.compile(r"ROCm\s*([\d.]+)|rocm([\d.]+)"),
+    "cuda": re.compile(r"CUDA\s+(?:Version[:\s]*)?([\d.]+)"),
+    "gpu": re.compile(r"(gfx\w+|MI\d+\w*|A100|H100|H200|L40)", re.IGNORECASE),
+    "sglang": re.compile(r"sglang(?:==|\s+)([\d.]+\S*)"),
+}
+
 
 # ---------------------------------------------------------------------------
 # Anthropic client
@@ -225,16 +244,24 @@ def extract_error_lines(
     job_steps_api: list[dict],
     run_id: int,
     job_id: int,
-    max_errors_per_step: int = 5,
+    failed_step_names: set[str] | None = None,
+    max_errors_per_step: int = 10,
 ) -> list[dict]:
-    """Extract error lines from a job log with deep-link URLs.
+    """Extract errors from failed steps using structural signals.
 
-    Maps parsed log steps to the GitHub API step numbers, scans for
-    ``ERROR_PATTERNS``, and builds URLs of the form::
+    Instead of enumerating error keywords (ERROR_PATTERNS, NOISE_PATTERNS,
+    etc.), uses two signals that follow from CI log structure:
 
-        https://github.com/{REPO}/actions/runs/{run_id}/job/{job_id}#step:{N}:{L}
+    1. ``##[error]`` annotations — GitHub Actions' own error markers.
+       These are the same lines that render as red annotations in the UI.
+    2. Python exception lines — any line matching ``\\w+Error:`` or
+       ``\\w+Exception:``.  This single pattern catches ALL Python
+       exceptions by convention, with no enumeration needed.
+    3. Fallback: last non-empty line of the failed step (the error is
+       always near the end of sequential output).
 
-    Returns a list of dicts with keys: step_name, preview, url, line_number.
+    Returns errors ordered so that the LAST entry is the most specific
+    (the root cause exception, not the Traceback header).
     """
     parsed_steps = parse_log_by_steps(raw_log)
 
@@ -245,37 +272,67 @@ def extract_error_lines(
     errors: list[dict] = []
     for parsed_step in parsed_steps:
         step_name = parsed_step["name"]
+
+        if failed_step_names is not None and step_name not in failed_step_names:
+            continue
+
         step_num = step_num_map.get(step_name)
         lines = parsed_step["content"].split("\n")
+        step_errors: list[dict] = []
 
-        step_error_count = 0
         for line_idx, line in enumerate(lines):
-            if ERROR_PATTERNS.search(line):
-                clean = _TIMESTAMP_RE.sub("", line).strip()
-                preview = clean[:200]
+            clean = _TIMESTAMP_RE.sub("", line).strip()
+            if not clean:
+                continue
 
-                if step_num is not None:
-                    url = (
-                        f"https://github.com/{REPO}/actions/runs/"
-                        f"{run_id}/job/{job_id}#step:{step_num}:{line_idx + 1}"
-                    )
-                else:
-                    url = (
-                        f"https://github.com/{REPO}/actions/runs/"
-                        f"{run_id}/job/{job_id}"
-                    )
-
-                errors.append({
+            ann = _GH_ANNOTATION_RE.search(clean)
+            if ann:
+                msg = ann.group(1).strip()
+                if msg.startswith("Process completed with exit code"):
+                    continue
+                step_errors.append({
                     "step_name": step_name,
-                    "preview": preview,
-                    "url": url,
+                    "preview": msg[:200],
+                    "url": _step_url(run_id, job_id, step_num, line_idx),
                     "line_number": line_idx + 1,
+                    "source": "annotation",
                 })
-                step_error_count += 1
-                if step_error_count >= max_errors_per_step:
+                continue
+
+            if _PYTHON_EXCEPTION_RE.match(clean):
+                step_errors.append({
+                    "step_name": step_name,
+                    "preview": clean[:200],
+                    "url": _step_url(run_id, job_id, step_num, line_idx),
+                    "line_number": line_idx + 1,
+                    "source": "exception",
+                })
+
+        if not step_errors:
+            for line_idx in range(len(lines) - 1, max(0, len(lines) - 5) - 1, -1):
+                clean = _TIMESTAMP_RE.sub("", lines[line_idx]).strip()
+                if clean and not clean.startswith("##["):
+                    step_errors.append({
+                        "step_name": step_name,
+                        "preview": clean[:200],
+                        "url": _step_url(run_id, job_id, step_num, line_idx),
+                        "line_number": line_idx + 1,
+                        "source": "tail",
+                    })
                     break
 
+        errors.extend(step_errors[-max_errors_per_step:])
+
     return errors
+
+
+def _step_url(
+    run_id: int, job_id: int, step_num: int | None, line_idx: int,
+) -> str:
+    base = f"https://github.com/{REPO}/actions/runs/{run_id}/job/{job_id}"
+    if step_num is not None:
+        return f"{base}#step:{step_num}:{line_idx + 1}"
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +447,110 @@ def prefilter_large_step_log(
 
 
 # ---------------------------------------------------------------------------
-# Progressive step-by-step analysis with Claude
+# Environment context extraction (regex-based, no LLM)
+# ---------------------------------------------------------------------------
+
+def extract_env_context(steps: list[dict]) -> str:
+    """Extract key environment info from step logs using regex.
+
+    Scans all steps for Python/PyTorch/ROCm/CUDA versions, GPU model,
+    and sglang version. Returns a compact summary string suitable for
+    inclusion as context in an LLM prompt.
+    """
+    found: dict[str, str] = {}
+    all_text = "\n".join(s["content"][:20_000] for s in steps[:15])
+
+    for key, pat in _ENV_PATTERNS.items():
+        m = pat.search(all_text)
+        if m:
+            found[key] = next(g for g in m.groups() if g)
+
+    if not found:
+        return "(no environment info extracted)"
+
+    parts = []
+    if "python" in found:
+        parts.append(f"Python {found['python']}")
+    if "torch" in found:
+        parts.append(f"PyTorch {found['torch']}")
+    if "rocm" in found:
+        parts.append(f"ROCm {found['rocm']}")
+    if "cuda" in found:
+        parts.append(f"CUDA {found['cuda']}")
+    if "gpu" in found:
+        parts.append(f"GPU: {found['gpu']}")
+    if "sglang" in found:
+        parts.append(f"sglang {found['sglang']}")
+
+    return "Environment: " + ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Focused job analysis (single LLM call per job)
+# ---------------------------------------------------------------------------
+
+def analyze_failed_job_focused(
+    client: anthropic.Anthropic,
+    job_name: str,
+    run_url: str,
+    failed_step_logs: list[dict],
+    env_context: str,
+) -> str:
+    """Analyze a failed job with a single LLM call.
+
+    Instead of progressive step-by-step analysis (N LLM calls), sends
+    only the failed step log(s) plus a regex-extracted environment
+    context string. Produces the same output format as final_job_analysis.
+    """
+    steps_text = ""
+    for step in failed_step_logs:
+        log = step["content"]
+        if len(log) > STEP_LOG_PREFILTER_THRESHOLD:
+            log = prefilter_large_step_log(log)
+        steps_text += f"\n### Failed Step: {step['name']}\n```\n{log}\n```\n"
+
+    prompt = f"""You are a CI/CD expert analyzing a FAILED CI job in the sglang project (LLM serving framework on AMD GPUs).
+
+## Job: {job_name}
+## Run: {run_url}
+## {env_context}
+
+{steps_text}
+
+Produce a CONCISE report in the following format. Be brief — engineers will read this quickly and then go look at the logs themselves.
+
+### Failure Summary
+One or two sentences: what failed and why.
+
+### Failure Reasons
+List ALL distinct failure reasons as bullet points. Do NOT omit any. Each bullet should be one concise sentence.
+
+### Stack Traces
+Include the key error messages and stack traces verbatim (in code blocks). Engineers need these to locate the issue. Only include the relevant portions — not the entire log.
+
+### Suggested Fix Directions
+List potential fix directions as bullet points. Only state the DIRECTION (e.g. "pin transformers to <5.0.0", "add default value to vision_config field"). Do NOT write out code implementations or detailed steps.
+
+### Priority
+One word: Critical / High / Medium / Low — with a single sentence justification.
+
+IMPORTANT RULES:
+- Do NOT include environment tables, version tables, or lengthy context sections.
+- Do NOT write code examples for fixes.
+- Do NOT include "Environment Context" sections.
+- Keep the entire output under 300 lines of markdown.
+- Be direct and factual — no filler."""
+
+    msg = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return msg.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# Progressive step-by-step analysis with Claude (legacy, used by monitor_ci)
 # ---------------------------------------------------------------------------
 
 def progressive_step_analysis(
