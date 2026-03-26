@@ -28,8 +28,8 @@ Runs entirely from a **separate personal repo** using GitHub Actions + GitHub RE
 |---------|--------|---------|--------------|
 | CI Failure Monitor | `monitor_ci.py` | Cron (every 8h) or manual | Monitors nightly CI workflows, analyzes failures with progressive step-by-step analysis, posts daily issue reports |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Fetches PR diff, sends to Claude for structured code review, posts as PR comment |
-| CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI checks for a PR, downloads failure logs, analyzes with Claude |
-| Comment Watcher | `watch_comments.py` | Daemon or Cron (every 15min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches the appropriate action |
+| CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, concurrently analyzes failures with Claude, correlates with PR changes |
+| Comment Watcher | `watch_comments.py` | Daemon (15s) + Cron (5min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches with reaction-based idempotency |
 
 ---
 
@@ -59,46 +59,79 @@ In your bot repo, go to **Settings > Secrets and variables > Actions** and add:
 
 All workflows run on self-hosted runners with the `amd-internal` label. The `runner/setup.sh` script builds a Docker image and spawns multiple runner containers (default: 10) so jobs can execute in parallel.
 
+#### New node deployment (one command)
+
 ```bash
+# Clone the repo
+git clone https://github.com/bingxche/sglang-ci-bot.git
+cd sglang-ci-bot
+
 # First time: build image and start 10 runners
 bash runner/setup.sh --pat ghp_xxxx --build
 
-# Custom count
-bash runner/setup.sh --pat ghp_xxxx --count 5 --build
-
-# On other machines: pull pre-built image from Docker Hub
+# Or on other machines: pull pre-built image from Docker Hub (no build needed)
 bash runner/setup.sh --pat ghp_xxxx --image bingxche/sglang-ci-bot-runner:latest
 ```
 
-This creates containers `amd-ci-bot-runner-1` through `amd-ci-bot-runner-10`, each registered as an independent GitHub Actions runner. GitHub distributes queued jobs across idle runners automatically.
+This creates containers `amd-ci-bot-runner-1` through `amd-ci-bot-runner-10`:
+- **Runner-1** runs with `ENABLE_WATCHER=true` — starts a daemon that polls for `@amd-bot` commands every 15 seconds
+- **Runners 2-10** are plain job executors
+- All runners register with GitHub Actions automatically
+- `entrypoint.sh` is bind-mounted from the host repo, so changes to it take effect on `docker restart` without rebuilding the image
+
+#### Custom options
 
 ```bash
-# View logs for a specific runner
+# Custom runner count
+bash runner/setup.sh --pat ghp_xxxx --count 5 --build
+
+# Custom runner name prefix
+bash runner/setup.sh --pat ghp_xxxx --name my-runner --build
+```
+
+#### Day-to-day operations
+
+```bash
+# View logs (runner-1 shows daemon output)
 docker logs -f amd-ci-bot-runner-1
 
-# Stop all runners
-for i in $(seq 1 10); do docker stop amd-ci-bot-runner-$i; done
+# Apply changes to entrypoint.sh (no rebuild needed, bind-mounted)
+git pull
+docker restart amd-ci-bot-runner-1
 
-# Remove all runners
+# Restart all runners
+for i in $(seq 1 10); do docker restart amd-ci-bot-runner-$i; done
+
+# Stop all runners
 for i in $(seq 1 10); do docker rm -f amd-ci-bot-runner-$i; done
 ```
+
+#### What requires what
+
+| Change | How to apply |
+|--------|-------------|
+| `scripts/*.py`, `.github/workflows/*.yml` | `git push` — workflows checkout fresh code each run |
+| `runner/entrypoint.sh` | `git pull` on host + `docker restart` (bind-mounted) |
+| `runner/Dockerfile` | `docker build -t sglang-ci-bot-runner:latest runner/` + recreate containers |
 
 ### 4. Enable Workflows
 
 Push the code to your repo. GitHub Actions will automatically pick up the workflow files and start running on their cron schedules.
 
-### Concurrency
+### Concurrency & Idempotency
 
 Each workflow has a `concurrency` group to prevent redundant or conflicting runs:
 
 | Workflow | Concurrency group | Behavior |
 |----------|-------------------|----------|
-| `pr-review.yml` | Per PR number | If the same PR is requested again, the old run is cancelled |
-| `ci-status-check.yml` | Per PR number | Same as above |
+| `pr-review.yml` | Per comment ID | Duplicate dispatches from the same `@amd-bot` comment share a group; second run is cancelled |
+| `ci-status-check.yml` | Per comment ID | Same as above |
 | `comment-watcher.yml` | Single instance | Only one watcher runs at a time (stateful, prevents duplicate dispatches) |
 | `ci-monitor.yml` | Single instance | Only one monitor runs at a time (stateful, prevents duplicate issues) |
 
 Different PRs are processed in parallel across the available runners.
+
+The comment watcher (both daemon and cron modes) uses **reaction-based idempotency**: before dispatching, it checks if the bot has already added a `rocket` reaction to the comment. This works as a distributed lock — even if both the daemon and cron watcher see the same comment, only the first one to react will dispatch. The `eyes` reaction is added as a user-visible acknowledgment.
 
 ---
 
@@ -272,11 +305,13 @@ python scripts/review_pr.py 1234 --context "This PR is part of the ROCm 7.2 migr
 ### What it does
 
 1. Fetches the PR's head commit SHA
-2. Gets all check runs for that commit (passed, failed, pending)
-3. For up to 5 failed checks, downloads the full job logs
-4. If there are failures, sends the check summary and failure logs to Claude for analysis
-5. Claude determines: what failed, root causes, suggested fixes, and whether failures are PR-related or pre-existing
-6. Posts the analysis as a comment on the PR (or prints to stdout)
+2. Gets all workflow runs for that commit (passed, failed, pending)
+3. For up to 8 failed jobs, downloads the full job logs and analyzes them **concurrently** (multiple jobs in parallel, ~6x faster than serial)
+4. Each job is analyzed with progressive step-by-step analysis (same approach as the CI monitor)
+5. Fetches the PR diff concurrently with job analysis
+6. Runs a PR correlation analysis: Claude assesses whether each failure is likely caused by the PR changes or is pre-existing
+7. If multiple jobs failed, performs cross-job analysis to find common patterns
+8. Posts the analysis as a comment on the PR (or prints to stdout)
 
 ### How to use
 
@@ -323,8 +358,9 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 2. Filters for comments by authorized users containing the `@amd-bot` trigger
 3. Parses the command (`review`, `review-focus`, `ci-status`, `help`)
 4. Verifies the comment is on a PR (not a plain issue)
-5. Adds an "eyes" reaction to acknowledge the command
-6. Dispatches the appropriate workflow via `repository_dispatch` event
+5. Checks if the comment has already been claimed (via `rocket` reaction) — if so, skips it (idempotency)
+6. Adds a `rocket` reaction to claim the comment, then `eyes` to acknowledge
+7. Dispatches the appropriate workflow via `repository_dispatch` event with `comment_id` for downstream deduplication
 
 ### Supported commands
 
@@ -371,7 +407,7 @@ The daemon handles errors gracefully with exponential backoff and responds to SI
 
 #### Mode 2: GitHub Actions cron (fallback)
 
-The workflow runs every 15 minutes as a fallback in case the daemon is not running. This has higher latency (15–40 min) due to GitHub Actions cron scheduling delays.
+The workflow runs every 5 minutes as a fallback in case the daemon is not running. Both modes share idempotency via GitHub reactions, so running both simultaneously is safe — the same comment is never processed twice.
 
 ```bash
 # Trigger manually
@@ -403,7 +439,10 @@ Only users listed in `AUTHORIZED_USERS` in `watch_comments.py` can trigger comma
 
 ### State Management
 
-Processed comment IDs are stored in `.state/last_check.json` to avoid re-processing the same commands.
+Two layers of idempotency prevent duplicate processing:
+
+1. **Reaction-based (distributed)**: Before dispatching, the watcher checks if a `rocket` reaction exists on the comment. This works across both daemon and cron modes without shared filesystem.
+2. **Local state (fast-path)**: Processed comment IDs are stored in `.state/last_check.json` to skip API calls for recently-seen comments.
 
 ---
 
@@ -476,7 +515,7 @@ sglang-ci-bot/
   runner/
     Dockerfile             Self-hosted runner Docker image
     setup.sh               Multi-runner deployment (spawns N containers, default 10)
-    entrypoint.sh          Runner container entrypoint (register + run)
+    entrypoint.sh          Runner container entrypoint (register + optional daemon + run)
   .state/                  Persisted state files (gitignored, cached in Actions)
   .secrets/                Local secret files (gitignored)
   requirements.txt         Python dependencies (anthropic, httpx, requests)
@@ -527,7 +566,7 @@ AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226"]
 Edit the `cron` expressions in the workflow files:
 
 - `ci-monitor.yml`: `'0 0,8,16 * * *'` (every 8 hours)
-- `comment-watcher.yml`: `'*/15 * * * *'` (every 15 minutes, fallback for daemon mode)
+- `comment-watcher.yml`: `'*/5 * * * *'` (every 5 minutes, fallback for daemon mode)
 
 ### Pre-filter Threshold
 
