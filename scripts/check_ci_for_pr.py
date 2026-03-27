@@ -20,7 +20,6 @@ from utils import (
     REPO,
     analyze_failed_job_focused,
     create_anthropic_client,
-    cross_job_analysis,
     download_job_logs,
     extract_env_context,
     extract_error_lines,
@@ -174,11 +173,8 @@ def analyze_failed_job(
     steps = parse_log_by_steps(raw_log)
     print(f"    Parsed {len(steps)} step(s)")
 
-    print("    Extracting error lines (failed steps only)...")
-    error_lines = extract_error_lines(
-        raw_log, api_steps, run_id, job_id,
-        failed_step_names=failed_step_names,
-    )
+    print("    Extracting error lines...")
+    error_lines = extract_error_lines(raw_log, api_steps, run_id, job_id)
     print(f"    Found {len(error_lines)} error line(s)")
 
     print("    Extracting environment context...")
@@ -349,16 +345,10 @@ def _format_details(ja: dict) -> str:
 </details>
 """
 
-    failed = set(ja["failed_steps"])
-    relevant_errors = [
-        el for el in ja["error_lines"]
-        if el["step_name"] in failed
-    ]
-
     error_listing = ""
-    if relevant_errors:
+    if ja["error_lines"]:
         error_listing = "**Error locations:**\n"
-        for el in relevant_errors[:5]:
+        for el in ja["error_lines"][:5]:
             short = el["preview"][:150]
             error_listing += (
                 f"- [{el['step_name']} L{el['line_number']}]({el['url']})"
@@ -465,13 +455,6 @@ def check_ci_for_pr(
                 client, pr_number, changed_files, pr_diff, real_analyses,
             )
 
-        cross = ""
-        if len(real_analyses) > 1:
-            print(f"\n  Cross-job analysis ({len(real_analyses)} jobs)...")
-            cross = cross_job_analysis(
-                client, f"PR #{pr_number}", real_analyses,
-            )
-
         # --- Build comment body ---
         body = (
             f"{requester_line}## CI Status for PR #{pr_number}\n\n"
@@ -494,9 +477,6 @@ def check_ci_for_pr(
 
         if correlation:
             body += f"### PR Correlation Analysis\n\n{correlation}\n\n"
-
-        if cross:
-            body += f"### Cross-Job Summary\n\n{cross}\n\n---\n\n"
 
         body += "### Per-Job Detailed Analysis\n"
         for ja in all_job_analyses:
