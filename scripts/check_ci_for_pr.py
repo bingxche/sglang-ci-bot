@@ -10,8 +10,8 @@ in 5 seconds.
 import argparse
 import json
 import os
+import re
 import sys
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -57,9 +57,9 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
         if existing is None or run["id"] > existing["id"]:
             latest_by_wf[wf_name] = run
 
-    wf_passed = 0
-    wf_failed = 0
-    wf_pending = 0
+    passed_names: list[str] = []
+    failed_names: list[str] = []
+    pending_names: list[str] = []
     failed_workflows: list[dict] = []
 
     for wf_name, run in sorted(latest_by_wf.items()):
@@ -67,11 +67,11 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
         conclusion = run.get("conclusion")
 
         if conclusion == "success":
-            wf_passed += 1
+            passed_names.append(wf_name)
         elif status in ("in_progress", "queued", "waiting", "requested"):
-            wf_pending += 1
+            pending_names.append(wf_name)
         elif conclusion in ("failure", "timed_out", "action_required"):
-            wf_failed += 1
+            failed_names.append(wf_name)
             jobs = get_run_jobs(token, run["id"])
             failed_jobs = [
                 j for j in jobs
@@ -88,12 +88,12 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
         elif conclusion == "cancelled":
             pass
         else:
-            wf_pending += 1
+            pending_names.append(wf_name)
 
     return {
-        "wf_passed": wf_passed,
-        "wf_failed": wf_failed,
-        "wf_pending": wf_pending,
+        "passed_names": passed_names,
+        "failed_names": failed_names,
+        "pending_names": pending_names,
         "failed_workflows": failed_workflows,
     }
 
@@ -102,8 +102,17 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
 # Gate job detection
 # ---------------------------------------------------------------------------
 
+_GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-", re.IGNORECASE)
+
+
 def _is_gate_job(job: dict) -> bool:
-    """Return True if the job is a coordinator/gate job."""
+    """Return True if the job is a coordinator/gate job.
+
+    Detects by job name (e.g. pr-test-finish, wait-for-stage-b) or by
+    step names (e.g. 'Check all dependent job statuses').
+    """
+    if _GATE_JOB_NAME_RE.search(job.get("name", "")):
+        return True
     failed_steps = [
         s for s in job.get("steps", [])
         if s.get("conclusion") == "failure"
@@ -293,21 +302,30 @@ _VERDICT_DISPLAY = {
 }
 
 
+_VERDICT_SORT_ORDER = {"likely": 0, "possibly": 1, "unlikely": 2}
+
+
 def _format_merged_table(
     analyses: list[dict],
     correlation: list[dict],
 ) -> str:
-    """Build ONE table merging error messages + PR correlation verdicts."""
+    """Build ONE table merging error messages + PR correlation verdicts.
+
+    Rows are sorted: likely-related first, then possibly, then unlikely.
+    """
     corr_by_job: dict[str, dict] = {}
     for c in correlation:
         corr_by_job[c.get("job", "")] = c
 
+    real = [ja for ja in analyses if not ja.get("is_gate")]
+    real.sort(key=lambda ja: _VERDICT_SORT_ORDER.get(
+        corr_by_job.get(ja["job_name"], {}).get("verdict", ""), 3
+    ))
+
     rows = "| Job | Error | Related? | Log |\n"
     rows += "|-----|-------|----------|-----|\n"
 
-    for ja in analyses:
-        if ja.get("is_gate"):
-            continue
+    for ja in real:
 
         best = _pick_best_error(ja)
         if best:
@@ -356,23 +374,24 @@ def check_ci_for_pr(
     print(f"  Head SHA: {head_sha[:12]}")
 
     status = collect_workflow_status(token, head_sha)
-    wf_passed = status["wf_passed"]
-    wf_failed = status["wf_failed"]
-    wf_pending = status["wf_pending"]
+    passed_names = status["passed_names"]
+    failed_names = status["failed_names"]
+    pending_names = status["pending_names"]
     failed_workflows = status["failed_workflows"]
+    total = len(passed_names) + len(failed_names) + len(pending_names)
 
     print(
-        f"  Workflows — Passed: {wf_passed}, Failed: {wf_failed}, "
-        f"Pending: {wf_pending}"
+        f"  Workflows — Passed: {len(passed_names)}, Failed: {len(failed_names)}, "
+        f"Pending: {len(pending_names)}"
     )
 
     requester_line = f"> @{comment_author}\n\n" if comment_author else ""
 
     if not failed_workflows:
-        pending_note = f" ({wf_pending} still pending)" if wf_pending else ""
+        pending_note = f" ({len(pending_names)} still pending)" if pending_names else ""
         body = (
             f"{requester_line}## CI Status for PR #{pr_number}\n\n"
-            f"All {wf_passed} workflow(s) passed!{pending_note}\n"
+            f"All {len(passed_names)} workflow(s) passed!{pending_note}\n"
         )
     else:
         all_job_data: list[dict] = []
@@ -431,15 +450,45 @@ def check_ci_for_pr(
             )
             print(f"  Got {len(correlation)} correlation verdict(s)")
 
-        # Phase 3: build ONE merged table
-        body = (
-            f"{requester_line}## CI Status for PR #{pr_number}\n\n"
-            f"**{wf_passed + wf_failed + wf_pending} workflow(s)**: "
-            f"{wf_passed} passed, {wf_failed} failed"
-        )
-        if wf_pending:
-            body += f", {wf_pending} pending"
+        # Phase 3: build header + verdict summary + sorted merged table
+        passed_str = ", ".join(passed_names) if passed_names else "none"
+        failed_str = ", ".join(failed_names) if failed_names else "none"
+
+        body = f"{requester_line}## CI Status for PR #{pr_number}\n\n"
+        body += f"**{total} workflows**: "
+        body += f"{len(passed_names)} passed ({passed_str})"
+        body += f", {len(failed_names)} failed ({failed_str})"
+        if pending_names:
+            body += f", {len(pending_names)} pending ({', '.join(pending_names)})"
         body += "\n\n"
+
+        # Verdict summary line
+        corr_by_job: dict[str, dict] = {}
+        for c in correlation:
+            corr_by_job[c.get("job", "")] = c
+
+        n_likely = sum(
+            1 for ja in real_jobs
+            if corr_by_job.get(ja["job_name"], {}).get("verdict") == "likely"
+        )
+        n_possibly = sum(
+            1 for ja in real_jobs
+            if corr_by_job.get(ja["job_name"], {}).get("verdict") == "possibly"
+        )
+        n_total = len(real_jobs)
+        n_unrelated = n_total - n_likely - n_possibly
+
+        if n_likely == 0 and n_possibly == 0:
+            body += f"**All {n_total} failures appear unrelated to your PR**\n\n"
+        else:
+            parts = []
+            if n_likely > 0:
+                parts.append(f"**{n_likely} failure{'s' if n_likely > 1 else ''} likely related to your PR**")
+            if n_possibly > 0:
+                parts.append(f"{n_possibly} possibly related")
+            if n_unrelated > 0:
+                parts.append(f"{n_unrelated} unrelated")
+            body += " · ".join(parts) + "\n\n"
 
         body += _format_merged_table(all_job_data, correlation)
         body += "\n---\n*Generated by amd-bot*\n"
