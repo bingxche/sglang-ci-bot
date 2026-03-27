@@ -318,8 +318,11 @@ def _format_merged_table(
         corr_by_job[c.get("job", "")] = c
 
     real = [ja for ja in analyses if not ja.get("is_gate")]
-    real.sort(key=lambda ja: _VERDICT_SORT_ORDER.get(
-        corr_by_job.get(ja["job_name"], {}).get("verdict", ""), 3
+    real.sort(key=lambda ja: (
+        _VERDICT_SORT_ORDER.get(
+            corr_by_job.get(ja["job_name"], {}).get("verdict", ""), 3
+        ),
+        ja.get("workflow_name", ""),
     ))
 
     rows = "| Workflow | Job | Error | Related? | Log |\n"
