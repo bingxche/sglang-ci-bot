@@ -58,7 +58,6 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
             latest_by_wf[wf_name] = run
 
     passed_names: list[str] = []
-    failed_names: list[str] = []
     pending_names: list[str] = []
     failed_workflows: list[dict] = []
 
@@ -71,7 +70,6 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
         elif status in ("in_progress", "queued", "waiting", "requested"):
             pending_names.append(wf_name)
         elif conclusion in ("failure", "timed_out", "action_required"):
-            failed_names.append(wf_name)
             jobs = get_run_jobs(token, run["id"])
             failed_jobs = [
                 j for j in jobs
@@ -80,7 +78,6 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
             if failed_jobs:
                 failed_workflows.append({
                     "name": wf_name,
-                    "path": run.get("path", ""),
                     "run_id": run["id"],
                     "run_url": run["html_url"],
                     "failed_jobs": failed_jobs,
@@ -92,7 +89,6 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
 
     return {
         "passed_names": passed_names,
-        "failed_names": failed_names,
         "pending_names": pending_names,
         "failed_workflows": failed_workflows,
     }
@@ -378,14 +374,12 @@ def check_ci_for_pr(
 
     status = collect_workflow_status(token, head_sha)
     passed_names = status["passed_names"]
-    failed_names = status["failed_names"]
     pending_names = status["pending_names"]
     failed_workflows = status["failed_workflows"]
-    total = len(passed_names) + len(failed_names) + len(pending_names)
 
     print(
-        f"  Workflows — Passed: {len(passed_names)}, Failed: {len(failed_names)}, "
-        f"Pending: {len(pending_names)}"
+        f"  Workflows — Passed: {len(passed_names)}, "
+        f"Failed: {len(failed_workflows)}, Pending: {len(pending_names)}"
     )
 
     requester_line = f"> @{comment_author}\n\n" if comment_author else ""

@@ -51,25 +51,6 @@ ERROR_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-EXCEPTION_PATTERNS = re.compile(
-    r"|".join([
-        r"Traceback \(most recent call last\)",
-        r"AssertionError",
-        r"RuntimeError",
-        r"ValueError",
-        r"TypeError",
-        r"ModuleNotFoundError",
-        r"ImportError",
-        r"FileNotFoundError",
-        r"ConnectionError",
-        r"OOM|Out\s*[Oo]f\s*[Mm]emory",
-        r"[Ss]egmentation\s+fault|segfault|SEGFAULT",
-        r"FATAL",
-        r"exit\s+code\s+[1-9]",
-    ]),
-    re.IGNORECASE,
-)
-
 # Structural error signals — instead of enumerating error keywords,
 # rely on CI log structure and Python language conventions.
 _GH_ANNOTATION_RE = re.compile(r"##\[error\](.*)")
@@ -88,15 +69,6 @@ GATE_STEP_PATTERNS = re.compile(
     r"Check all dependent job statuses|Wait for .* jobs to complete",
     re.IGNORECASE,
 )
-
-_ENV_PATTERNS = {
-    "python": re.compile(r"Python\s+([\d.]+)"),
-    "torch": re.compile(r"torch(?:==|\s+)([\d.]+\S*)"),
-    "rocm": re.compile(r"ROCm\s*([\d.]+)|rocm([\d.]+)"),
-    "cuda": re.compile(r"CUDA\s+(?:Version[:\s]*)?([\d.]+)"),
-    "gpu": re.compile(r"(gfx\w+|MI\d+\w*|A100|H100|H200|L40)", re.IGNORECASE),
-    "sglang": re.compile(r"sglang(?:==|\s+)([\d.]+\S*)"),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -462,110 +434,7 @@ def prefilter_large_step_log(
 
 
 # ---------------------------------------------------------------------------
-# Environment context extraction (regex-based, no LLM)
-# ---------------------------------------------------------------------------
-
-def extract_env_context(steps: list[dict]) -> str:
-    """Extract key environment info from step logs using regex.
-
-    Scans all steps for Python/PyTorch/ROCm/CUDA versions, GPU model,
-    and sglang version. Returns a compact summary string suitable for
-    inclusion as context in an LLM prompt.
-    """
-    found: dict[str, str] = {}
-    all_text = "\n".join(s["content"][:20_000] for s in steps[:15])
-
-    for key, pat in _ENV_PATTERNS.items():
-        m = pat.search(all_text)
-        if m:
-            found[key] = next(g for g in m.groups() if g)
-
-    if not found:
-        return "(no environment info extracted)"
-
-    parts = []
-    if "python" in found:
-        parts.append(f"Python {found['python']}")
-    if "torch" in found:
-        parts.append(f"PyTorch {found['torch']}")
-    if "rocm" in found:
-        parts.append(f"ROCm {found['rocm']}")
-    if "cuda" in found:
-        parts.append(f"CUDA {found['cuda']}")
-    if "gpu" in found:
-        parts.append(f"GPU: {found['gpu']}")
-    if "sglang" in found:
-        parts.append(f"sglang {found['sglang']}")
-
-    return "Environment: " + ", ".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Focused job analysis (single LLM call per job)
-# ---------------------------------------------------------------------------
-
-def analyze_failed_job_focused(
-    client: anthropic.Anthropic,
-    job_name: str,
-    run_url: str,
-    failed_step_logs: list[dict],
-    env_context: str,
-) -> str:
-    """Analyze a failed job with a single LLM call.
-
-    Instead of progressive step-by-step analysis (N LLM calls), sends
-    only the failed step log(s) plus a regex-extracted environment
-    context string. Produces the same output format as final_job_analysis.
-    """
-    steps_text = ""
-    for step in failed_step_logs:
-        log = step["content"]
-        if len(log) > STEP_LOG_PREFILTER_THRESHOLD:
-            log = prefilter_large_step_log(log)
-        steps_text += f"\n### Failed Step: {step['name']}\n```\n{log}\n```\n"
-
-    prompt = f"""You are a CI/CD expert analyzing a FAILED CI job in the sglang project (LLM serving framework on AMD GPUs).
-
-## Job: {job_name}
-## Run: {run_url}
-## {env_context}
-
-{steps_text}
-
-Produce a CONCISE report in the following format. Be brief — engineers will read this quickly and then go look at the logs themselves.
-
-### Failure Summary
-One or two sentences: what failed and why.
-
-### Failure Reasons
-List ALL distinct failure reasons as bullet points. Do NOT omit any. Each bullet should be one concise sentence.
-
-### Stack Traces
-Include the key error messages and stack traces verbatim (in code blocks). Engineers need these to locate the issue. Only include the relevant portions — not the entire log.
-
-### Suggested Fix Directions
-List potential fix directions as bullet points. Only state the DIRECTION (e.g. "pin transformers to <5.0.0", "add default value to vision_config field"). Do NOT write out code implementations or detailed steps.
-
-### Priority
-One word: Critical / High / Medium / Low — with a single sentence justification.
-
-IMPORTANT RULES:
-- Do NOT include environment tables, version tables, or lengthy context sections.
-- Do NOT write code examples for fixes.
-- Do NOT include "Environment Context" sections.
-- Keep the entire output under 300 lines of markdown.
-- Be direct and factual — no filler."""
-
-    msg = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return msg.content[0].text
-
-
-# ---------------------------------------------------------------------------
-# Progressive step-by-step analysis with Claude (legacy, used by monitor_ci)
+# Progressive step-by-step analysis with Claude (used by monitor_ci)
 # ---------------------------------------------------------------------------
 
 def progressive_step_analysis(
