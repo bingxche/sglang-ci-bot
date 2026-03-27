@@ -75,6 +75,15 @@ EXCEPTION_PATTERNS = re.compile(
 _GH_ANNOTATION_RE = re.compile(r"##\[error\](.*)")
 _PYTHON_EXCEPTION_RE = re.compile(r"\w+(?:Error|Exception)\b\s*:.+")
 
+# Test-result boundary: everything AFTER these lines is cleanup noise.
+# Covers unittest, pytest, and sglang's wrapper.
+_TEST_RESULT_RE = re.compile(
+    r"^(?:FAILED\b|OK$|Ran \d+ tests? in |"
+    r"=== SUITE RESULT|"
+    r"={3,} \d+ (?:failed|passed)|"
+    r"={3,} short test summary)"
+)
+
 GATE_STEP_PATTERNS = re.compile(
     r"Check all dependent job statuses|Wait for .* jobs to complete",
     re.IGNORECASE,
@@ -249,19 +258,17 @@ def extract_error_lines(
 ) -> list[dict]:
     """Extract errors from failed steps using structural signals.
 
-    Instead of enumerating error keywords (ERROR_PATTERNS, NOISE_PATTERNS,
-    etc.), uses two signals that follow from CI log structure:
+    Uses three signals based on CI log structure:
 
     1. ``##[error]`` annotations — GitHub Actions' own error markers.
-       These are the same lines that render as red annotations in the UI.
-    2. Python exception lines — any line matching ``\\w+Error:`` or
-       ``\\w+Exception:``.  This single pattern catches ALL Python
-       exceptions by convention, with no enumeration needed.
-    3. Fallback: last non-empty line of the failed step (the error is
-       always near the end of sequential output).
+    2. Python exception lines (``\\w+Error:`` / ``\\w+Exception:``).
+    3. Fallback: last non-empty line of the step.
 
-    Returns errors ordered so that the LAST entry is the most specific
-    (the root cause exception, not the Traceback header).
+    Applies test-result boundary filtering: exceptions appearing AFTER
+    lines like ``FAILED``, ``=== SUITE RESULT`` are cleanup noise
+    (e.g. ``resource_tracker`` / ``KeyError: '/loky-...'``) and are
+    discarded.  Among remaining exceptions, the most informative one
+    (longest preview) is the root cause.
     """
     parsed_steps = parse_log_by_steps(raw_log)
 
@@ -279,6 +286,14 @@ def extract_error_lines(
         step_num = step_num_map.get(step_name)
         lines = parsed_step["content"].split("\n")
         step_errors: list[dict] = []
+
+        # Find the test-result boundary (scan backward for FAILED / SUITE RESULT / etc.)
+        result_boundary = len(lines)
+        for i in range(len(lines) - 1, -1, -1):
+            clean = _TIMESTAMP_RE.sub("", lines[i]).strip()
+            if _TEST_RESULT_RE.match(clean):
+                result_boundary = i
+                break
 
         for line_idx, line in enumerate(lines):
             clean = _TIMESTAMP_RE.sub("", line).strip()
@@ -299,7 +314,7 @@ def extract_error_lines(
                 })
                 continue
 
-            if _PYTHON_EXCEPTION_RE.match(clean):
+            if _PYTHON_EXCEPTION_RE.match(clean) and line_idx < result_boundary:
                 step_errors.append({
                     "step_name": step_name,
                     "preview": clean[:200],
