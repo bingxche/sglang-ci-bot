@@ -322,11 +322,10 @@ def _format_merged_table(
         corr_by_job.get(ja["job_name"], {}).get("verdict", ""), 3
     ))
 
-    rows = "| Job | Error | Related? | Log |\n"
-    rows += "|-----|-------|----------|-----|\n"
+    rows = "| Workflow | Job | Error | Related? | Log |\n"
+    rows += "|----------|-----|-------|----------|-----|\n"
 
     for ja in real:
-
         best = _pick_best_error(ja)
         if best:
             preview = best["preview"]
@@ -351,8 +350,9 @@ def _format_merged_table(
             related_cell = "*(pending)*"
 
         related_cell = related_cell.replace("|", "\\|")
+        wf = ja.get("workflow_name", "")
 
-        rows += f"| `{ja['job_name']}` | `{preview}` | {related_cell} | {log_link} |\n"
+        rows += f"| {wf} | `{ja['job_name']}` | `{preview}` | {related_cell} | {log_link} |\n"
 
     return rows
 
@@ -451,16 +451,7 @@ def check_ci_for_pr(
             print(f"  Got {len(correlation)} correlation verdict(s)")
 
         # Phase 3: build header + verdict summary + sorted merged table
-        passed_str = ", ".join(passed_names) if passed_names else "none"
-        failed_str = ", ".join(failed_names) if failed_names else "none"
-
         body = f"{requester_line}## CI Status for PR #{pr_number}\n\n"
-        body += f"**{total} workflows**: "
-        body += f"{len(passed_names)} passed ({passed_str})"
-        body += f", {len(failed_names)} failed ({failed_str})"
-        if pending_names:
-            body += f", {len(pending_names)} pending ({', '.join(pending_names)})"
-        body += "\n\n"
 
         # Verdict summary line
         corr_by_job: dict[str, dict] = {}
