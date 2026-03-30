@@ -2,13 +2,16 @@
 
 Automated CI monitoring and PR review bot for [sglang](https://github.com/sgl-project/sglang), powered by Claude via AMD LLM Gateway.
 
-Runs entirely from a **separate personal repo** using GitHub Actions + GitHub REST API + Claude API. No admin access to the target repo required — only collaborator-level read access.
+Runs entirely from a **separate personal repo** (`bingxche/sglang-ci-bot`) using GitHub Actions + GitHub REST API + Claude API. No admin access to the target repo required — sglang is a public repo, so any authenticated GitHub user can read data and post comments.
+
+All public-facing replies (PR comments, reactions, CI reports) are posted under the dedicated **[amd-bot](https://github.com/amd-bot)** GitHub account.
 
 ---
 
 ## Table of Contents
 
 - [Features Overview](#features-overview)
+- [Architecture](#architecture)
 - [Setup](#setup)
   - [Deploy Self-Hosted Runner](#3-deploy-self-hosted-runner)
   - [Concurrency](#concurrency)
@@ -16,6 +19,7 @@ Runs entirely from a **separate personal repo** using GitHub Actions + GitHub RE
 - [Feature 2: PR Code Review](#feature-2-pr-code-review)
 - [Feature 3: CI Status Check for a PR](#feature-3-ci-status-check-for-a-pr)
 - [Feature 4: Comment Watcher](#feature-4-comment-watcher)
+- [Applying Changes](#applying-changes)
 - [Local Development](#local-development)
 - [Project Structure](#project-structure)
 - [Customization](#customization)
@@ -33,27 +37,50 @@ Runs entirely from a **separate personal repo** using GitHub Actions + GitHub RE
 
 ---
 
+## Architecture
+
+The bot uses **two GitHub accounts** with different roles:
+
+| Account | Role | What it does |
+|---------|------|--------------|
+| **bingxche** | Repo owner / infra admin | Owns `bingxche/sglang-ci-bot`, registers self-hosted runners (requires admin access) |
+| **amd-bot** | Bot identity | Posts all public-facing comments, reactions, and issues on sglang PRs |
+
+This separation exists because self-hosted runner registration requires repo admin access, but `amd-bot` (as a collaborator) cannot have admin on a personal repo.
+
+**Token usage:**
+
+| Context | Token used | Identity |
+|---------|-----------|----------|
+| GitHub Actions workflows (review, CI check, monitor, cron watcher) | `secrets.GH_PAT` (amd-bot's PAT) | amd-bot |
+| Daemon comment watcher (runner-1 container) | `BOT_PAT` env var (amd-bot's PAT) | amd-bot |
+| Runner registration (`entrypoint.sh`) | `GH_PAT` env var (bingxche's PAT) | bingxche |
+| Git clone inside container | `GH_PAT` env var (bingxche's PAT) | bingxche |
+
+---
+
 ## Setup
 
 ### 1. Prerequisites
 
-- GitHub account with collaborator access to `sgl-project/sglang`
+- **bingxche** GitHub account: owner of this bot repo
+- **amd-bot** GitHub account: added as collaborator (write access) to `bingxche/sglang-ci-bot`
 - AMD LLM Gateway subscription key and endpoint URL
-- GitHub Personal Access Token (PAT) with these permissions on `sgl-project/sglang` + your bot repo:
-  - `Actions`: Read (fetch workflow runs and logs)
-  - `Issues`: Read & Write (post comments, create issues)
-  - `Pull requests`: Read & Write (read PR data, post reviews)
-  - `Contents`: Read (fetch file contents)
+- Two GitHub PATs:
+  - **bingxche's PAT**: `repo` + `workflow` + `admin:repo_hook` scopes (for runner registration)
+  - **amd-bot's PAT**: `repo` scope (for posting comments on sglang and dispatching workflows on bot repo)
 
 ### 2. Configure Repository Secrets
 
-In your bot repo, go to **Settings > Secrets and variables > Actions** and add:
+In `bingxche/sglang-ci-bot`, go to **Settings > Secrets and variables > Actions** and add:
 
 | Secret | Value |
 |--------|-------|
-| `GH_PAT` | Your GitHub Personal Access Token |
+| `GH_PAT` | **amd-bot's** GitHub PAT (all workflows use this to post as amd-bot) |
 | `LLM_GATEWAY_KEY` | AMD LLM Gateway subscription key |
 | `LLM_GATEWAY_URL` | AMD LLM Gateway endpoint (e.g. `https://llm-api.amd.com/Anthropic`) |
+
+> **Note**: The `GH_PAT` secret is amd-bot's PAT, not bingxche's. Bingxche's PAT is only used on runner machines for registration (passed via `--pat` to `setup.sh`).
 
 ### 3. Deploy Self-Hosted Runner
 
@@ -67,26 +94,29 @@ git clone https://github.com/bingxche/sglang-ci-bot.git
 cd sglang-ci-bot
 
 # First time: build image and start 10 runners
-bash runner/setup.sh --pat ghp_xxxx --build
+bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT> --build
 
 # Or on other machines: pull pre-built image from Docker Hub (no build needed)
-bash runner/setup.sh --pat ghp_xxxx --image bingxche/sglang-ci-bot-runner:latest
+bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT> --image bingxche/sglang-ci-bot-runner:latest
 ```
 
+- `--pat`: bingxche's PAT (used for runner registration, requires repo admin)
+- `--bot-pat`: amd-bot's PAT (used by the daemon comment watcher to post as amd-bot)
+
 This creates containers `amd-ci-bot-runner-1` through `amd-ci-bot-runner-10`:
-- **Runner-1** runs with `ENABLE_WATCHER=true` — starts a daemon that polls for `@amd-bot` commands every 15 seconds
+- **Runner-1** runs with `ENABLE_WATCHER=true` — starts a daemon that polls for `@amd-bot` commands every 15 seconds, using `BOT_PAT` (amd-bot's identity)
 - **Runners 2-10** are plain job executors
-- All runners register with GitHub Actions automatically
+- All runners register with GitHub Actions using bingxche's PAT (admin access)
 - `entrypoint.sh` is bind-mounted from the host repo, so changes to it take effect on `docker restart` without rebuilding the image
 
 #### Custom options
 
 ```bash
 # Custom runner count
-bash runner/setup.sh --pat ghp_xxxx --count 5 --build
+bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT> --count 5 --build
 
 # Custom runner name prefix
-bash runner/setup.sh --pat ghp_xxxx --name my-runner --build
+bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT> --name my-runner --build
 ```
 
 #### Day-to-day operations
@@ -95,7 +125,7 @@ bash runner/setup.sh --pat ghp_xxxx --name my-runner --build
 # View logs (runner-1 shows daemon output)
 docker logs -f amd-ci-bot-runner-1
 
-# Apply changes to entrypoint.sh (no rebuild needed, bind-mounted)
+# Restart runner-1 (pulls latest code for daemon)
 git pull
 docker restart amd-ci-bot-runner-1
 
@@ -105,14 +135,6 @@ for i in $(seq 1 10); do docker restart amd-ci-bot-runner-$i; done
 # Stop all runners
 for i in $(seq 1 10); do docker rm -f amd-ci-bot-runner-$i; done
 ```
-
-#### What requires what
-
-| Change | How to apply |
-|--------|-------------|
-| `scripts/*.py`, `.github/workflows/*.yml` | `git push` — workflows checkout fresh code each run |
-| `runner/entrypoint.sh` | `git pull` on host + `docker restart` (bind-mounted) |
-| `runner/Dockerfile` | `docker build -t sglang-ci-bot-runner:latest runner/` + recreate containers |
 
 ### 4. Enable Workflows
 
@@ -131,7 +153,7 @@ Each workflow has a `concurrency` group to prevent redundant or conflicting runs
 
 Different PRs are processed in parallel across the available runners.
 
-The comment watcher (both daemon and cron modes) uses **reaction-based idempotency**: before dispatching, it checks if the bot has already added a `rocket` reaction to the comment. This works as a distributed lock — even if both the daemon and cron watcher see the same comment, only the first one to react will dispatch. The `eyes` reaction is added as a user-visible acknowledgment.
+The comment watcher (both daemon and cron modes) uses **reaction-based idempotency**: before dispatching, it checks if the `amd-bot` account has already added a `rocket` reaction to the comment. This works as a distributed lock — even if both the daemon and cron watcher see the same comment, only the first one to react will dispatch. The `eyes` reaction is added as a user-visible acknowledgment.
 
 ---
 
@@ -164,6 +186,7 @@ nightly-test-amd-rocm720.yml
 release-docker-amd-nightly.yml
 release-docker-amd-rocm720-nightly.yml
 amd-aiter-scout.yml
+pr-test-amd-rocm720.yml
 ```
 
 ### Output Modes
@@ -200,7 +223,7 @@ gh workflow run ci-monitor.yml -f workflows="nightly-test-amd.yml,amd-aiter-scou
 python scripts/monitor_ci.py --output stdout --hours-back 24
 
 # Post to daily issue in bot repo
-python scripts/monitor_ci.py --output daily-issue --bot-repo user/sglang-ci-bot --hours-back 24
+python scripts/monitor_ci.py --output daily-issue --bot-repo bingxche/sglang-ci-bot --hours-back 24
 
 # Monitor specific workflows only
 python scripts/monitor_ci.py --output stdout --workflows nightly-test-amd.yml amd-aiter-scout.yml
@@ -358,7 +381,7 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 2. Filters for comments by authorized users containing the `@amd-bot` trigger
 3. Parses the command (`review`, `review-focus`, `ci-status`, `help`)
 4. Verifies the comment is on a PR (not a plain issue)
-5. Checks if the comment has already been claimed (via `rocket` reaction) — if so, skips it (idempotency)
+5. Checks if the comment has already been claimed (via `rocket` reaction from `amd-bot`) — if so, skips it (idempotency)
 6. Adds a `rocket` reaction to claim the comment, then `eyes` to acknowledge
 7. Dispatches the appropriate workflow via `repository_dispatch` event with `comment_id` for downstream deduplication
 
@@ -377,20 +400,20 @@ The comment watcher supports two running modes:
 
 #### Mode 1: Daemon (recommended)
 
-Run as a persistent background process on your self-hosted runner. Polls every 30 seconds for near-instant response to `@amd-bot` commands.
+Run as a persistent background process on your self-hosted runner. Polls every 15 seconds for near-instant response to `@amd-bot` commands. Automatically started on runner-1 when deployed via `setup.sh`.
 
 ```bash
 # Start in foreground (for testing)
-export GH_PAT=ghp_your_token
+export BOT_PAT=ghp_amd_bot_token
 python3 scripts/watch_comments.py \
   --daemon \
-  --poll-interval 30 \
+  --poll-interval 15 \
   --bot-repo bingxche/sglang-ci-bot
 
 # Start as background process
 nohup python3 scripts/watch_comments.py \
   --daemon \
-  --poll-interval 30 \
+  --poll-interval 15 \
   --bot-repo bingxche/sglang-ci-bot \
   > /tmp/comment-watcher.log 2>&1 &
 
@@ -431,18 +454,58 @@ python scripts/watch_comments.py --bot-repo bingxche/sglang-ci-bot --since-hours
 | `--daemon` | false | Run as a long-lived daemon instead of one-shot |
 | `--poll-interval` | `30` | Seconds between polls in daemon mode |
 | `--since-hours` | `1` | How many hours back to check in one-shot mode |
-| `--github-token` | `$GH_PAT` | GitHub token |
+| `--github-token` | `$BOT_PAT` or `$GH_PAT` | GitHub token (prefers `BOT_PAT` if set) |
 
 ### Authorization
 
-Only users listed in `AUTHORIZED_USERS` in `watch_comments.py` can trigger commands. Currently: `["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226"]`.
+Only users listed in `AUTHORIZED_USERS` in `watch_comments.py` can trigger commands. Currently:
+
+```python
+AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd", "HaiShaw"]
+```
 
 ### State Management
 
 Two layers of idempotency prevent duplicate processing:
 
-1. **Reaction-based (distributed)**: Before dispatching, the watcher checks if a `rocket` reaction exists on the comment. This works across both daemon and cron modes without shared filesystem.
+1. **Reaction-based (distributed)**: Before dispatching, the watcher checks if a `rocket` reaction from the `amd-bot` account exists on the comment. This works across both daemon and cron modes without shared filesystem.
 2. **Local state (fast-path)**: Processed comment IDs are stored in `.state/last_check.json` to skip API calls for recently-seen comments.
+
+---
+
+## Applying Changes
+
+Different types of changes require different steps to take effect:
+
+| What changed | Workflows (cron + dispatch) | Daemon (runner-1) |
+|---|---|---|
+| `scripts/*.py` (e.g. `AUTHORIZED_USERS`, `CLAUDE_MODEL`, `MONITORED_WORKFLOWS`) | `git push` — effective on next run (workflows checkout fresh code) | `docker restart amd-ci-bot-runner-1` (entrypoint runs `git pull` on restart) |
+| `.github/workflows/*.yml` (schedules, secrets usage) | `git push` — effective immediately | N/A |
+| `runner/entrypoint.sh` | N/A | `git pull` on host + `docker restart amd-ci-bot-runner-1` (bind-mounted) |
+| `runner/Dockerfile` | N/A | `docker build -t sglang-ci-bot-runner:latest runner/` + recreate containers |
+| GitHub Actions secrets (`GH_PAT`, `LLM_GATEWAY_*`) | Effective immediately on next workflow run | N/A (daemon uses `BOT_PAT` from container env) |
+| Daemon PAT (`BOT_PAT`) | N/A | Must recreate runner-1 container: `bash runner/setup.sh --pat ... --bot-pat <new-PAT> ...` |
+
+**Common scenarios:**
+
+```bash
+# Changed AUTHORIZED_USERS or other Python code
+git push                                  # workflows pick up changes automatically
+docker restart amd-ci-bot-runner-1        # daemon picks up on restart
+
+# Changed entrypoint.sh
+git pull                                  # on the runner machine
+docker restart amd-ci-bot-runner-1        # bind-mounted, no rebuild needed
+
+# Changed Dockerfile
+docker build -t sglang-ci-bot-runner:latest runner/
+bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT>   # recreate all containers
+
+# Rotated amd-bot's PAT
+# 1. Update GH_PAT secret in GitHub Actions (Settings > Secrets)
+# 2. Recreate runner-1 with new BOT_PAT:
+bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <new-amd-bot-PAT> --image bingxche/sglang-ci-bot-runner:latest
+```
 
 ---
 
@@ -460,7 +523,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Set up secrets
+# Set up secrets (optional, for local_run.sh)
 mkdir -p .secrets
 echo 'your_gateway_key' > .secrets/llm_gateway_key
 echo 'your_github_pat' > .secrets/gh_pat
@@ -502,23 +565,24 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 ```
 sglang-ci-bot/
   scripts/
-    monitor_ci.py          CI failure monitor (progressive step-by-step analysis)
-    check_ci_for_pr.py     PR CI status checker
-    review_pr.py           PR code review
-    watch_comments.py      Comment watcher / command dispatcher
-    local_run.sh           Local dev runner (venv + secrets + logging)
+    utils.py               Shared GitHub API helpers, Anthropic client, log parsing
+    monitor_ci.py           CI failure monitor (progressive step-by-step analysis)
+    check_ci_for_pr.py      PR CI status checker (concurrent analysis + PR correlation)
+    review_pr.py            PR code review
+    watch_comments.py       Comment watcher / command dispatcher
+    local_run.sh            Local dev runner (venv + secrets + logging)
   .github/workflows/
-    ci-monitor.yml         Scheduled CI monitor (cron every 8h)
-    ci-status-check.yml    PR CI check (triggered by repository_dispatch)
-    pr-review.yml          PR review (triggered by repository_dispatch)
-    comment-watcher.yml    Comment poller (cron every 15min, fallback for daemon)
+    ci-monitor.yml          Scheduled CI monitor (cron every 8h)
+    ci-status-check.yml     PR CI check (triggered by repository_dispatch)
+    pr-review.yml           PR review (triggered by repository_dispatch)
+    comment-watcher.yml     Comment poller (cron every 5min, fallback for daemon)
   runner/
-    Dockerfile             Self-hosted runner Docker image
-    setup.sh               Multi-runner deployment (spawns N containers, default 10)
-    entrypoint.sh          Runner container entrypoint (register + optional daemon + run)
-  .state/                  Persisted state files (gitignored, cached in Actions)
-  .secrets/                Local secret files (gitignored)
-  requirements.txt         Python dependencies (anthropic, httpx, requests)
+    Dockerfile              Self-hosted runner Docker image
+    setup.sh                Multi-runner deployment (spawns N containers, default 10)
+    entrypoint.sh           Runner container entrypoint (register + optional daemon + run)
+  .state/                   Persisted state files (gitignored, cached in Actions)
+  .secrets/                 Local secret files (gitignored)
+  requirements.txt          Python dependencies (anthropic, httpx, requests)
 ```
 
 ---
@@ -539,26 +603,27 @@ MONITORED_WORKFLOWS = [
 
 ### Claude Model
 
-Edit `CLAUDE_MODEL` in any script:
+Edit `CLAUDE_MODEL` in `scripts/utils.py`:
 
 ```python
 CLAUDE_MODEL = "claude-opus-4-6"  # default
 ```
 
-### Bot Trigger Keyword
+### Bot Identity
 
-Edit `BOT_TRIGGER` in `scripts/watch_comments.py`:
+Edit `BOT_LOGIN` in `scripts/watch_comments.py`:
 
 ```python
-BOT_TRIGGER = "@amd-bot"
+BOT_LOGIN = "amd-bot"
+BOT_TRIGGER = f"@{BOT_LOGIN}"
 ```
 
 ### Authorized Users
 
-Edit `AUTHORIZED_USERS` in `scripts/watch_comments.py`:
+Edit `AUTHORIZED_USERS` in `scripts/watch_comments.py`. After pushing, restart runner-1 for the daemon to pick up the change:
 
 ```python
-AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226"]
+AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd", "HaiShaw"]
 ```
 
 ### Schedules
@@ -570,7 +635,7 @@ Edit the `cron` expressions in the workflow files:
 
 ### Pre-filter Threshold
 
-If Claude's context window changes or you want to adjust when regex pre-filtering kicks in, edit `STEP_LOG_PREFILTER_THRESHOLD` in `monitor_ci.py`:
+If Claude's context window changes or you want to adjust when regex pre-filtering kicks in, edit `STEP_LOG_PREFILTER_THRESHOLD` in `scripts/utils.py`:
 
 ```python
 STEP_LOG_PREFILTER_THRESHOLD = 150_000  # characters per step
