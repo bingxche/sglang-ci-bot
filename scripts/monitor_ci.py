@@ -732,7 +732,7 @@ def main():
     )
     parser.add_argument(
         "--github-token",
-        default=os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")),
+        default=os.environ.get("BOT_PAT", os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", ""))),
         help="GitHub token",
     )
 

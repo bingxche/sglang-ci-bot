@@ -61,8 +61,9 @@ if [ "${ENABLE_WATCHER:-}" = "true" ]; then
 fi
 
 if [ "${ENABLE_CI_MONITOR:-}" = "true" ]; then
+    CI_MONITOR_TOKEN="${BOT_PAT:-$GH_PAT}"
     echo "Starting CI monitor daemon (active poll: ${CI_MONITOR_POLL_INTERVAL:-60}s)..."
-    GH_PAT="${GH_PAT}" \
+    BOT_PAT="${CI_MONITOR_TOKEN}" \
     LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY:?LLM_GATEWAY_KEY required for CI monitor}" \
     LLM_GATEWAY_URL="${LLM_GATEWAY_URL:-https://llm-api.amd.com/Anthropic}" \
     python3 /tmp/bot/scripts/monitor_ci.py \

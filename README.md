@@ -54,7 +54,7 @@ This separation exists because self-hosted runner registration requires repo adm
 |---------|-----------|----------|
 | GitHub Actions workflows (review, CI check, monitor, cron watcher) | `secrets.GH_PAT` (amd-bot's PAT) | amd-bot |
 | Daemon comment watcher (runner-1 container) | `BOT_PAT` env var (amd-bot's PAT) | amd-bot |
-| Daemon CI monitor (runner-1 container) | `GH_PAT` env var + `LLM_GATEWAY_*` env vars | amd-bot |
+| Daemon CI monitor (runner-1 container) | `BOT_PAT` env var (amd-bot's PAT) + `LLM_GATEWAY_*` env vars | amd-bot |
 | Runner registration (`entrypoint.sh`) | `GH_PAT` env var (bingxche's PAT) | bingxche |
 | Git clone inside container | `GH_PAT` env var (bingxche's PAT) | bingxche |
 
