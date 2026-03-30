@@ -29,7 +29,8 @@ REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
 
-BOT_TRIGGER = "@amd-bot"
+BOT_LOGIN = "amd-bot"
+BOT_TRIGGER = f"@{BOT_LOGIN}"
 AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd"]
 COMMANDS = {
     "review": "Perform a full code review of this PR",
@@ -185,7 +186,7 @@ def has_bot_claimed(token: str, comment_id: int, reaction: str = "rocket") -> bo
         log.warning("Could not check reactions: HTTP %d", resp.status_code)
         return False
     for r in resp.json():
-        if r.get("content") == reaction and r.get("user", {}).get("type") == "User":
+        if r.get("content") == reaction and r.get("user", {}).get("login") == BOT_LOGIN:
             return True
     return False
 
