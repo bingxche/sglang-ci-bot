@@ -214,10 +214,8 @@ def extract_processed_ids_from_comments(
 # Daily issue management
 # ---------------------------------------------------------------------------
 
-def find_or_create_daily_issue(
-    token: str, bot_repo: str, date_str: str
-) -> tuple[int, bool]:
-    """Find or create the daily CI monitoring issue. Returns (number, created)."""
+def find_daily_issue(token: str, bot_repo: str, date_str: str) -> int | None:
+    """Find the daily CI monitoring issue if it exists. Returns issue number or None."""
     url = f"https://api.github.com/repos/{bot_repo}/issues"
     params = {"state": "open", "labels": "ci-monitor", "per_page": 50}
     resp = requests.get(url, headers=gh_headers(token), params=params)
@@ -226,7 +224,17 @@ def find_or_create_daily_issue(
     title = f"[CI Monitor] Daily Report - {date_str}"
     for issue in resp.json():
         if issue["title"] == title:
-            return issue["number"], False
+            return issue["number"]
+    return None
+
+
+def find_or_create_daily_issue(
+    token: str, bot_repo: str, date_str: str
+) -> tuple[int, bool]:
+    """Find or create the daily CI monitoring issue. Returns (number, created)."""
+    existing = find_daily_issue(token, bot_repo, date_str)
+    if existing is not None:
+        return existing, False
 
     wf_list = "\n".join(f"- `{w}`" for w in MONITORED_WORKFLOWS)
     body = f"""## CI Monitor — {date_str}
@@ -553,6 +561,12 @@ def run_daemon(
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         daily = get_daily_state(state, date_str)
 
+        if not daily.get("issue_number"):
+            try:
+                daily["issue_number"] = find_daily_issue(token, bot_repo, date_str)
+            except Exception:
+                pass
+
         gh_comments: list[dict] = []
         if daily.get("issue_number"):
             try:
@@ -633,8 +647,14 @@ def run_oneshot(
     daily = get_daily_state(state, date_str)
     total_reports = 0
 
+    if bot_repo and not daily.get("issue_number"):
+        try:
+            daily["issue_number"] = find_daily_issue(token, bot_repo, date_str)
+        except Exception:
+            pass
+
     gh_comments: list[dict] = []
-    if output == "daily-issue" and bot_repo and daily.get("issue_number"):
+    if bot_repo and daily.get("issue_number"):
         try:
             gh_comments = get_issue_comments(token, bot_repo, daily["issue_number"])
         except Exception:
