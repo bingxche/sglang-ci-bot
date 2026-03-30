@@ -30,7 +30,7 @@ REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
 
 BOT_TRIGGER = "@amd-bot"
-AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226"]
+AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd"]
 COMMANDS = {
     "review": "Perform a full code review of this PR",
     "review-focus": "Review with focus on specific areas (provide after the command)",
