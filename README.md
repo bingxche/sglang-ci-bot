@@ -30,7 +30,7 @@ All public-facing replies (PR comments, reactions, CI reports) are posted under 
 
 | Feature | Script | Trigger | What it does |
 |---------|--------|---------|--------------|
-| CI Failure Monitor | `monitor_ci.py` | Cron (every 8h) or manual | Monitors nightly CI workflows, analyzes failures with progressive step-by-step analysis, posts daily issue reports |
+| CI Failure Monitor | `monitor_ci.py` | Daemon (60s) + Cron (8h fallback) | Monitors CI workflows in real-time, analyzes failures with progressive step-by-step analysis, posts/updates daily issue comments. Detects in-progress run failures immediately. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Fetches PR diff, sends to Claude for structured code review, posts as PR comment |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, concurrently analyzes failures with Claude, correlates with PR changes |
 | Comment Watcher | `watch_comments.py` | Daemon (15s) + Cron (5min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches with reaction-based idempotency |
@@ -54,6 +54,7 @@ This separation exists because self-hosted runner registration requires repo adm
 |---------|-----------|----------|
 | GitHub Actions workflows (review, CI check, monitor, cron watcher) | `secrets.GH_PAT` (amd-bot's PAT) | amd-bot |
 | Daemon comment watcher (runner-1 container) | `BOT_PAT` env var (amd-bot's PAT) | amd-bot |
+| Daemon CI monitor (runner-1 container) | `GH_PAT` env var + `LLM_GATEWAY_*` env vars | amd-bot |
 | Runner registration (`entrypoint.sh`) | `GH_PAT` env var (bingxche's PAT) | bingxche |
 | Git clone inside container | `GH_PAT` env var (bingxche's PAT) | bingxche |
 
@@ -93,18 +94,25 @@ All workflows run on self-hosted runners with the `amd-internal` label. The `run
 git clone https://github.com/bingxche/sglang-ci-bot.git
 cd sglang-ci-bot
 
-# First time: build image and start 10 runners
-bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT> --build
+# First time: build image and start 10 runners (with CI monitor daemon)
+bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT> --llm-gateway-key <KEY> --build
 
 # Or on other machines: pull pre-built image from Docker Hub (no build needed)
-bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT> --image bingxche/sglang-ci-bot-runner:latest
+bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT> --llm-gateway-key <KEY> --image bingxche/sglang-ci-bot-runner:latest
+
+# Without CI monitor daemon (comment watcher only)
+bash runner/setup.sh --pat <bingxche-PAT> --bot-pat <amd-bot-PAT> --build
 ```
 
 - `--pat`: bingxche's PAT (used for runner registration, requires repo admin)
 - `--bot-pat`: amd-bot's PAT (used by the daemon comment watcher to post as amd-bot)
+- `--llm-gateway-key`: AMD LLM Gateway key (enables CI monitor daemon on runner-1; omit to disable)
+- `--llm-gateway-url`: (optional) LLM Gateway endpoint (defaults to `https://llm-api.amd.com/Anthropic`)
 
 This creates containers `amd-ci-bot-runner-1` through `amd-ci-bot-runner-10`:
-- **Runner-1** runs with `ENABLE_WATCHER=true` — starts a daemon that polls for `@amd-bot` commands every 15 seconds, using `BOT_PAT` (amd-bot's identity)
+- **Runner-1** runs two background daemons:
+  - **Comment watcher** (`ENABLE_WATCHER=true`) — polls for `@amd-bot` commands every 15 seconds
+  - **CI monitor** (`ENABLE_CI_MONITOR=true`, if `--llm-gateway-key` provided) — polls for CI failures every 60 seconds, analyzes immediately
 - **Runners 2-10** are plain job executors
 - All runners register with GitHub Actions using bingxche's PAT (admin access)
 - `entrypoint.sh` is bind-mounted from the host repo, so changes to it take effect on `docker restart` without rebuilding the image
@@ -160,23 +168,25 @@ The comment watcher (both daemon and cron modes) uses **reaction-based idempoten
 ## Feature 1: CI Failure Monitor
 
 **Script**: `scripts/monitor_ci.py`
-**Workflow**: `.github/workflows/ci-monitor.yml`
-**Schedule**: Every 8 hours (0:00, 8:00, 16:00 UTC)
+**Workflow**: `.github/workflows/ci-monitor.yml` (cron fallback)
+**Daemon**: runner-1 container (primary, polls every 60s)
 
 ### What it does
 
-1. Queries the GitHub API for failed workflow runs in the monitored workflows (last 24 hours by default)
-2. Skips runs that have already been analyzed (tracked via `.state/ci_monitor.json`)
-3. For each failed job, downloads the **full job log** (no character limit)
-4. Parses the log into individual steps using GitHub Actions `##[group]` / `##[endgroup]` markers
-5. Runs **progressive step-by-step analysis**:
+1. Queries the GitHub API for failed workflow runs in the monitored workflows (main branch only, last 24 hours by default)
+2. **Monitors in-progress runs**: doesn't wait for the entire workflow to finish — if a job fails 10 minutes into a 4-hour workflow, it's analyzed immediately
+3. Skips jobs that have already been analyzed (deduplication via HTML metadata embedded in GitHub comments — shared between daemon and cron)
+4. For each failed job, downloads the **full job log** (no character limit)
+5. Parses the log into individual steps using GitHub Actions `##[group]` / `##[endgroup]` markers
+6. Runs **progressive step-by-step analysis**:
    - Every step (including passed ones) is sent to Claude for summarization
    - Each step's summary is accumulated and passed as context to the next step
    - This means Claude has full context when analyzing a failed test step — it knows the Docker image version, installed dependency versions, environment config, etc.
    - If a single step's log exceeds 150K characters, a regex pre-filter extracts error-relevant sections (ERROR, FAIL, Traceback, etc.) with surrounding context
-6. Produces a final root-cause analysis for each job based on the complete accumulated summary
-7. If multiple jobs failed in the same workflow, performs a cross-job analysis to find common patterns
-8. Outputs the report
+7. **Analyzes multiple jobs in parallel** (up to 3 concurrent workers via ThreadPoolExecutor)
+8. Produces a final root-cause analysis for each job based on the complete accumulated summary
+9. If multiple jobs failed in the same workflow, performs a cross-job analysis to find common patterns
+10. **Each workflow gets ONE comment** in the daily issue, updated via PATCH as new failures are discovered. In-progress runs show a "still running" indicator that's removed when the workflow completes
 
 ### Monitored Workflows
 
@@ -196,11 +206,21 @@ pr-test-amd-rocm720.yml
 | `stdout` | Print the analysis report to the terminal (for local testing) |
 | `daily-issue` | Find or create a daily issue `[CI Monitor] Daily Report - YYYY-MM-DD` in the bot repo, append each workflow's report as a comment |
 
+### Running modes
+
+#### Mode 1: Daemon (recommended)
+
+The CI monitor daemon runs as a persistent background process on runner-1. It polls every 60 seconds when tracking in-progress workflows, and every 5 minutes when idle. Automatically started when `--llm-gateway-key` is provided to `setup.sh`.
+
+The daemon detects failures within seconds of a job completing, even if the overall workflow is still running.
+
+#### Mode 2: GitHub Actions cron (fallback)
+
+The workflow runs every 8 hours as a safety net. Both modes share deduplication via GitHub comment metadata (`<!-- processed_job_ids: ... -->`), so running both simultaneously is safe — the same job is never analyzed twice.
+
 ### How to use
 
-**Via GitHub Actions (automatic):**
-
-The workflow runs automatically every 8 hours. To trigger manually:
+**Via GitHub Actions (manual trigger):**
 
 ```bash
 # Default: check last 24h, post to daily issue
@@ -231,24 +251,35 @@ python scripts/monitor_ci.py --output stdout --workflows nightly-test-amd.yml am
 # Only analyze a specific job by name
 python scripts/monitor_ci.py --output stdout --job-name nightly-8-gpu-grok2
 
-# Save to a local file for review
-python scripts/monitor_ci.py --output stdout --hours-back 48 2>&1 | tee report.md
+# Run as daemon (equivalent to what runner-1 does)
+python scripts/monitor_ci.py --daemon --bot-repo bingxche/sglang-ci-bot
+
+# Daemon with custom poll interval
+python scripts/monitor_ci.py --daemon --bot-repo bingxche/sglang-ci-bot --poll-interval 30
 ```
 
 **CLI options:**
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--output` | `stdout` | Output mode: `stdout` or `daily-issue` |
+| `--output` | `stdout` | Output mode: `stdout` or `daily-issue` (one-shot only) |
 | `--hours-back` | `24` | How many hours back to search for failures |
 | `--workflows` | (all monitored) | Space-separated list of workflow files to check |
 | `--job-name` | (none) | Only analyze jobs whose name contains this string |
-| `--bot-repo` | (none) | Bot repo for posting issues (required for `daily-issue` mode) |
+| `--branch` | `main` | Only analyze runs triggered on this branch |
+| `--bot-repo` | (none) | Bot repo for posting issues (required for `daily-issue` and `--daemon`) |
+| `--daemon` | false | Run as a long-lived daemon instead of one-shot |
+| `--poll-interval` | `60` | Override active poll interval in daemon mode (seconds) |
 | `--github-token` | `$GH_PAT` | GitHub token (can also set via env var) |
 
-### State Management
+### State & Deduplication
 
-Processed run IDs are stored in `.state/ci_monitor.json` to avoid re-analyzing the same failures. In GitHub Actions, this state is persisted across runs using `actions/cache`.
+Deduplication works across processes (daemon + cron) without shared filesystem:
+
+1. **GitHub comment metadata (source of truth)**: Each workflow comment embeds `<!-- processed_job_ids: 111,222,333 -->` as an invisible HTML comment. Before analyzing, both daemon and cron read these IDs from the daily issue's comments to know which jobs have already been processed.
+2. **Local state (cache)**: The daemon keeps `job_analyses` in `.state/ci_monitor.json` as a local cache for rebuilding comments on PATCH. The cron uses `actions/cache` for its own local state. Neither process depends on the other's local state.
+
+This means if the daemon is down and the cron takes over, they won't duplicate work. When the daemon comes back, it reads the cron's comment metadata and picks up where it left off.
 
 ---
 
@@ -479,12 +510,13 @@ Different types of changes require different steps to take effect:
 
 | What changed | Workflows (cron + dispatch) | Daemon (runner-1) |
 |---|---|---|
-| `scripts/*.py` (e.g. `AUTHORIZED_USERS`, `CLAUDE_MODEL`, `MONITORED_WORKFLOWS`) | `git push` — effective on next run (workflows checkout fresh code) | `docker restart amd-ci-bot-runner-1` (entrypoint runs `git pull` on restart) |
+| `scripts/*.py` (e.g. `AUTHORIZED_USERS`, `CLAUDE_MODEL`, `MONITORED_WORKFLOWS`) | `git push` — effective on next run (workflows checkout fresh code) | `docker restart amd-ci-bot-runner-1` (entrypoint runs `git pull` on restart, restarts both comment watcher and CI monitor daemons) |
 | `.github/workflows/*.yml` (schedules, secrets usage) | `git push` — effective immediately | N/A |
 | `runner/entrypoint.sh` | N/A | `git pull` on host + `docker restart amd-ci-bot-runner-1` (bind-mounted) |
 | `runner/Dockerfile` | N/A | `docker build -t sglang-ci-bot-runner:latest runner/` + recreate containers |
 | GitHub Actions secrets (`GH_PAT`, `LLM_GATEWAY_*`) | Effective immediately on next workflow run | N/A (daemon uses `BOT_PAT` from container env) |
 | Daemon PAT (`BOT_PAT`) | N/A | Must recreate runner-1 container: `bash runner/setup.sh --pat ... --bot-pat <new-PAT> ...` |
+| LLM Gateway key (`LLM_GATEWAY_KEY`) | Effective immediately on next workflow run | Must recreate runner-1 container: `bash runner/setup.sh --pat ... --llm-gateway-key <new-KEY> ...` |
 
 **Common scenarios:**
 
@@ -566,20 +598,20 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 sglang-ci-bot/
   scripts/
     utils.py               Shared GitHub API helpers, Anthropic client, log parsing
-    monitor_ci.py           CI failure monitor (progressive step-by-step analysis)
+    monitor_ci.py           CI failure monitor (daemon + one-shot, parallel analysis, incremental comments)
     check_ci_for_pr.py      PR CI status checker (concurrent analysis + PR correlation)
     review_pr.py            PR code review
     watch_comments.py       Comment watcher / command dispatcher
     local_run.sh            Local dev runner (venv + secrets + logging)
   .github/workflows/
-    ci-monitor.yml          Scheduled CI monitor (cron every 8h)
+    ci-monitor.yml          CI monitor cron fallback (every 8h, safety net for daemon)
     ci-status-check.yml     PR CI check (triggered by repository_dispatch)
     pr-review.yml           PR review (triggered by repository_dispatch)
     comment-watcher.yml     Comment poller (cron every 5min, fallback for daemon)
   runner/
     Dockerfile              Self-hosted runner Docker image
-    setup.sh                Multi-runner deployment (spawns N containers, default 10)
-    entrypoint.sh           Runner container entrypoint (register + optional daemon + run)
+    setup.sh                Multi-runner deployment (spawns N containers, default 10, enables daemons on runner-1)
+    entrypoint.sh           Runner container entrypoint (register + comment watcher + CI monitor + run)
   .state/                   Persisted state files (gitignored, cached in Actions)
   .secrets/                 Local secret files (gitignored)
   requirements.txt          Python dependencies (anthropic, httpx, requests)
@@ -630,8 +662,19 @@ AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "
 
 Edit the `cron` expressions in the workflow files:
 
-- `ci-monitor.yml`: `'0 0,8,16 * * *'` (every 8 hours)
+- `ci-monitor.yml`: `'0 0,8,16 * * *'` (every 8 hours, safety net for daemon)
 - `comment-watcher.yml`: `'*/5 * * * *'` (every 5 minutes, fallback for daemon mode)
+
+### CI Monitor Polling Intervals
+
+Edit constants in `scripts/monitor_ci.py`:
+
+```python
+IDLE_POLL_INTERVAL = 300   # 5 min — no active runs
+ACTIVE_POLL_INTERVAL = 60  # 60s — tracking in-progress runs
+```
+
+Or override the active interval at deploy time via `CI_MONITOR_POLL_INTERVAL` env var.
 
 ### Pre-filter Threshold
 

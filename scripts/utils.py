@@ -125,6 +125,14 @@ def post_comment(
     return resp.json()
 
 
+def update_comment(token: str, repo: str, comment_id: int, body: str) -> dict:
+    """Update an existing comment on an issue or PR."""
+    url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
+    resp = requests.patch(url, headers=gh_headers(token), json={"body": body})
+    resp.raise_for_status()
+    return resp.json()
+
+
 def create_github_issue(
     token: str,
     title: str,

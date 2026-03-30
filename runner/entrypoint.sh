@@ -41,18 +41,33 @@ trap cleanup EXIT SIGTERM SIGINT
     --unattended \
     --replace
 
-if [ "${ENABLE_WATCHER:-}" = "true" ]; then
-    WATCHER_TOKEN="${BOT_PAT:-$GH_PAT}"
-    echo "Starting comment watcher daemon (poll every ${POLL_INTERVAL:-15}s)..."
+# Clone/update bot repo once (shared by watcher + CI monitor)
+if [ "${ENABLE_WATCHER:-}" = "true" ] || [ "${ENABLE_CI_MONITOR:-}" = "true" ]; then
     if [ -d /tmp/bot ]; then
         git -C /tmp/bot pull --ff-only 2>/dev/null || true
     else
         git clone "https://${GH_PAT}@github.com/${REPO_PATH}.git" /tmp/bot
     fi
     pip install -q -r /tmp/bot/requirements.txt 2>/dev/null
+fi
+
+if [ "${ENABLE_WATCHER:-}" = "true" ]; then
+    WATCHER_TOKEN="${BOT_PAT:-$GH_PAT}"
+    echo "Starting comment watcher daemon (poll every ${POLL_INTERVAL:-15}s)..."
     BOT_PAT="${WATCHER_TOKEN}" python3 /tmp/bot/scripts/watch_comments.py \
         --daemon \
         --poll-interval "${POLL_INTERVAL:-15}" \
+        --bot-repo "${REPO_PATH}" &
+fi
+
+if [ "${ENABLE_CI_MONITOR:-}" = "true" ]; then
+    echo "Starting CI monitor daemon (active poll: ${CI_MONITOR_POLL_INTERVAL:-60}s)..."
+    GH_PAT="${GH_PAT}" \
+    LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY:?LLM_GATEWAY_KEY required for CI monitor}" \
+    LLM_GATEWAY_URL="${LLM_GATEWAY_URL:-https://llm-api.amd.com/Anthropic}" \
+    python3 /tmp/bot/scripts/monitor_ci.py \
+        --daemon \
+        --poll-interval "${CI_MONITOR_POLL_INTERVAL:-60}" \
         --bot-repo "${REPO_PATH}" &
 fi
 

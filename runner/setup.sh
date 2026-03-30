@@ -2,7 +2,7 @@
 # One-command setup for sglang-ci-bot self-hosted GitHub Actions runners.
 #
 # Usage:
-#   bash runner/setup.sh --pat <GH_PAT> [--bot-pat <BOT_PAT>] [--count N] [--name <runner-prefix>] [--image <dockerhub-image>] [--build]
+#   bash runner/setup.sh --pat <GH_PAT> [--bot-pat <BOT_PAT>] [--llm-gateway-key <KEY>] [--count N] [--name <runner-prefix>] [--image <dockerhub-image>] [--build]
 #
 # Examples:
 #   # First time: build locally, spawn 10 runners (default)
@@ -26,6 +26,8 @@ REPO="bingxche/sglang-ci-bot"
 RUNNER_NAME="amd-ci-bot-runner"
 GH_PAT=""
 BOT_PAT=""
+LLM_GATEWAY_KEY=""
+LLM_GATEWAY_URL=""
 RUNNER_VERSION="2.333.0"
 IMAGE=""
 FORCE_BUILD=false
@@ -36,20 +38,22 @@ POLL_INTERVAL=15
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --pat)     GH_PAT="$2"; shift 2 ;;
-        --bot-pat) BOT_PAT="$2"; shift 2 ;;
-        --name)    RUNNER_NAME="$2"; shift 2 ;;
-        --repo)  REPO="$2"; shift 2 ;;
-        --image) IMAGE="$2"; shift 2 ;;
-        --count) RUNNER_COUNT="$2"; shift 2 ;;
-        --build) FORCE_BUILD=true; shift ;;
-        *)       echo "Unknown option: $1"; exit 1 ;;
+        --pat)             GH_PAT="$2"; shift 2 ;;
+        --bot-pat)         BOT_PAT="$2"; shift 2 ;;
+        --llm-gateway-key) LLM_GATEWAY_KEY="$2"; shift 2 ;;
+        --llm-gateway-url) LLM_GATEWAY_URL="$2"; shift 2 ;;
+        --name)            RUNNER_NAME="$2"; shift 2 ;;
+        --repo)            REPO="$2"; shift 2 ;;
+        --image)           IMAGE="$2"; shift 2 ;;
+        --count)           RUNNER_COUNT="$2"; shift 2 ;;
+        --build)           FORCE_BUILD=true; shift ;;
+        *)                 echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
 if [ -z "$GH_PAT" ]; then
     echo "ERROR: --pat <GH_PAT> is required"
-    echo "Usage: bash runner/setup.sh --pat ghp_xxxx [--count 10] [--name my-runner] [--image user/repo:tag] [--build]"
+    echo "Usage: bash runner/setup.sh --pat ghp_xxxx [--llm-gateway-key KEY] [--count 10] [--name my-runner] [--image user/repo:tag] [--build]"
     exit 1
 fi
 
@@ -143,6 +147,11 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
         if [ -n "$BOT_PAT" ]; then
             EXTRA_ARGS+=(-e BOT_PAT="${BOT_PAT}")
         fi
+        if [ -n "$LLM_GATEWAY_KEY" ]; then
+            EXTRA_ARGS+=(-e ENABLE_CI_MONITOR=true)
+            EXTRA_ARGS+=(-e LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY}")
+            EXTRA_ARGS+=(-e LLM_GATEWAY_URL="${LLM_GATEWAY_URL:-https://llm-api.amd.com/Anthropic}")
+        fi
     fi
 
     docker run -d \
@@ -166,9 +175,12 @@ echo ""
 echo "============================================"
 echo "  ${RUNNER_COUNT} runners deployed successfully!"
 echo "============================================"
-echo "  Containers : ${RUNNER_NAME}-{1..${RUNNER_COUNT}}"
-echo "  Watcher    : ${RUNNER_NAME}-1 (daemon polling every ${POLL_INTERVAL}s)"
-echo "  Repo       : ${REPO}"
+echo "  Containers  : ${RUNNER_NAME}-{1..${RUNNER_COUNT}}"
+echo "  Watcher     : ${RUNNER_NAME}-1 (comment daemon, poll ${POLL_INTERVAL}s)"
+if [ -n "$LLM_GATEWAY_KEY" ]; then
+echo "  CI Monitor  : ${RUNNER_NAME}-1 (failure daemon, poll 60s)"
+fi
+echo "  Repo        : ${REPO}"
 echo "  Labels     : self-hosted, amd-internal"
 echo "  Entrypoint : ${ENTRYPOINT_PATH} (bind-mounted, restart to apply changes)"
 echo ""
