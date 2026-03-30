@@ -2,7 +2,7 @@
 # One-command setup for sglang-ci-bot self-hosted GitHub Actions runners.
 #
 # Usage:
-#   bash runner/setup.sh --pat <GH_PAT> [--count N] [--name <runner-prefix>] [--image <dockerhub-image>] [--build]
+#   bash runner/setup.sh --pat <GH_PAT> [--bot-pat <BOT_PAT>] [--count N] [--name <runner-prefix>] [--image <dockerhub-image>] [--build]
 #
 # Examples:
 #   # First time: build locally, spawn 10 runners (default)
@@ -25,6 +25,7 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 REPO="bingxche/sglang-ci-bot"
 RUNNER_NAME="amd-ci-bot-runner"
 GH_PAT=""
+BOT_PAT=""
 RUNNER_VERSION="2.333.0"
 IMAGE=""
 FORCE_BUILD=false
@@ -35,8 +36,9 @@ POLL_INTERVAL=15
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --pat)   GH_PAT="$2"; shift 2 ;;
-        --name)  RUNNER_NAME="$2"; shift 2 ;;
+        --pat)     GH_PAT="$2"; shift 2 ;;
+        --bot-pat) BOT_PAT="$2"; shift 2 ;;
+        --name)    RUNNER_NAME="$2"; shift 2 ;;
         --repo)  REPO="$2"; shift 2 ;;
         --image) IMAGE="$2"; shift 2 ;;
         --count) RUNNER_COUNT="$2"; shift 2 ;;
@@ -138,6 +140,9 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     EXTRA_ARGS=()
     if [ "$i" -eq 1 ]; then
         EXTRA_ARGS=(-e ENABLE_WATCHER=true -e POLL_INTERVAL="${POLL_INTERVAL}")
+        if [ -n "$BOT_PAT" ]; then
+            EXTRA_ARGS+=(-e BOT_PAT="${BOT_PAT}")
+        fi
     fi
 
     docker run -d \

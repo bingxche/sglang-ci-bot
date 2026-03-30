@@ -42,6 +42,7 @@ trap cleanup EXIT SIGTERM SIGINT
     --replace
 
 if [ "${ENABLE_WATCHER:-}" = "true" ]; then
+    WATCHER_TOKEN="${BOT_PAT:-$GH_PAT}"
     echo "Starting comment watcher daemon (poll every ${POLL_INTERVAL:-15}s)..."
     if [ -d /tmp/bot ]; then
         git -C /tmp/bot pull --ff-only 2>/dev/null || true
@@ -49,7 +50,7 @@ if [ "${ENABLE_WATCHER:-}" = "true" ]; then
         git clone "https://${GH_PAT}@github.com/${REPO_PATH}.git" /tmp/bot
     fi
     pip install -q -r /tmp/bot/requirements.txt 2>/dev/null
-    python3 /tmp/bot/scripts/watch_comments.py \
+    BOT_PAT="${WATCHER_TOKEN}" python3 /tmp/bot/scripts/watch_comments.py \
         --daemon \
         --poll-interval "${POLL_INTERVAL:-15}" \
         --bot-repo "${REPO_PATH}" &
