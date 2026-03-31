@@ -139,12 +139,16 @@ def get_workflow_runs(
     }
 
     all_runs: list[dict] = []
-    for status in ("completed", "in_progress", "queued"):
+    seen_ids: set[int] = set()
+    for status in ("completed", "in_progress", "queued", "waiting", "requested"):
         params = {**base_params, "status": status}
         resp = requests.get(url, headers=gh_headers(token), params=params)
         resp.raise_for_status()
         for r in resp.json().get("workflow_runs", []):
-            if status == "in_progress" or r.get("conclusion") not in SUCCESS_CONCLUSIONS:
+            if r["id"] in seen_ids:
+                continue
+            if status != "completed" or r.get("conclusion") not in SUCCESS_CONCLUSIONS:
+                seen_ids.add(r["id"])
                 all_runs.append(r)
 
     return all_runs[:max_runs]
@@ -482,7 +486,7 @@ def publish_workflow_report(
 
     total_pending = sum(p["count"] for p in pending_info) if pending_info else 0
     cross = ""
-    if len(all_analyses) > 1 and total_pending == 0:
+    if len(all_analyses) > 1:
         client = create_anthropic_client()
         log.info("  Cross-job analysis (%d jobs)...", len(all_analyses))
         cross = cross_job_analysis(client, workflow_file, all_analyses)
