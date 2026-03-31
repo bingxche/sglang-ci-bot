@@ -139,7 +139,7 @@ def get_workflow_runs(
     }
 
     all_runs: list[dict] = []
-    for status in ("completed", "in_progress"):
+    for status in ("completed", "in_progress", "queued"):
         params = {**base_params, "status": status}
         resp = requests.get(url, headers=gh_headers(token), params=params)
         resp.raise_for_status()
