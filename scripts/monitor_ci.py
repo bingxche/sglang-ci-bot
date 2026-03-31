@@ -236,6 +236,7 @@ def find_or_create_daily_issue(
     if existing is not None:
         return existing, False
 
+    title = f"[CI Monitor] Daily Report - {date_str}"
     wf_list = "\n".join(f"- `{w}`" for w in MONITORED_WORKFLOWS)
     body = f"""## CI Monitor — {date_str}
 
