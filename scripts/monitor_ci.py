@@ -40,15 +40,17 @@ import requests
 
 from utils import (
     REPO,
+    STEP_LOG_PREFILTER_THRESHOLD,
     create_anthropic_client,
     create_github_issue,
     cross_job_analysis,
     download_job_logs,
-    final_job_analysis,
+    extract_error_lines,
+    focused_job_analysis,
     gh_headers,
     parse_log_by_steps,
     post_comment,
-    progressive_step_analysis,
+    prefilter_large_step_log,
     update_comment,
 )
 
@@ -262,9 +264,10 @@ def find_or_create_daily_issue(
 # ---------------------------------------------------------------------------
 
 def _analyze_job(client, token: str, job: dict, run_url: str) -> dict:
-    """Download logs and run progressive analysis for one job."""
+    """Download logs, extract errors, and run focused analysis for one job."""
     job_name = job["name"]
     job_id = job["id"]
+    run_id = int(run_url.rstrip("/").split("/")[-1])
 
     failed_step_names = {
         s["name"]
@@ -276,13 +279,23 @@ def _analyze_job(client, token: str, job: dict, run_url: str) -> dict:
     raw_log = download_job_logs(token, job_id)
     log.info("  [%s] Log: %s chars", job_name, f"{len(raw_log):,}")
 
-    steps = parse_log_by_steps(raw_log)
-    log.info("  [%s] %d step(s), analyzing...", job_name, len(steps))
-
-    accumulated = progressive_step_analysis(
-        client, job_name, steps, failed_step_names
+    all_errors = extract_error_lines(
+        raw_log, job.get("steps", []), run_id, job_id,
     )
-    analysis = final_job_analysis(client, job_name, run_url, accumulated)
+    error_lines = [e for e in all_errors if e["source"] != "tail"]
+    log.info("  [%s] Extracted %d error signal(s)", job_name, len(error_lines))
+
+    filtered_log = prefilter_large_step_log(raw_log)
+    if len(filtered_log) < len(raw_log):
+        log.info(
+            "  [%s] Pre-filtered log: %s -> %s chars",
+            job_name, f"{len(raw_log):,}", f"{len(filtered_log):,}",
+        )
+
+    log.info("  [%s] Analyzing...", job_name)
+    analysis = focused_job_analysis(
+        client, job_name, run_url, error_lines, filtered_log,
+    )
 
     log.info("  [%s] Done.", job_name)
     return {

@@ -294,7 +294,7 @@ def extract_error_lines(
                 })
                 continue
 
-            if _PYTHON_EXCEPTION_RE.match(clean) and line_idx < result_boundary:
+            if _PYTHON_EXCEPTION_RE.search(clean) and line_idx < result_boundary:
                 step_errors.append({
                     "step_name": step_name,
                     "preview": clean[:200],
@@ -545,6 +545,92 @@ IMPORTANT RULES:
         messages=[{"role": "user", "content": prompt}],
     )
     return msg.content[0].text
+
+
+def focused_job_analysis(
+    client: anthropic.Anthropic,
+    job_name: str,
+    run_url: str,
+    error_lines: list[dict],
+    filtered_log: str,
+) -> str:
+    """Analyze a failed CI job using pre-extracted errors and pre-filtered logs.
+
+    Replaces the progressive_step_analysis + final_job_analysis pipeline
+    with a single LLM call.  Pre-extracted error messages are placed at
+    the top of the prompt so the model starts from actual errors rather
+    than accumulating noise from passing steps.
+    """
+    if error_lines:
+        errors_section = "\n".join(
+            f"- **[{e['source']}]** `{e['step_name']}` line {e['line_number']}: "
+            f"`{e['preview']}`"
+            for e in error_lines
+        )
+    else:
+        errors_section = "(no errors extracted programmatically — check the log below)"
+
+    prompt = f"""You are a CI/CD expert analyzing a FAILED CI job in the sglang project (LLM serving framework on AMD GPUs).
+
+## Job: {job_name}
+## Run: {run_url}
+
+## Pre-extracted Error Signals
+These errors were programmatically extracted from the log. Start your analysis from these:
+
+{errors_section}
+
+## Log (error-relevant sections)
+```
+{filtered_log}
+```
+
+Produce a CONCISE report. Be brief — engineers will read this quickly then check the logs themselves.
+
+### Failure Summary
+One or two sentences: what failed and why.
+
+### Failure Reasons
+List ALL distinct failure reasons as bullet points. Each bullet: one concise sentence.
+
+### Stack Traces
+Include key error messages and stack traces verbatim (in code blocks). Only the relevant portions.
+
+### Suggested Fix Directions
+Bullet points with fix DIRECTIONS only (e.g. "pin transformers to <5.0.0"). No code.
+
+### Priority
+Critical / High / Medium / Low — with one sentence justification.
+
+IMPORTANT:
+- Focus on actual error messages and stack traces, not warnings from passing steps.
+- Do NOT include environment tables or version lists.
+- Do NOT write code examples.
+- Keep output under 300 lines.
+- Be direct and factual."""
+
+    try:
+        msg = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=16000,
+            thinking={
+                "type": "enabled",
+                "budget_tokens": 8000,
+            },
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return "\n".join(
+            block.text for block in msg.content
+            if block.type == "text"
+        )
+    except Exception as exc:
+        print(f"    Extended thinking unavailable ({exc}), using standard call")
+        msg = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text
 
 
 def cross_job_analysis(
