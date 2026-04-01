@@ -369,11 +369,9 @@ def _check_ci_with_agent(pr_number: int, repo_path) -> str:
 
 Check CI status for PR #{pr_number} in sgl-project/sglang. The source code is in the current directory (checked out to the PR branch). GitHub API token is in $GH_PAT.
 
-For each failed CI job, determine whether the failure is caused by this PR or is a pre-existing issue. Use BOTH methods described in CLAUDE.md:
-1. Code path analysis — read the PR diff and source files to correlate errors with changed code.
-2. Cross-PR comparison — fetch recent CI runs from OTHER PRs on the same workflow and check if the same job also fails there.
+For each failed CI job, determine whether the failure is caused by this PR or is a pre-existing issue. Read the PR diff and the full source files in the workspace to correlate failures with the changed code.
 
-IMPORTANT: Do NOT perform regression bisection or search for the commit that broke main. That is the CI Monitor's job, not yours."""
+IMPORTANT: Do NOT perform regression bisection, search for the commit that broke main, or fetch historical workflow runs. That is the CI Monitor's job, not yours."""
 
     return claude_code_analyze(
         prompt=prompt,
