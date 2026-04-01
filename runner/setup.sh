@@ -158,19 +158,11 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
         fi
     fi
 
-    # Runner-1 specific: daemons (comment watcher + CI monitor)
+    # Runner-1 specific: comment watcher daemon
     if [ "$i" -eq 1 ]; then
         EXTRA_ARGS+=(-e ENABLE_WATCHER=true -e POLL_INTERVAL="${POLL_INTERVAL}")
         if [ -n "$BOT_PAT" ]; then
             EXTRA_ARGS+=(-e BOT_PAT="${BOT_PAT}")
-        fi
-        if [ -n "$LLM_GATEWAY_KEY" ]; then
-            EXTRA_ARGS+=(-e ENABLE_CI_MONITOR=true)
-            EXTRA_ARGS+=(-e LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY}")
-            EXTRA_ARGS+=(-e LLM_GATEWAY_URL="${LLM_GATEWAY_URL:-https://llm-api.amd.com/Anthropic}")
-        fi
-        if [ "$USE_AGENT" = true ]; then
-            EXTRA_ARGS+=(-e USE_AGENT=true)
         fi
     fi
 
@@ -197,12 +189,7 @@ echo "  ${RUNNER_COUNT} runners deployed successfully!"
 echo "============================================"
 echo "  Containers  : ${RUNNER_NAME}-{1..${RUNNER_COUNT}}"
 echo "  Watcher     : ${RUNNER_NAME}-1 (comment daemon, poll ${POLL_INTERVAL}s)"
-if [ -n "$LLM_GATEWAY_KEY" ]; then
-echo "  CI Monitor  : ${RUNNER_NAME}-1 (failure daemon, poll 60s)"
-fi
-if [ "$USE_AGENT" = true ]; then
-echo "  Agent Mode  : enabled (Claude Code CLI)"
-fi
+echo "  CI Monitor  : via GitHub Actions cron (ci-monitor.yml, every 30min)"
 echo "  Repo        : ${REPO}"
 echo "  Labels     : self-hosted, amd-internal"
 echo "  Entrypoint : ${ENTRYPOINT_PATH} (bind-mounted, restart to apply changes)"

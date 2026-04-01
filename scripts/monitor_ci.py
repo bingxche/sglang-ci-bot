@@ -3,24 +3,21 @@
 amd-bot CI Failure Monitor for sglang.
 
 Monitors specified CI workflows, fetches full logs from failed jobs,
-uses progressive step-by-step analysis with Claude to build a cumulative
-understanding across all steps (not just failed ones), then posts/updates
-daily summary comments on GitHub issues.
+analyzes them with Claude, and posts/updates daily summary comments
+on GitHub issues.
 
 Each workflow gets ONE comment in the daily issue, updated via PATCH as
 new failures are discovered.  In-progress runs are monitored so that
 already-failed jobs can be analyzed immediately, without waiting for the
 entire workflow to finish.
 
-Deduplication across processes (daemon + cron) is achieved by embedding
-processed job IDs in the comment body as an HTML comment:
+Deduplication is achieved by embedding processed job IDs in the comment
+body as an HTML comment:
   <!-- processed_job_ids: 111,222,333 -->
-Both daemon and cron read this metadata before analyzing, ensuring no
-job is analyzed twice regardless of which process handles it.
+Each cron run reads this metadata before analyzing, ensuring no job is
+analyzed twice.
 
-Supports two modes:
-  1. One-shot (default): check once and exit (for GitHub Actions cron)
-  2. Daemon (--daemon):  poll continuously (for self-hosted runner)
+Runs as a one-shot process triggered by GitHub Actions cron (every 30min).
 """
 
 import argparse
@@ -28,9 +25,7 @@ import json
 import logging
 import os
 import re
-import signal
 import sys
-import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -41,7 +36,6 @@ import requests
 from utils import (
     GATE_STEP_PATTERNS,
     REPO,
-    STEP_LOG_PREFILTER_THRESHOLD,
     claude_code_analyze,
     claude_code_available,
     create_anthropic_client,
@@ -52,7 +46,6 @@ from utils import (
     extract_error_lines,
     focused_job_analysis,
     gh_headers,
-    parse_log_by_steps,
     post_comment,
     prefilter_large_step_log,
     update_comment,
@@ -74,9 +67,6 @@ SKIP_JOB_CONCLUSIONS = {"success", "skipped"}
 
 STATE_FILE = Path(__file__).parent.parent / ".state" / "ci_monitor.json"
 MAX_PARALLEL_JOBS = 3
-
-IDLE_POLL_INTERVAL = 300   # 5 min — no active runs
-ACTIVE_POLL_INTERVAL = 60  # 60s  — tracking in-progress runs
 
 _PROCESSED_IDS_RE = re.compile(r"<!-- processed_job_ids: ([\d,]+) -->")
 _GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-", re.IGNORECASE)
@@ -218,11 +208,7 @@ def get_issue_comments(token: str, bot_repo: str, issue_number: int) -> list[dic
 def extract_processed_ids_from_comments(
     comments: list[dict], workflow_file: str,
 ) -> set[int]:
-    """Scan ALL comments for a workflow and return the union of processed job IDs.
-
-    Multiple comments may exist for the same workflow (e.g. one from cron,
-    one from daemon).  We merge their metadata so no job is ever re-analyzed.
-    """
+    """Scan ALL comments for a workflow and return the union of processed job IDs."""
     marker = f"## `{workflow_file}`"
     all_ids: set[int] = set()
     for comment in comments:
@@ -232,6 +218,64 @@ def extract_processed_ids_from_comments(
             if match:
                 all_ids.update(int(x) for x in match.group(1).split(",") if x)
     return all_ids
+
+
+_JOB_TABLE_ROW_RE = re.compile(
+    r"\| \[`(.+?)`\]\((.+?)\) \| (.+?) \| (.+?) \|"
+)
+_DETAILS_BLOCK_RE = re.compile(
+    r"<details>\s*<summary><b>(.+?)</b> — failed step\(s\): (.+?)</summary>"
+    r"\s*\n(.*?)\n</details>",
+    re.DOTALL,
+)
+
+
+def find_workflow_comment(
+    comments: list[dict], workflow_file: str,
+) -> dict | None:
+    """Find the most recent comment for a workflow. Returns comment dict or None."""
+    marker = f"## `{workflow_file}`"
+    for comment in reversed(comments):
+        if marker in comment.get("body", ""):
+            return comment
+    return None
+
+
+def parse_job_analyses_from_comment(body: str) -> list[dict]:
+    """Reconstruct job_analyses list from an existing comment body.
+
+    Parses the processed_job_ids metadata, job table rows, and <details>
+    blocks to recover the structured data needed for merging with new analyses.
+    """
+    ids_match = _PROCESSED_IDS_RE.search(body)
+    job_ids = (
+        [int(x) for x in ids_match.group(1).split(",") if x]
+        if ids_match else []
+    )
+
+    table_rows = _JOB_TABLE_ROW_RE.findall(body)
+    details_blocks = {m.group(1): m.group(3).strip() for m in _DETAILS_BLOCK_RE.finditer(body)}
+
+    analyses: list[dict] = []
+    for i, (job_name, run_url, failed_steps_str, started_at) in enumerate(table_rows):
+        job_id = job_ids[i] if i < len(job_ids) else 0
+        failed_steps = (
+            [s.strip() for s in failed_steps_str.split(",")]
+            if failed_steps_str.strip() != "N/A" else []
+        )
+        started = started_at.strip() if started_at.strip() != "N/A" else None
+        analysis_text = details_blocks.get(job_name, "")
+
+        analyses.append({
+            "run_url": run_url,
+            "job_name": job_name,
+            "job_id": job_id,
+            "started_at": started,
+            "failed_steps": failed_steps,
+            "analysis": analysis_text,
+        })
+
+    return analyses
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +466,8 @@ def render_workflow_comment(
 """
 
     if cross_summary:
-        body += f"### Summary\n\n{cross_summary}\n\n---\n\n"
+        cleaned = re.sub(r"^#{1,3}\s+.*(?:Summary|Overview).*$", "", cross_summary, flags=re.MULTILINE).strip()
+        body += f"### Summary\n\n{cleaned}\n\n---\n\n"
 
     body += f"""| Job | Failed Steps | Started |
 |-----|-------------|---------|
@@ -577,9 +622,15 @@ def publish_workflow_report(
     new_analyses: list[dict],
     pending_info: list[dict],
     state: dict,
+    gh_comments: list[dict] | None = None,
     use_agent: bool = False,
 ):
-    """Publish or update the workflow comment in the daily issue."""
+    """Publish or update the workflow comment in the daily issue.
+
+    Adopts an existing comment for this workflow if one exists in the issue
+    (recovering state from the comment body), ensuring one comment per workflow
+    even across process restarts or cache eviction.
+    """
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = get_daily_state(state, date_str)
 
@@ -590,6 +641,28 @@ def publish_workflow_report(
 
     issue_num = daily["issue_number"]
     wf_state = get_workflow_state(daily, workflow_file)
+
+    # Adopt existing comment if we don't own one yet
+    if not (wf_state.get("comment_id") and wf_state.get("owned")):
+        if gh_comments is None:
+            try:
+                gh_comments = get_issue_comments(token, bot_repo, issue_num)
+            except Exception:
+                gh_comments = []
+
+        existing_comment = find_workflow_comment(gh_comments, workflow_file)
+        if existing_comment:
+            wf_state["comment_id"] = existing_comment["id"]
+            wf_state["owned"] = True
+            recovered = parse_job_analyses_from_comment(existing_comment["body"])
+            if recovered:
+                recovered_ids = {ja["job_id"] for ja in recovered}
+                for ja in wf_state.get("job_analyses", []):
+                    if ja["job_id"] not in recovered_ids:
+                        recovered.append(ja)
+                wf_state["job_analyses"] = recovered
+                log.info("  Adopted comment %d for %s (%d existing analyses)",
+                         existing_comment["id"], workflow_file, len(recovered))
 
     existing = wf_state.get("job_analyses", [])
     existing_ids = {ja["job_id"] for ja in existing}
@@ -625,157 +698,7 @@ def publish_workflow_report(
 
 
 # ---------------------------------------------------------------------------
-# Building processed_job_ids from local state + GitHub comments
-# ---------------------------------------------------------------------------
-
-def build_processed_ids(
-    wf_state: dict,
-    gh_comments: list[dict],
-    workflow_file: str,
-) -> set[int]:
-    """Merge processed job IDs from local cache and GitHub comments."""
-    local_ids = {ja["job_id"] for ja in wf_state.get("job_analyses", [])}
-    gh_ids = extract_processed_ids_from_comments(gh_comments, workflow_file)
-    return local_ids | gh_ids
-
-
-# ---------------------------------------------------------------------------
-# Daemon mode
-# ---------------------------------------------------------------------------
-
-_shutdown = False
-
-
-def _handle_signal(signum, _frame):
-    global _shutdown
-    log.info("Received %s, shutting down...", signal.Signals(signum).name)
-    _shutdown = True
-
-
-def _interruptible_sleep(seconds: int):
-    end = time.monotonic() + seconds
-    while not _shutdown and time.monotonic() < end:
-        time.sleep(min(1, end - time.monotonic()))
-
-
-def run_daemon(
-    token: str,
-    bot_repo: str,
-    workflows: list[str],
-    hours_back: int,
-    branch: str,
-    job_name_filter: str | None = None,
-    use_agent: bool = False,
-):
-    """Run the CI monitor as a long-lived daemon."""
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
-
-    agent_mode = "agent" if use_agent else "API"
-    log.info(
-        "Daemon started — monitoring %s, dispatching to %s "
-        "(idle: %ds, active: %ds, mode: %s)",
-        REPO, bot_repo, IDLE_POLL_INTERVAL, ACTIVE_POLL_INTERVAL, agent_mode,
-    )
-
-    agent_repo_path = None
-    if use_agent:
-        if not claude_code_available():
-            log.warning("--use-agent specified but Claude Code CLI not found, falling back to API mode")
-            use_agent = False
-        else:
-            try:
-                agent_repo_path = ensure_sglang_repo()
-            except Exception:
-                log.exception("Failed to clone sglang repo, falling back to API mode")
-                use_agent = False
-
-    consecutive_errors = 0
-    max_backoff = 600
-
-    while not _shutdown:
-        has_in_progress = False
-        state = load_state()
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        daily = get_daily_state(state, date_str)
-
-        if use_agent and agent_repo_path:
-            try:
-                ensure_sglang_repo()
-            except Exception:
-                log.warning("Failed to update sglang repo, using stale copy")
-
-        if not daily.get("issue_number"):
-            try:
-                daily["issue_number"] = find_daily_issue(token, bot_repo, date_str)
-            except Exception:
-                pass
-
-        gh_comments: list[dict] = []
-        if daily.get("issue_number"):
-            try:
-                gh_comments = get_issue_comments(token, bot_repo, daily["issue_number"])
-            except Exception:
-                log.warning("Could not fetch issue comments, using local state only")
-
-        for wf in workflows:
-            if _shutdown:
-                break
-            try:
-                wf_state = get_workflow_state(daily, wf)
-                processed_job_ids = build_processed_ids(wf_state, gh_comments, wf)
-
-                new_analyses, new_ids, pending = monitor_workflow(
-                    token, wf,
-                    hours_back=hours_back,
-                    processed_job_ids=processed_job_ids,
-                    job_name_filter=job_name_filter,
-                    branch=branch,
-                    use_agent=use_agent,
-                    agent_repo_path=agent_repo_path,
-                )
-
-                if pending:
-                    has_in_progress = True
-
-                total_pending = sum(p["count"] for p in pending) if pending else 0
-                last_pending = wf_state.get("last_pending_count", 0)
-
-                needs_update = bool(new_analyses)
-                if not needs_update and wf_state.get("comment_id") and wf_state.get("owned"):
-                    if wf_state.get("job_analyses") and total_pending != last_pending:
-                        needs_update = True
-
-                if needs_update:
-                    publish_workflow_report(
-                        token, bot_repo, wf, new_analyses, pending, state,
-                    )
-
-                save_state(state)
-                consecutive_errors = 0
-
-            except requests.exceptions.RequestException as exc:
-                consecutive_errors += 1
-                backoff = min(60 * (2 ** consecutive_errors), max_backoff)
-                log.warning(
-                    "API error on %s (%d in a row): %s — retry in %ds",
-                    wf, consecutive_errors, exc, backoff,
-                )
-                _interruptible_sleep(backoff)
-            except Exception:
-                consecutive_errors += 1
-                log.exception("Error monitoring %s (%d in a row)", wf, consecutive_errors)
-                _interruptible_sleep(min(60 * consecutive_errors, max_backoff))
-
-        interval = ACTIVE_POLL_INTERVAL if has_in_progress else IDLE_POLL_INTERVAL
-        log.debug("Sleeping %ds (active=%s)...", interval, has_in_progress)
-        _interruptible_sleep(interval)
-
-    log.info("Daemon stopped.")
-
-
-# ---------------------------------------------------------------------------
-# One-shot mode (for cron / manual use)
+# One-shot mode (triggered by GitHub Actions cron)
 # ---------------------------------------------------------------------------
 
 def run_oneshot(
@@ -856,6 +779,7 @@ def run_oneshot(
             elif output == "daily-issue" and bot_repo:
                 publish_workflow_report(
                     token, bot_repo, wf, new_analyses, pending, state,
+                    gh_comments=gh_comments,
                     use_agent=use_agent,
                 )
 
@@ -893,7 +817,7 @@ def main():
     )
     parser.add_argument(
         "--output", choices=["stdout", "daily-issue"], default="stdout",
-        help="Output mode for one-shot (default: stdout)",
+        help="Output mode (default: stdout)",
     )
     parser.add_argument(
         "--bot-repo",
@@ -906,14 +830,6 @@ def main():
     parser.add_argument(
         "--branch", default="main",
         help="Only analyze runs triggered on this branch (default: main)",
-    )
-    parser.add_argument(
-        "--daemon", action="store_true",
-        help="Run as a long-lived daemon instead of one-shot",
-    )
-    parser.add_argument(
-        "--poll-interval", type=int,
-        help="Override active poll interval in daemon mode (seconds)",
     )
     parser.add_argument(
         "--use-agent", action="store_true",
@@ -947,24 +863,11 @@ def main():
             log.error("LLM_GATEWAY_URL env var required.")
             sys.exit(1)
 
-    if args.daemon:
-        if not args.bot_repo:
-            log.error("--bot-repo is required for daemon mode.")
-            sys.exit(1)
-        if args.poll_interval:
-            global ACTIVE_POLL_INTERVAL
-            ACTIVE_POLL_INTERVAL = args.poll_interval
-        run_daemon(
-            args.github_token, args.bot_repo, args.workflows,
-            args.hours_back, args.branch, args.job_name,
-            use_agent=args.use_agent,
-        )
-    else:
-        run_oneshot(
-            args.github_token, args.bot_repo, args.output,
-            args.workflows, args.hours_back, args.branch, args.job_name,
-            use_agent=args.use_agent,
-        )
+    run_oneshot(
+        args.github_token, args.bot_repo, args.output,
+        args.workflows, args.hours_back, args.branch, args.job_name,
+        use_agent=args.use_agent,
+    )
 
 
 if __name__ == "__main__":
