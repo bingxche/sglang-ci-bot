@@ -104,7 +104,11 @@ Critical / High / Medium / Low — (one sentence justification)
 
 ## PR CI Status Check
 
-When the prompt asks you to **check CI status for a PR**, follow this methodology. The goal is to determine whether each CI failure is caused by the PR changes or is a pre-existing/infrastructure issue. **Do NOT** perform historical comparison or regression detection — that is the CI Monitor's job.
+When the prompt asks you to **check CI status for a PR**, follow this methodology. The developer's question is: **"Do I need to fix something before merging, or can I ignore these failures?"** Your job is to give a clear, evidence-backed answer for each failed job.
+
+Two complementary methods provide evidence:
+1. **Code path analysis** — read the PR diff and source files to determine whether the error involves code touched by the PR.
+2. **Cross-PR comparison** — check whether the same job also fails on other recent PRs. If it does, the failure is clearly not caused by this PR.
 
 ### Step 1: Get PR info and CI runs
 
@@ -123,47 +127,72 @@ When the prompt asks you to **check CI status for a PR**, follow this methodolog
 
 ### Step 2: Analyze each failed job
 
-For each failed job:
-- Download the last 100 lines of the log:
-  ```
-  curl -sL -H "Authorization: token $GH_PAT" \
-    "https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/logs" | tail -100
-  ```
-- If the tail is insufficient, grep for errors:
-  ```
-  curl -sL -H "Authorization: token $GH_PAT" \
-    "https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/logs" | grep -E "(FAIL|ERROR|Exception|Traceback)" | tail -30
-  ```
-- Identify the specific error message.
+For each failed job, download the full log and identify the error:
+```
+curl -sL -H "Authorization: token $GH_PAT" \
+  "https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/logs"
+```
+Read the log however you see fit (grep, tail, search for stack traces, etc.) to find the root error message.
+- Identify the specific error message and note the step number + line number for linking.
 
-### Step 3: Correlate with PR changes
+### Step 3: Code path analysis
 
 - Read the PR diff to understand what code was changed.
 - Read the **full source files** in the workspace for any files touched by the PR.
-- For each failure, assess:
-  - Does the error involve code paths touched by the PR? → **Likely related**
-  - Could the PR indirectly affect the failing code? → **Possibly related**
-  - Is the error in completely unrelated code, or is it an infrastructure/timeout issue? → **Unlikely related**
+- For each failure, form an initial assessment:
+  - Does the error involve code paths directly touched by the PR? → likely PR-related
+  - Could the PR indirectly affect the failing code (e.g., shared module, changed API)? → possibly PR-related
+  - Is the error in completely unrelated code, a different model, or an infrastructure/timeout issue? → unlikely PR-related
+
+### Step 4: Cross-PR comparison
+
+Validate your Step 3 assessment with empirical data. For each failed workflow, fetch recent runs from **other PRs**:
+```
+curl -sH "Authorization: token $GH_PAT" \
+  "https://api.github.com/repos/sgl-project/sglang/actions/workflows/{workflow_file}/runs?per_page=10&event=pull_request"
+```
+For each of those runs, check if the **same job name** also failed:
+```
+curl -sH "Authorization: token $GH_PAT" \
+  "https://api.github.com/repos/sgl-project/sglang/actions/runs/{run_id}/jobs?per_page=100"
+```
+
+Use cross-PR results to confirm or override your code analysis verdict:
+- Code says "possibly related" + same job also fails on other PRs → override to 🟢 Unlikely
+- Code says "unlikely" + only this PR fails this job while other PRs pass → escalate to 🟡 Possibly
+- Code says "likely" + other PRs pass this job → confirms 🔴 Likely
 
 ### What NOT to do
 
-- Do NOT fetch historical workflow runs to compare pass/fail trends.
-- Do NOT search for regression windows or suspicious commits on main.
-- Do NOT run `git log --since/--until` to find when a failure started.
-- These are all CI Monitor tasks, not PR CI status check tasks.
+- Do NOT perform regression bisection (searching for the commit that broke main). That is the CI Monitor's job.
+- Do NOT run `git log --since/--until` to find when a failure first appeared on main.
+- Fetching other PRs' CI runs for cross-PR comparison IS allowed — it is different from regression hunting.
+
+### Link format
+
+When citing evidence, always include hyperlinks. Construct them as follows:
+- Job page: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}`
+- Specific log line: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}#step:{step_number}:{line_number}`
+- PR page: `https://github.com/sgl-project/sglang/pull/{pr_number}`
 
 ### Output format
 
 ```
 ## CI Status for PR #N
 
-| Job | Error | Related to PR? | Explanation |
-|-----|-------|----------------|-------------|
-| job-name | error message | Likely/Possibly/Unlikely | one sentence |
+PR: [title](pr_url)
+Changed files: `file1.py` (+X/-Y), `file2.py` (+X/-Y)
+
+| Job | Error | Related? | Evidence | Log |
+|-----|-------|----------|----------|-----|
+| job-name | error message | 🟢 Unlikely | Also fails on [PR #X](link), [PR #Y](link) | [Log](link) |
+| job-name | error message | 🔴 Likely | Error in `file.py` changed by this PR; other PRs pass | [Log](link) |
+| job-name | error message | 🟡 Possibly | Only this PR fails; error in related module | [Log](link) |
 
 ### Details
-(For each "Likely" or "Possibly" related failure, explain which PR changes
-could cause it, referencing specific files and code paths)
+(For each 🔴 Likely or 🟡 Possibly failure, explain which PR changes
+could cause it. All claims MUST include hyperlinks to log lines,
+job pages, or other PR CI runs as evidence.)
 ```
 
 ---
