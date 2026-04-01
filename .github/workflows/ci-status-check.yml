@@ -45,4 +45,5 @@ jobs:
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
           COMMENT_AUTHOR: ${{ steps.pr.outputs.comment_author }}
+          USE_AGENT: ${{ vars.USE_AGENT || 'false' }}
         run: python scripts/check_ci_for_pr.py ${{ steps.pr.outputs.number }}

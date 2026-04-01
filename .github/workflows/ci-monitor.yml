@@ -21,6 +21,11 @@ on:
         options:
           - daily-issue
           - stdout
+      use_agent:
+        description: 'Use Claude Code agent for deeper analysis'
+        required: false
+        default: 'false'
+        type: boolean
 
 concurrency:
   group: ci-monitor
@@ -63,6 +68,11 @@ jobs:
           if [ -n "$WORKFLOWS" ]; then
             IFS=',' read -ra WF_ARRAY <<< "$WORKFLOWS"
             ARGS="$ARGS --workflows ${WF_ARRAY[*]}"
+          fi
+
+          USE_AGENT="${{ github.event.inputs.use_agent || 'false' }}"
+          if [ "$USE_AGENT" = "true" ]; then
+            ARGS="$ARGS --use-agent"
           fi
 
           python scripts/monitor_ci.py $ARGS

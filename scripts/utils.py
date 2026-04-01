@@ -2,12 +2,17 @@
 Shared utilities for amd-bot scripts.
 
 Provides GitHub API helpers, Anthropic client creation, log parsing,
-and progressive step-by-step CI log analysis.
+progressive step-by-step CI log analysis, and Claude Code agent integration.
 """
 
 import getpass
+import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 import anthropic
 import httpx
@@ -660,3 +665,155 @@ Do NOT repeat per-job analysis. Do NOT write code. Be brief."""
         messages=[{"role": "user", "content": prompt}],
     )
     return msg.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# Claude Code agent integration
+# ---------------------------------------------------------------------------
+
+_agent_log = logging.getLogger("claude-agent")
+
+AGENT_WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/workspace"))
+SGLANG_REPO_PATH = AGENT_WORKSPACE / "sglang"
+
+
+def claude_code_available() -> bool:
+    """Check if the Claude Code CLI is installed and callable."""
+    try:
+        result = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, timeout=10,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def ensure_sglang_repo(ref: str = "main") -> Path:
+    """Clone or update the sglang repo for agent-based analysis.
+
+    Args:
+        ref: Git ref to checkout — ``"main"`` for CI monitor,
+             or a PR branch like ``"pull/1234/head"`` for PR review.
+
+    Returns:
+        Path to the sglang repo root (``/workspace/sglang``).
+    """
+    AGENT_WORKSPACE.mkdir(parents=True, exist_ok=True)
+
+    if SGLANG_REPO_PATH.exists() and (SGLANG_REPO_PATH / ".git").exists():
+        _agent_log.info("Updating sglang repo at %s (ref: %s)...", SGLANG_REPO_PATH, ref)
+        subprocess.run(
+            ["git", "fetch", "origin", ref, "--depth", "100"],
+            cwd=SGLANG_REPO_PATH, capture_output=True, timeout=120,
+        )
+        if ref == "main":
+            subprocess.run(
+                ["git", "reset", "--hard", "origin/main"],
+                cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
+            )
+        else:
+            subprocess.run(
+                ["git", "checkout", "FETCH_HEAD", "--force"],
+                cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
+            )
+    else:
+        if SGLANG_REPO_PATH.exists():
+            shutil.rmtree(SGLANG_REPO_PATH)
+        _agent_log.info("Cloning sglang repo to %s...", SGLANG_REPO_PATH)
+        clone_url = f"https://github.com/{REPO}.git"
+        subprocess.run(
+            ["git", "clone", "--depth", "100", "--single-branch", "--branch", "main",
+             clone_url, str(SGLANG_REPO_PATH)],
+            capture_output=True, timeout=300, check=True,
+        )
+        if ref != "main":
+            subprocess.run(
+                ["git", "fetch", "origin", ref, "--depth", "100"],
+                cwd=SGLANG_REPO_PATH, capture_output=True, timeout=120,
+            )
+            subprocess.run(
+                ["git", "checkout", "FETCH_HEAD", "--force"],
+                cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
+            )
+
+    _agent_log.info("sglang repo ready at %s", SGLANG_REPO_PATH)
+    return SGLANG_REPO_PATH
+
+
+def claude_code_analyze(
+    prompt: str,
+    work_dir: Path,
+    context_files: dict[str, str] | None = None,
+    max_turns: int = 15,
+    timeout_secs: int = 600,
+) -> str:
+    """Run Claude Code CLI in non-interactive print mode.
+
+    Writes *context_files* into a ``.ci-context/`` subdirectory of
+    *work_dir* so the agent can read them, runs ``claude -p``, and
+    returns the text output.
+
+    Raises ``RuntimeError`` on failure so callers can fall back to
+    the single-shot API approach.
+    """
+    context_dir = work_dir / ".ci-context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+
+    written: list[Path] = []
+    try:
+        if context_files:
+            for filename, content in context_files.items():
+                p = context_dir / filename
+                p.write_text(content)
+                written.append(p)
+
+        cmd = [
+            "claude", "-p", prompt,
+            "--output-format", "text",
+            "--max-turns", str(max_turns),
+            "--dangerously-skip-permissions",
+        ]
+
+        _agent_log.info(
+            "Running Claude Code (max_turns=%d, timeout=%ds, cwd=%s)...",
+            max_turns, timeout_secs, work_dir,
+        )
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(work_dir),
+            timeout=timeout_secs,
+            stdin=subprocess.DEVNULL,
+        )
+
+        _agent_log.info(
+            "Claude Code exit=%d, stdout=%d chars, stderr=%d chars",
+            result.returncode, len(result.stdout or ""), len(result.stderr or ""),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+
+        stderr_snippet = (result.stderr or "")[:1000]
+        stdout_snippet = (result.stdout or "")[:1000]
+        raise RuntimeError(
+            f"Claude Code exited {result.returncode}.\n"
+            f"stderr: {stderr_snippet}\n"
+            f"stdout: {stdout_snippet}"
+        )
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Claude Code timed out after {timeout_secs}s")
+    except FileNotFoundError:
+        raise RuntimeError(
+            "Claude Code CLI not found (install: npm install -g @anthropic-ai/claude-code)"
+        )
+    finally:
+        for p in written:
+            p.unlink(missing_ok=True)
+        try:
+            context_dir.rmdir()
+        except OSError:
+            pass

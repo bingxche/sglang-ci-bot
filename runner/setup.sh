@@ -35,6 +35,9 @@ MIN_DISK_MB=3000
 LOCAL_TAG="sglang-ci-bot-runner:latest"
 RUNNER_COUNT=10
 POLL_INTERVAL=15
+CLAUDE_CONFIG_DIR=""
+CLAUDE_ENV_FILE=""
+USE_AGENT=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -47,6 +50,9 @@ while [[ $# -gt 0 ]]; do
         --image)           IMAGE="$2"; shift 2 ;;
         --count)           RUNNER_COUNT="$2"; shift 2 ;;
         --build)           FORCE_BUILD=true; shift ;;
+        --claude-config)   CLAUDE_CONFIG_DIR="$2"; shift 2 ;;
+        --claude-env)      CLAUDE_ENV_FILE="$2"; shift 2 ;;
+        --use-agent)       USE_AGENT=true; shift ;;
         *)                 echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -152,6 +158,13 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
             EXTRA_ARGS+=(-e LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY}")
             EXTRA_ARGS+=(-e LLM_GATEWAY_URL="${LLM_GATEWAY_URL:-https://llm-api.amd.com/Anthropic}")
         fi
+        if [ "$USE_AGENT" = true ]; then
+            EXTRA_ARGS+=(-e USE_AGENT=true)
+            # Inject the LLM Gateway key for Claude Code at runtime (never baked into image)
+            if [ -n "$LLM_GATEWAY_KEY" ]; then
+                EXTRA_ARGS+=(-e "ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: ${LLM_GATEWAY_KEY}")
+            fi
+        fi
     fi
 
     docker run -d \
@@ -179,6 +192,9 @@ echo "  Containers  : ${RUNNER_NAME}-{1..${RUNNER_COUNT}}"
 echo "  Watcher     : ${RUNNER_NAME}-1 (comment daemon, poll ${POLL_INTERVAL}s)"
 if [ -n "$LLM_GATEWAY_KEY" ]; then
 echo "  CI Monitor  : ${RUNNER_NAME}-1 (failure daemon, poll 60s)"
+fi
+if [ "$USE_AGENT" = true ]; then
+echo "  Agent Mode  : enabled (Claude Code CLI)"
 fi
 echo "  Repo        : ${REPO}"
 echo "  Labels     : self-hosted, amd-internal"

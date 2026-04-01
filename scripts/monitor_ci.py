@@ -41,10 +41,13 @@ import requests
 from utils import (
     REPO,
     STEP_LOG_PREFILTER_THRESHOLD,
+    claude_code_analyze,
+    claude_code_available,
     create_anthropic_client,
     create_github_issue,
     cross_job_analysis,
     download_job_logs,
+    ensure_sglang_repo,
     extract_error_lines,
     focused_job_analysis,
     gh_headers,
@@ -308,6 +311,62 @@ def _analyze_job(client, token: str, job: dict, run_url: str) -> dict:
     }
 
 
+def _analyze_job_with_agent(job: dict, run_url: str, repo_path: Path) -> dict:
+    """Invoke Claude Code agent to fully analyze a CI failure.
+
+    The agent handles everything autonomously: downloading logs via the
+    GitHub API (using ``$GH_PAT`` from the environment), parsing errors,
+    reading sglang source code, checking git history, and producing a
+    root-cause analysis.
+    """
+    job_name = job["name"]
+    job_id = job["id"]
+
+    failed_step_names = {
+        s["name"]
+        for s in job.get("steps", [])
+        if s.get("conclusion") not in ("success", "skipped", None)
+    }
+
+    prompt = f"""Analyze this CI failure in the sglang project (https://github.com/sgl-project/sglang).
+The sglang source code is in the current directory.
+
+Job: {job_name}
+Run: {run_url}
+Job ID: {job_id}
+
+Download the job log via GitHub API (auth token is in env var $GH_PAT or $BOT_PAT):
+  curl -sL -H "Authorization: token $GH_PAT" https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/logs
+
+Investigate: read the log, find failures, search the source code for relevant files, check git log for recent changes, and determine the root cause.
+
+Output a concise markdown report:
+### Failure Summary
+### Failure Reasons (bullet points)
+### Stack Traces (verbatim in code blocks)
+### Root Cause Analysis (which code, regression or pre-existing, relevant files)
+### Suggested Fix Directions (bullet points, no code)
+### Priority (Critical/High/Medium/Low with one sentence)
+
+Keep it under 400 lines. Be direct, no filler."""
+
+    log.info("  [%s] Running Claude Code agent...", job_name)
+    analysis = claude_code_analyze(
+        prompt=prompt,
+        work_dir=repo_path,
+    )
+
+    log.info("  [%s] Agent analysis done.", job_name)
+    return {
+        "run_url": run_url,
+        "job_name": job_name,
+        "job_id": job_id,
+        "started_at": job.get("started_at"),
+        "failed_steps": sorted(failed_step_names),
+        "analysis": analysis,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Comment rendering
 # ---------------------------------------------------------------------------
@@ -390,6 +449,8 @@ def monitor_workflow(
     processed_job_ids: set[int] | None = None,
     job_name_filter: str | None = None,
     branch: str = "main",
+    use_agent: bool = False,
+    agent_repo_path: Path | None = None,
 ) -> tuple[list[dict], list[int], list[dict]]:
     """Monitor a single workflow.
 
@@ -439,25 +500,49 @@ def monitor_workflow(
     new_job_ids: list[int] = []
 
     if jobs_to_analyze:
-        client = create_anthropic_client()
-        workers = min(MAX_PARALLEL_JOBS, len(jobs_to_analyze))
-        log.info("  Analyzing %d job(s) (workers: %d)...", len(jobs_to_analyze), workers)
+        max_workers = min(
+            MAX_PARALLEL_JOBS if not use_agent else 2,
+            len(jobs_to_analyze),
+        )
+        mode = "agent" if use_agent else "API"
+        log.info("  Analyzing %d job(s) (%s mode, workers: %d)...",
+                 len(jobs_to_analyze), mode, max_workers)
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(_analyze_job, client, token, job, run_url): job
-                for job, run_url in jobs_to_analyze
-            }
-            for future in as_completed(futures):
-                job = futures[future]
-                try:
-                    result = future.result()
-                    new_job_analyses.append(result)
-                    new_job_ids.append(result["job_id"])
-                except Exception as e:
-                    log.error("  Error analyzing %s: %s", job["name"], e)
-                    traceback.print_exc()
-                    new_job_ids.append(job["id"])
+        if use_agent and agent_repo_path:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _analyze_job_with_agent, job, run_url, agent_repo_path,
+                    ): job
+                    for job, run_url in jobs_to_analyze
+                }
+                for future in as_completed(futures):
+                    job = futures[future]
+                    try:
+                        result = future.result()
+                        new_job_analyses.append(result)
+                        new_job_ids.append(result["job_id"])
+                    except Exception as e:
+                        log.error("  Error analyzing %s: %s", job["name"], e)
+                        traceback.print_exc()
+                        new_job_ids.append(job["id"])
+        else:
+            client = create_anthropic_client()
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(_analyze_job, client, token, job, run_url): job
+                    for job, run_url in jobs_to_analyze
+                }
+                for future in as_completed(futures):
+                    job = futures[future]
+                    try:
+                        result = future.result()
+                        new_job_analyses.append(result)
+                        new_job_ids.append(result["job_id"])
+                    except Exception as e:
+                        log.error("  Error analyzing %s: %s", job["name"], e)
+                        traceback.print_exc()
+                        new_job_ids.append(job["id"])
     else:
         log.info("  No new failed jobs to analyze.")
 
@@ -559,16 +644,30 @@ def run_daemon(
     hours_back: int,
     branch: str,
     job_name_filter: str | None = None,
+    use_agent: bool = False,
 ):
     """Run the CI monitor as a long-lived daemon."""
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    agent_mode = "agent" if use_agent else "API"
     log.info(
         "Daemon started — monitoring %s, dispatching to %s "
-        "(idle: %ds, active: %ds)",
-        REPO, bot_repo, IDLE_POLL_INTERVAL, ACTIVE_POLL_INTERVAL,
+        "(idle: %ds, active: %ds, mode: %s)",
+        REPO, bot_repo, IDLE_POLL_INTERVAL, ACTIVE_POLL_INTERVAL, agent_mode,
     )
+
+    agent_repo_path = None
+    if use_agent:
+        if not claude_code_available():
+            log.warning("--use-agent specified but Claude Code CLI not found, falling back to API mode")
+            use_agent = False
+        else:
+            try:
+                agent_repo_path = ensure_sglang_repo()
+            except Exception:
+                log.exception("Failed to clone sglang repo, falling back to API mode")
+                use_agent = False
 
     consecutive_errors = 0
     max_backoff = 600
@@ -578,6 +677,12 @@ def run_daemon(
         state = load_state()
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         daily = get_daily_state(state, date_str)
+
+        if use_agent and agent_repo_path:
+            try:
+                ensure_sglang_repo()
+            except Exception:
+                log.warning("Failed to update sglang repo, using stale copy")
 
         if not daily.get("issue_number"):
             try:
@@ -605,6 +710,8 @@ def run_daemon(
                     processed_job_ids=processed_job_ids,
                     job_name_filter=job_name_filter,
                     branch=branch,
+                    use_agent=use_agent,
+                    agent_repo_path=agent_repo_path,
                 )
 
                 if pending:
@@ -658,8 +765,21 @@ def run_oneshot(
     hours_back: int,
     branch: str,
     job_name_filter: str | None = None,
+    use_agent: bool = False,
 ):
     """Run the CI monitor once and exit."""
+    agent_repo_path = None
+    if use_agent:
+        if not claude_code_available():
+            log.warning("--use-agent specified but Claude Code CLI not found, falling back to API mode")
+            use_agent = False
+        else:
+            try:
+                agent_repo_path = ensure_sglang_repo()
+            except Exception:
+                log.exception("Failed to clone sglang repo, falling back to API mode")
+                use_agent = False
+
     state = load_state()
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = get_daily_state(state, date_str)
@@ -691,6 +811,8 @@ def run_oneshot(
                 processed_job_ids=processed_job_ids,
                 job_name_filter=job_name_filter,
                 branch=branch,
+                use_agent=use_agent,
+                agent_repo_path=agent_repo_path,
             )
 
             if not new_analyses:
@@ -769,6 +891,11 @@ def main():
         help="Override active poll interval in daemon mode (seconds)",
     )
     parser.add_argument(
+        "--use-agent", action="store_true",
+        default=os.environ.get("USE_AGENT", "").lower() in ("true", "1", "yes"),
+        help="Use Claude Code agent for deeper analysis (reads source code, git history)",
+    )
+    parser.add_argument(
         "--github-token",
         default=os.environ.get("BOT_PAT", os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", ""))),
         help="GitHub token",
@@ -786,12 +913,14 @@ def main():
     if not args.github_token:
         log.error("GitHub token required. Set GH_PAT.")
         sys.exit(1)
-    if not os.environ.get("LLM_GATEWAY_KEY"):
-        log.error("LLM_GATEWAY_KEY env var required.")
-        sys.exit(1)
-    if not os.environ.get("LLM_GATEWAY_URL"):
-        log.error("LLM_GATEWAY_URL env var required.")
-        sys.exit(1)
+
+    if not args.use_agent:
+        if not os.environ.get("LLM_GATEWAY_KEY"):
+            log.error("LLM_GATEWAY_KEY env var required.")
+            sys.exit(1)
+        if not os.environ.get("LLM_GATEWAY_URL"):
+            log.error("LLM_GATEWAY_URL env var required.")
+            sys.exit(1)
 
     if args.daemon:
         if not args.bot_repo:
@@ -803,11 +932,13 @@ def main():
         run_daemon(
             args.github_token, args.bot_repo, args.workflows,
             args.hours_back, args.branch, args.job_name,
+            use_agent=args.use_agent,
         )
     else:
         run_oneshot(
             args.github_token, args.bot_repo, args.output,
             args.workflows, args.hours_back, args.branch, args.job_name,
+            use_agent=args.use_agent,
         )
 
 

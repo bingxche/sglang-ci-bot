@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+# Export ANTHROPIC_CUSTOM_HEADERS if set (injected at runtime via -e flag)
+export ANTHROPIC_CUSTOM_HEADERS="${ANTHROPIC_CUSTOM_HEADERS:-}"
+
 REPO_URL="${REPO_URL:?REPO_URL is required}"
 GH_PAT="${GH_PAT:?GH_PAT is required}"
 RUNNER_NAME="${RUNNER_NAME:-$(hostname)}"
@@ -62,14 +65,31 @@ fi
 
 if [ "${ENABLE_CI_MONITOR:-}" = "true" ]; then
     CI_MONITOR_TOKEN="${BOT_PAT:-$GH_PAT}"
-    echo "Starting CI monitor daemon (active poll: ${CI_MONITOR_POLL_INTERVAL:-60}s)..."
-    BOT_PAT="${CI_MONITOR_TOKEN}" \
-    LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY:?LLM_GATEWAY_KEY required for CI monitor}" \
-    LLM_GATEWAY_URL="${LLM_GATEWAY_URL:-https://llm-api.amd.com/Anthropic}" \
+    AGENT_FLAG=""
+    MONITOR_ENV=""
+    if [ "${USE_AGENT:-}" = "true" ]; then
+        AGENT_FLAG="--use-agent"
+        echo "Pre-cloning sglang repo to /workspace/sglang..."
+        mkdir -p /workspace
+        if [ -d /workspace/sglang ]; then
+            git -C /workspace/sglang fetch origin main --depth 100 2>/dev/null || true
+            git -C /workspace/sglang reset --hard origin/main 2>/dev/null || true
+        else
+            git clone --depth 100 --single-branch --branch main \
+                https://github.com/sgl-project/sglang.git /workspace/sglang 2>/dev/null || true
+        fi
+    else
+        MONITOR_ENV="LLM_GATEWAY_KEY=${LLM_GATEWAY_KEY:?LLM_GATEWAY_KEY required for CI monitor without --use-agent} LLM_GATEWAY_URL=${LLM_GATEWAY_URL:-https://llm-api.amd.com/Anthropic}"
+    fi
+    echo "Starting CI monitor daemon (active poll: ${CI_MONITOR_POLL_INTERVAL:-60}s, agent: ${USE_AGENT:-false})..."
+    env BOT_PAT="${CI_MONITOR_TOKEN}" \
+        AGENT_WORKSPACE="/workspace" \
+        ${MONITOR_ENV} \
     python3 /tmp/bot/scripts/monitor_ci.py \
         --daemon \
         --poll-interval "${CI_MONITOR_POLL_INTERVAL:-60}" \
-        --bot-repo "${REPO_PATH}" &
+        --bot-repo "${REPO_PATH}" \
+        ${AGENT_FLAG} &
 fi
 
 exec ./run.sh

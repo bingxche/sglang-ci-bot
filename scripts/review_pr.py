@@ -16,7 +16,10 @@ import requests
 from utils import (
     CLAUDE_MODEL,
     REPO,
+    claude_code_analyze,
+    claude_code_available,
     create_anthropic_client,
+    ensure_sglang_repo,
     gh_headers,
     post_comment,
 )
@@ -146,15 +149,94 @@ Format as clear Markdown. Be constructive and specific. Reference file names and
     return message.content[0].text
 
 
+def review_pr_with_agent(
+    pr_number: int,
+    repo_path,
+    focus_areas: str | None = None,
+    review_context: str | None = None,
+) -> str:
+    """Use Claude Code agent for deep PR review.
+
+    The agent autonomously fetches the PR diff, reads full source files,
+    finds callers of modified functions, checks test coverage, and
+    explores related code.
+    """
+    focus_line = f"\nFocus especially on: {focus_areas}" if focus_areas else ""
+    context_line = f"\nAdditional context: {review_context}" if review_context else ""
+
+    prompt = f"""Review PR #{pr_number} in sgl-project/sglang.
+The sglang source code is in the current directory (checked out to the PR branch).
+
+Fetch the PR diff and metadata via GitHub API (auth token in $GH_PAT or $BOT_PAT):
+  curl -sL -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github.diff" https://api.github.com/repos/sgl-project/sglang/pulls/{pr_number}
+  curl -sL -H "Authorization: token $GH_PAT" https://api.github.com/repos/sgl-project/sglang/pulls/{pr_number}
+
+Read the diff, then for each changed file read the full source to understand context. Search for callers of modified functions. Check if tests exist and are adequate.
+{focus_line}{context_line}
+Provide a thorough review:
+1. **Summary** (2-3 sentences)
+2. **Code Quality** (bugs, edge cases, error handling)
+3. **Performance** (especially for serving/inference)
+4. **Security**
+5. **Testing** (adequate? what to add?)
+6. **Suggestions** (specific, with file names and line numbers)
+7. **Overall Assessment** (Approve / Request Changes / Comment)
+
+Be constructive and specific."""
+
+    return claude_code_analyze(
+        prompt=prompt,
+        work_dir=repo_path,
+        max_turns=20,
+        timeout_secs=600,
+    )
+
+
 def review_pr(
     token: str,
     pr_number: int,
     focus_areas: str | None = None,
     review_context: str | None = None,
     post_comment_flag: bool = True,
+    use_agent: bool = False,
 ) -> str:
     """Main function to review a PR."""
     comment_author = os.environ.get("COMMENT_AUTHOR", "")
+    requester_line = f"> @{comment_author} requested a review\n\n" if comment_author else ""
+
+    if use_agent:
+        if not claude_code_available():
+            print("  WARNING: --use-agent but Claude Code not found, falling back to API")
+            use_agent = False
+        else:
+            try:
+                pr_ref = f"pull/{pr_number}/head"
+                repo_path = ensure_sglang_repo(ref=pr_ref)
+                print(f"Reviewing PR #{pr_number} (agent mode)...")
+                review = review_pr_with_agent(
+                    pr_number, repo_path, focus_areas, review_context,
+                )
+                now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                body = f"""{requester_line}## Claude Code Review
+
+> PR #{pr_number} — Reviewed at {now}
+
+{review}
+
+---
+*Automated review by amd-bot using Claude. This is an AI-generated review — please use your judgment.*
+"""
+                if post_comment_flag:
+                    result = post_comment(token, REPO, pr_number, body)
+                    print(f"  Posted review: {result['html_url']}")
+                    return result["html_url"]
+                print(body)
+                return body
+            except Exception as exc:
+                print(f"  WARNING: Agent failed ({exc}), falling back to API")
+                use_agent = False
+
+    # --- Non-agent (API) path ---
     print(f"Reviewing PR #{pr_number}...")
 
     pr_info = get_pr_info(token, pr_number)
@@ -170,14 +252,11 @@ def review_pr(
     print("  Sending to Claude for review...")
     review = review_pr_with_claude(pr_info, diff, files, focus_areas, review_context)
 
-    requester_line = ""
-    if comment_author:
-        requester_line = f"> @{comment_author} requested a review\n\n"
-
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     body = f"""{requester_line}## Claude Code Review
 
 > PR #{pr_number}: {pr_info['title']}
-> Reviewed at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+> Reviewed at {now}
 
 {review}
 
@@ -211,6 +290,11 @@ def main():
         help="Print review to stdout instead of posting",
     )
     parser.add_argument(
+        "--use-agent", action="store_true",
+        default=os.environ.get("USE_AGENT", "").lower() in ("true", "1", "yes"),
+        help="Use Claude Code agent for deeper review (reads full source files)",
+    )
+    parser.add_argument(
         "--github-token",
         default=os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")),
     )
@@ -220,12 +304,14 @@ def main():
     if not args.github_token:
         print("Error: GitHub token required. Set GH_PAT.", file=sys.stderr)
         sys.exit(1)
-    if not os.environ.get("LLM_GATEWAY_KEY"):
-        print("Error: LLM_GATEWAY_KEY env var required.", file=sys.stderr)
-        sys.exit(1)
-    if not os.environ.get("LLM_GATEWAY_URL"):
-        print("Error: LLM_GATEWAY_URL env var required.", file=sys.stderr)
-        sys.exit(1)
+
+    if not args.use_agent:
+        if not os.environ.get("LLM_GATEWAY_KEY"):
+            print("Error: LLM_GATEWAY_KEY env var required.", file=sys.stderr)
+            sys.exit(1)
+        if not os.environ.get("LLM_GATEWAY_URL"):
+            print("Error: LLM_GATEWAY_URL env var required.", file=sys.stderr)
+            sys.exit(1)
 
     review_pr(
         args.github_token,
@@ -233,6 +319,7 @@ def main():
         focus_areas=args.focus,
         review_context=args.context,
         post_comment_flag=not args.no_post,
+        use_agent=args.use_agent,
     )
 
 
