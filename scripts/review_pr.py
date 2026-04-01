@@ -172,7 +172,7 @@ def review_pr_with_agent(
     return claude_code_analyze(
         prompt=prompt,
         work_dir=repo_path,
-        max_turns=20,
+        max_turns=1000,
         timeout_secs=600,
     )
 

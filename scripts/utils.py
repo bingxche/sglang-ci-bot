@@ -766,7 +766,7 @@ def claude_code_analyze(
     prompt: str,
     work_dir: Path,
     context_files: dict[str, str] | None = None,
-    max_turns: int = 15,
+    max_turns: int = 1000,
     timeout_secs: int = 600,
 ) -> str:
     """Run Claude Code CLI in non-interactive print mode.
