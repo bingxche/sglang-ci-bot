@@ -364,10 +364,14 @@ def _format_merged_table(
 # ---------------------------------------------------------------------------
 
 def _check_ci_with_agent(pr_number: int, repo_path) -> str:
-    """Let the agent handle everything: query CI, download logs, analyze."""
-    prompt = f"""Check CI status for PR #{pr_number} in sgl-project/sglang. The source code is in the current directory. GitHub API token is in $GH_PAT.
+    """Let the agent check PR CI status — no historical comparison."""
+    prompt = f"""This is a **PR CI Status Check** (not a CI Monitor investigation). Follow the "PR CI Status Check" section in CLAUDE.md.
 
-For each failed job, determine whether the failure is related to the PR changes or is a pre-existing/infra issue."""
+Check CI status for PR #{pr_number} in sgl-project/sglang. The source code is in the current directory (checked out to the PR branch). GitHub API token is in $GH_PAT.
+
+For each failed CI job, determine whether the failure is related to the PR changes or is a pre-existing/infrastructure issue. Read the PR diff and the full source files in the workspace to correlate failures with the changes.
+
+IMPORTANT: Do NOT perform historical comparison or regression detection. Do NOT fetch old workflow runs or compare pass/fail trends across runs. Only analyze the current CI results against this PR's changes."""
 
     return claude_code_analyze(
         prompt=prompt,
