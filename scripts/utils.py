@@ -652,16 +652,22 @@ def cross_job_analysis(
 
 {jobs_text}
 
-Write a SHORT cross-job summary (under 30 lines). Include:
-1. **Common Root Cause** (if any): one or two sentences.
-2. **Distinct vs Shared Failures**: which jobs share the same root cause, and which have unique issues.
-3. **Fix Priority**: one sentence on what to fix first and why.
+Write a SHORT cross-job summary (under 40 lines). Start with a summary table, then brief analysis.
+
+1. **Summary Table** (MUST be first): a markdown table with these columns:
+   | # | Job | Root Cause | Type | Priority |
+   Type examples: Threshold too tight, Infra flake, Server crash, Build error, Timeout, Flaky test.
+   Priority: Critical / High / Medium / Low.
+
+2. **Common Root Cause** (if any): one or two sentences.
+3. **Distinct vs Shared Failures**: which jobs share the same root cause, and which have unique issues.
+4. **Fix Priority**: one sentence on what to fix first and why.
 
 Do NOT repeat per-job analysis. Do NOT write code. Be brief."""
 
     msg = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1024,
+        max_tokens=2048,
         messages=[{"role": "user", "content": prompt}],
     )
     return msg.content[0].text
