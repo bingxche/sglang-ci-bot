@@ -148,8 +148,19 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     echo "    Starting ${CONTAINER_NAME}..."
 
     EXTRA_ARGS=()
+
+    # Claude Code env vars for ALL runners (agent mode)
+    if [ "$USE_AGENT" = true ]; then
+        if [ -n "$CLAUDE_ENV_FILE" ]; then
+            EXTRA_ARGS+=(--env-file "$CLAUDE_ENV_FILE")
+        elif [ -n "$LLM_GATEWAY_KEY" ]; then
+            EXTRA_ARGS+=(-e "ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: ${LLM_GATEWAY_KEY}")
+        fi
+    fi
+
+    # Runner-1 specific: daemons (comment watcher + CI monitor)
     if [ "$i" -eq 1 ]; then
-        EXTRA_ARGS=(-e ENABLE_WATCHER=true -e POLL_INTERVAL="${POLL_INTERVAL}")
+        EXTRA_ARGS+=(-e ENABLE_WATCHER=true -e POLL_INTERVAL="${POLL_INTERVAL}")
         if [ -n "$BOT_PAT" ]; then
             EXTRA_ARGS+=(-e BOT_PAT="${BOT_PAT}")
         fi
@@ -160,10 +171,6 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
         fi
         if [ "$USE_AGENT" = true ]; then
             EXTRA_ARGS+=(-e USE_AGENT=true)
-            # Inject the LLM Gateway key for Claude Code at runtime (never baked into image)
-            if [ -n "$LLM_GATEWAY_KEY" ]; then
-                EXTRA_ARGS+=(-e "ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: ${LLM_GATEWAY_KEY}")
-            fi
         fi
     fi
 

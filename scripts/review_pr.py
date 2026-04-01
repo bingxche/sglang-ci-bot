@@ -161,28 +161,13 @@ def review_pr_with_agent(
     finds callers of modified functions, checks test coverage, and
     explores related code.
     """
-    focus_line = f"\nFocus especially on: {focus_areas}" if focus_areas else ""
-    context_line = f"\nAdditional context: {review_context}" if review_context else ""
+    extras = ""
+    if focus_areas:
+        extras += f"\nFocus especially on: {focus_areas}"
+    if review_context:
+        extras += f"\nAdditional context: {review_context}"
 
-    prompt = f"""Review PR #{pr_number} in sgl-project/sglang.
-The sglang source code is in the current directory (checked out to the PR branch).
-
-Fetch the PR diff and metadata via GitHub API (auth token in $GH_PAT or $BOT_PAT):
-  curl -sL -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github.diff" https://api.github.com/repos/sgl-project/sglang/pulls/{pr_number}
-  curl -sL -H "Authorization: token $GH_PAT" https://api.github.com/repos/sgl-project/sglang/pulls/{pr_number}
-
-Read the diff, then for each changed file read the full source to understand context. Search for callers of modified functions. Check if tests exist and are adequate.
-{focus_line}{context_line}
-Provide a thorough review:
-1. **Summary** (2-3 sentences)
-2. **Code Quality** (bugs, edge cases, error handling)
-3. **Performance** (especially for serving/inference)
-4. **Security**
-5. **Testing** (adequate? what to add?)
-6. **Suggestions** (specific, with file names and line numbers)
-7. **Overall Assessment** (Approve / Request Changes / Comment)
-
-Be constructive and specific."""
+    prompt = f"""Review PR #{pr_number} in sgl-project/sglang. The source code is in the current directory (checked out to the PR branch). GitHub API token is in $GH_PAT.{extras}"""
 
     return claude_code_analyze(
         prompt=prompt,

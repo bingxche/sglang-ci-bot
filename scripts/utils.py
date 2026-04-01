@@ -737,8 +737,29 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
                 cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
             )
 
+    _deploy_claude_md()
     _agent_log.info("sglang repo ready at %s", SGLANG_REPO_PATH)
     return SGLANG_REPO_PATH
+
+
+def _deploy_claude_md():
+    """Copy agent/CLAUDE.md from the bot repo to /workspace/CLAUDE.md.
+
+    Checks multiple possible locations for the bot repo source tree
+    (GitHub Actions checkout, daemon clone at /tmp/bot, relative to
+    this script).  Always overwrites so the latest version is used.
+    """
+    candidates = [
+        Path(__file__).resolve().parent.parent / "agent" / "CLAUDE.md",
+        Path("/tmp/bot/agent/CLAUDE.md"),
+    ]
+    for src in candidates:
+        if src.exists():
+            dst = AGENT_WORKSPACE / "CLAUDE.md"
+            shutil.copy2(src, dst)
+            _agent_log.info("Deployed CLAUDE.md to %s", dst)
+            return
+    _agent_log.warning("agent/CLAUDE.md not found, skipping deployment")
 
 
 def claude_code_analyze(

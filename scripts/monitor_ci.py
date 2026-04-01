@@ -311,13 +311,16 @@ def _analyze_job(client, token: str, job: dict, run_url: str) -> dict:
     }
 
 
-def _analyze_job_with_agent(job: dict, run_url: str, repo_path: Path) -> dict:
+def _analyze_job_with_agent(
+    job: dict, run_url: str, repo_path: Path, workflow_file: str = "",
+) -> dict:
     """Invoke Claude Code agent to fully analyze a CI failure.
 
     The agent handles everything autonomously: downloading logs via the
     GitHub API (using ``$GH_PAT`` from the environment), parsing errors,
     reading sglang source code, checking git history, and producing a
-    root-cause analysis.
+    root-cause analysis.  Investigation methodology is defined in
+    ``/workspace/CLAUDE.md`` which Claude Code reads automatically.
     """
     job_name = job["name"]
     job_id = job["id"]
@@ -328,27 +331,13 @@ def _analyze_job_with_agent(job: dict, run_url: str, repo_path: Path) -> dict:
         if s.get("conclusion") not in ("success", "skipped", None)
     }
 
-    prompt = f"""Analyze this CI failure in the sglang project (https://github.com/sgl-project/sglang).
-The sglang source code is in the current directory.
+    prompt = f"""Analyze this CI failure in sgl-project/sglang. The source code is in the current directory. GitHub API token is in $GH_PAT.
 
 Job: {job_name}
 Run: {run_url}
 Job ID: {job_id}
-
-Download the job log via GitHub API (auth token is in env var $GH_PAT or $BOT_PAT):
-  curl -sL -H "Authorization: token $GH_PAT" https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/logs
-
-Investigate: read the log, find failures, search the source code for relevant files, check git log for recent changes, and determine the root cause.
-
-Output a concise markdown report:
-### Failure Summary
-### Failure Reasons (bullet points)
-### Stack Traces (verbatim in code blocks)
-### Root Cause Analysis (which code, regression or pre-existing, relevant files)
-### Suggested Fix Directions (bullet points, no code)
-### Priority (Critical/High/Medium/Low with one sentence)
-
-Keep it under 400 lines. Be direct, no filler."""
+Workflow file: {workflow_file}
+Log URL: https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/logs"""
 
     log.info("  [%s] Running Claude Code agent...", job_name)
     analysis = claude_code_analyze(
@@ -512,7 +501,8 @@ def monitor_workflow(
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
                     executor.submit(
-                        _analyze_job_with_agent, job, run_url, agent_repo_path,
+                        _analyze_job_with_agent, job, run_url,
+                        agent_repo_path, workflow_file,
                     ): job
                     for job, run_url in jobs_to_analyze
                 }
