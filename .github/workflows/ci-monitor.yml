@@ -24,7 +24,7 @@ on:
       use_agent:
         description: 'Use Claude Code agent for deeper analysis'
         required: false
-        default: 'false'
+        default: 'true'
         type: boolean
 
 concurrency:
@@ -70,7 +70,7 @@ jobs:
             ARGS="$ARGS --workflows ${WF_ARRAY[*]}"
           fi
 
-          USE_AGENT="${{ github.event.inputs.use_agent || 'false' }}"
+          USE_AGENT="${{ github.event.inputs.use_agent || 'true' }}"
           if [ "$USE_AGENT" = "true" ]; then
             ARGS="$ARGS --use-agent"
           fi

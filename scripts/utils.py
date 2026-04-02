@@ -619,8 +619,7 @@ IMPORTANT:
             model=CLAUDE_MODEL,
             max_tokens=16000,
             thinking={
-                "type": "enabled",
-                "budget_tokens": 8000,
+                "type": "adaptive",
             },
             messages=[{"role": "user", "content": prompt}],
         )
