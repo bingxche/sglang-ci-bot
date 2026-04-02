@@ -61,6 +61,18 @@ if [ "${ENABLE_WATCHER:-}" = "true" ]; then
         --daemon \
         --poll-interval "${POLL_INTERVAL:-15}" \
         --bot-repo "${REPO_PATH}" &
+
+    echo "Starting CI monitor trigger (every 15 minutes)..."
+    (
+        while true; do
+            sleep 900
+            curl -fsSL -X POST \
+                -H "Authorization: token ${GH_PAT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO_PATH}/actions/workflows/ci-monitor.yml/dispatches" \
+                -d '{"ref":"main"}' || true
+        done
+    ) &
 fi
 
 exec ./run.sh
