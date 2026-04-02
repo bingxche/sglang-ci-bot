@@ -69,7 +69,7 @@ STATE_FILE = Path(__file__).parent.parent / ".state" / "ci_monitor.json"
 MAX_PARALLEL_JOBS = 3
 
 _PROCESSED_IDS_RE = re.compile(r"<!-- processed_job_ids: ([\d,]+) -->")
-_GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-", re.IGNORECASE)
+_GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-|check-all", re.IGNORECASE)
 
 
 def _is_gate_job(job: dict) -> bool:
