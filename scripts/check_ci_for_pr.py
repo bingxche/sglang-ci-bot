@@ -101,7 +101,7 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
 # Gate job detection
 # ---------------------------------------------------------------------------
 
-_GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-", re.IGNORECASE)
+_GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-|check-all", re.IGNORECASE)
 
 
 def _is_gate_job(job: dict) -> bool:
