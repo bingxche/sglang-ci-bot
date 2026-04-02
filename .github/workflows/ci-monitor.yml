@@ -48,10 +48,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Reset state
-        if: ${{ github.event.inputs.reset_state == 'true' }}
-        run: rm -rf .state/
-
       - name: Restore state
         uses: actions/cache@v4
         with:
@@ -59,6 +55,10 @@ jobs:
           key: ci-monitor-state-${{ github.run_id }}
           restore-keys: |
             ci-monitor-state-
+
+      - name: Reset state
+        if: ${{ github.event.inputs.reset_state == 'true' }}
+        run: rm -rf .state/
 
       - name: Run CI Monitor
         env:
