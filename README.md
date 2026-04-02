@@ -12,7 +12,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 
 | Feature | Script | Trigger | What it does |
 |---------|--------|---------|--------------|
-| CI Failure Monitor | `monitor_ci.py` | Daemon (60s poll) + Cron (8h fallback) | Monitors CI workflows, analyzes failures with historical comparison and regression detection, posts daily issue reports. Gate/finish jobs are automatically skipped — only actual upstream failures are analyzed. Reports use a results-first layout: summary table at top, then per-job details in collapsible sections. |
+| Cron CI Monitor | `monitor_ci.py` | Runner-1 dispatch (every 15min) | Monitors CI workflows, analyzes failures with historical comparison and regression detection, posts daily issue reports. Gate/finish jobs are automatically skipped — only actual upstream failures are analyzed. Reports use a results-first layout: summary table at top, then per-job details in collapsible sections. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, analyzes failures, determines if failures are PR-related |
 | Comment Watcher | `watch_comments.py` | Daemon (15s poll) + Cron (5min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches workflows |
@@ -326,7 +326,7 @@ sglang-ci-bot/
     watch_comments.py       Comment watcher / command dispatcher
     local_run.sh            Local dev runner
   .github/workflows/
-    ci-monitor.yml          CI monitor (cron every 8h + manual)
+    ci-monitor.yml          Cron CI monitor (runner-1 dispatch every 15min + manual)
     ci-status-check.yml     PR CI check (repository_dispatch)
     pr-review.yml           PR review (repository_dispatch)
     comment-watcher.yml     Comment poller (cron every 5min)
@@ -390,5 +390,5 @@ ACTIVE_POLL_INTERVAL = 60  # 60s — tracking in-progress runs
 
 ### Schedules
 
-- `ci-monitor.yml`: `'0 0,8,16 * * *'` (every 8 hours)
+- `ci-monitor.yml`: triggered by runner-1 every 15 minutes via `workflow_dispatch`
 - `comment-watcher.yml`: `'*/5 * * * *'` (every 5 minutes)

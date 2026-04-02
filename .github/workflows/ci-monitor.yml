@@ -1,4 +1,4 @@
-name: CI Failure Monitor
+name: Cron CI Monitor
 
 on:
   workflow_dispatch:
@@ -24,6 +24,11 @@ on:
         required: false
         default: 'true'
         type: boolean
+      reset_state:
+        description: 'Reset state to force re-analysis of all jobs'
+        required: false
+        default: 'false'
+        type: boolean
 
 concurrency:
   group: ci-monitor
@@ -42,6 +47,10 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Reset state
+        if: ${{ github.event.inputs.reset_state == 'true' }}
+        run: rm -rf .state/
 
       - name: Restore state
         uses: actions/cache@v4

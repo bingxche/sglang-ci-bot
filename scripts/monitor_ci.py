@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-amd-bot CI Failure Monitor for sglang.
+amd-bot Cron CI Monitor for sglang.
 
 Monitors specified CI workflows, fetches full logs from failed jobs,
 analyzes them with Claude, and posts/updates daily summary comments
