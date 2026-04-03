@@ -6,6 +6,7 @@ progressive step-by-step CI log analysis, and Claude Code agent integration.
 """
 
 import getpass
+import json
 import logging
 import os
 import re
@@ -767,6 +768,64 @@ def _deploy_claude_md():
     _agent_log.warning("agent/CLAUDE.md not found, skipping deployment")
 
 
+def _recover_text_from_session_log(work_dir: Path) -> str | None:
+    """Extract the last assistant text from Claude Code session logs.
+
+    When ``claude -p --output-format text`` exits 0 but returns empty
+    stdout (e.g. because the final turn contained a tool call alongside
+    the text), the actual report may still be in the session ``.jsonl``.
+
+    Returns the recovered text, or ``None`` if nothing useful is found.
+    """
+    claude_dir = Path.home() / ".claude" / "projects"
+    if not claude_dir.exists():
+        return None
+
+    escaped_cwd = str(work_dir.resolve()).replace("/", "-")
+    project_dir = claude_dir / escaped_cwd
+    if not project_dir.exists():
+        return None
+
+    jsonl_files = sorted(project_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    if not jsonl_files:
+        return None
+
+    latest = jsonl_files[-1]
+    _agent_log.info("Attempting session log recovery from %s", latest)
+
+    last_text = None
+    try:
+        with open(latest) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") != "assistant":
+                    continue
+                msg = entry.get("message", {})
+                if msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if block.get("type") == "text" and block.get("text", "").strip():
+                        last_text = block["text"].strip()
+    except Exception as exc:
+        _agent_log.warning("Session log recovery failed: %s", exc)
+        return None
+
+    if last_text and len(last_text) > 100:
+        _agent_log.info("Recovered %d chars from session log", len(last_text))
+        return last_text
+
+    return None
+
+
 def claude_code_analyze(
     prompt: str,
     work_dir: Path,
@@ -821,6 +880,15 @@ def claude_code_analyze(
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
+
+        if result.returncode == 0:
+            recovered = _recover_text_from_session_log(work_dir)
+            if recovered:
+                _agent_log.info(
+                    "stdout was empty but recovered %d chars from session log",
+                    len(recovered),
+                )
+                return recovered
 
         stderr_snippet = (result.stderr or "")[:1000]
         stdout_snippet = (result.stdout or "")[:1000]
