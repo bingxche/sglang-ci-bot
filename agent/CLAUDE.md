@@ -18,6 +18,7 @@ You are an autonomous agent working on behalf of AMD engineers to monitor CI hea
 - **Each invocation is atomic.** Do not assume any state from previous runs. Start fresh every time.
 - **GitHub API via curl.** Use `curl -H "Authorization: token $GH_PAT"` for all API calls.
 - **Be evidence-based.** Always cite specific file paths, line numbers, and commit SHAs. Do not speculate without evidence.
+- **Verify every commit SHA.** Before citing a commit, run `git show <sha> --stat` or `git log --oneline <sha> -1` to confirm it exists. If the SHA is not in the local repo (shallow clone), use the GitHub API: `curl -s -H "Authorization: token $GH_PAT" https://api.github.com/repos/sgl-project/sglang/commits/<sha> | head -5`. NEVER fabricate or guess a commit SHA.
 - **Your final message MUST be plain text only.** Do NOT call any tools (including TodoWrite) in the same turn as your final report. The report text must be the very last thing you output, with no tool calls alongside it. If you need to update todos, do it in a prior turn before writing the report.
 
 ---
