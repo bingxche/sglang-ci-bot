@@ -59,8 +59,14 @@ MONITORED_WORKFLOWS = [
     "release-docker-amd-nightly.yml",
     "release-docker-amd-rocm720-nightly.yml",
     "amd-aiter-scout.yml",
+    "pr-test-amd.yml",
     "pr-test-amd-rocm720.yml",
 ]
+
+SCHEDULE_ONLY_WORKFLOWS = {
+    "pr-test-amd.yml",
+    "pr-test-amd-rocm720.yml",
+}
 
 SUCCESS_CONCLUSIONS = {"success"}
 SKIP_JOB_CONCLUSIONS = {"success", "skipped"}
@@ -133,6 +139,7 @@ def get_workflow_runs(
     hours_back: int = 24,
     max_runs: int = 5,
     branch: str = "main",
+    event: str | None = None,
 ) -> list[dict]:
     """Fetch recent non-success completed runs AND in-progress runs.
 
@@ -147,6 +154,8 @@ def get_workflow_runs(
         "per_page": min(max_runs * 5, 100),
         "created": f">={since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
     }
+    if event:
+        base_params["event"] = event
 
     all_runs: list[dict] = []
     seen_ids: set[int] = set()
@@ -325,7 +334,7 @@ def find_or_create_daily_issue(
 # Single-job analysis (thread-safe)
 # ---------------------------------------------------------------------------
 
-def _analyze_job(client, token: str, job: dict, run_url: str) -> dict:
+def _analyze_job(client, token: str, job: dict, run_url: str, head_sha: str = "") -> dict:
     """Download logs, extract errors, and run focused analysis for one job."""
     job_name = job["name"]
     job_id = job["id"]
@@ -364,6 +373,7 @@ def _analyze_job(client, token: str, job: dict, run_url: str) -> dict:
         "run_url": run_url,
         "job_name": job_name,
         "job_id": job_id,
+        "head_sha": head_sha,
         "started_at": job.get("started_at"),
         "failed_steps": sorted(failed_step_names),
         "analysis": analysis,
@@ -372,6 +382,7 @@ def _analyze_job(client, token: str, job: dict, run_url: str) -> dict:
 
 def _analyze_job_with_agent(
     job: dict, run_url: str, repo_path: Path, workflow_file: str = "",
+    head_sha: str = "",
 ) -> dict:
     """Invoke Claude Code agent to fully analyze a CI failure.
 
@@ -395,6 +406,7 @@ def _analyze_job_with_agent(
 Job: {job_name}
 Run: {run_url}
 Job ID: {job_id}
+Commit SHA: {head_sha}
 Workflow file: {workflow_file}
 Log URL: https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/logs"""
 
@@ -409,6 +421,7 @@ Log URL: https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/l
         "run_url": run_url,
         "job_name": job_name,
         "job_id": job_id,
+        "head_sha": head_sha,
         "started_at": job.get("started_at"),
         "failed_steps": sorted(failed_step_names),
         "analysis": analysis,
@@ -458,12 +471,26 @@ def render_workflow_comment(
 </details>
 """
 
+    unique_shas = dict.fromkeys(
+        ja.get("head_sha", "") for ja in job_analyses
+    )
+    commit_parts = []
+    for sha in unique_shas:
+        if sha:
+            short = sha[:7]
+            commit_parts.append(
+                f"[`{short}`](https://github.com/{REPO}/commit/{sha})"
+            )
+    commits_line = (
+        f"**Commits**: sglang {', '.join(commit_parts)}\n\n"
+        if commit_parts else ""
+    )
+
     body = f"""{metadata}
 ## `{workflow_file}` — {len(job_analyses)} failure(s)
 
 **Scanned**: {now}
-
-"""
+{commits_line}"""
 
     if cross_summary:
         cleaned = re.sub(r"^#{1,3}\s+.*(?:Summary|Overview).*$", "", cross_summary, flags=re.MULTILINE).strip()
@@ -507,14 +534,15 @@ def monitor_workflow(
     branch: str = "main",
     use_agent: bool = False,
     agent_repo_path: Path | None = None,
+    event: str | None = None,
 ) -> tuple[list[dict], list[int], list[dict]]:
     """Monitor a single workflow.
 
     Returns (new_job_analyses, new_job_ids, pending_info).
     """
-    log.info("Monitoring: %s (branch: %s)", workflow_file, branch)
+    log.info("Monitoring: %s (branch: %s, event: %s)", workflow_file, branch, event or "all")
 
-    runs = get_workflow_runs(token, workflow_file, hours_back=hours_back, branch=branch)
+    runs = get_workflow_runs(token, workflow_file, hours_back=hours_back, branch=branch, event=event)
     if not runs:
         log.info("  No actionable runs in the last %d hours.", hours_back)
         return [], [], []
@@ -526,12 +554,13 @@ def monitor_workflow(
         len(completed_runs), len(in_progress_runs),
     )
 
-    jobs_to_analyze: list[tuple[dict, str]] = []
+    jobs_to_analyze: list[tuple[dict, str, str]] = []
     pending_info: list[dict] = []
 
     for run in runs:
         run_id = run["id"]
         run_url = run["html_url"]
+        head_sha = run.get("head_sha", "")
         run_status = run.get("status", "unknown")
         run_conclusion = run.get("conclusion") or "in_progress"
         log.info("  Run %d [%s/%s]: %s", run_id, run_status, run_conclusion, run_url)
@@ -550,7 +579,7 @@ def monitor_workflow(
         if failed_jobs:
             log.info("    %d new failed job(s) to analyze", len(failed_jobs))
             for job in failed_jobs:
-                jobs_to_analyze.append((job, run_url))
+                jobs_to_analyze.append((job, run_url, head_sha))
 
         if run_status != "completed":
             pi = get_pending_job_info(token, run_id)
@@ -575,8 +604,9 @@ def monitor_workflow(
                     executor.submit(
                         _analyze_job_with_agent, job, run_url,
                         agent_repo_path, workflow_file,
+                        head_sha=sha,
                     ): job
-                    for job, run_url in jobs_to_analyze
+                    for job, run_url, sha in jobs_to_analyze
                 }
                 for future in as_completed(futures):
                     job = futures[future]
@@ -592,8 +622,8 @@ def monitor_workflow(
             client = create_anthropic_client()
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(_analyze_job, client, token, job, run_url): job
-                    for job, run_url in jobs_to_analyze
+                    executor.submit(_analyze_job, client, token, job, run_url, head_sha=sha): job
+                    for job, run_url, sha in jobs_to_analyze
                 }
                 for future in as_completed(futures):
                     job = futures[future]
@@ -749,6 +779,7 @@ def run_oneshot(
             gh_ids = extract_processed_ids_from_comments(gh_comments, wf) if gh_comments else set()
             processed_job_ids = local_ids | gh_ids
 
+            wf_event = "schedule" if wf in SCHEDULE_ONLY_WORKFLOWS else None
             new_analyses, new_ids, pending = monitor_workflow(
                 token, wf,
                 hours_back=hours_back,
@@ -757,6 +788,7 @@ def run_oneshot(
                 branch=branch,
                 use_agent=use_agent,
                 agent_repo_path=agent_repo_path,
+                event=wf_event,
             )
 
             if not new_analyses:

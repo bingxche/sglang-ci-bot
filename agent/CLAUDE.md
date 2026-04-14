@@ -37,9 +37,25 @@ Include all evidence with hyperlinks.
 - Job page: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}`
 - Specific log line: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}#step:{step_number}:{line_number}`
 
+### Commit info extraction (REQUIRED)
+
+Every analysis **must** begin with a `### Commit Info` section. The prompt will supply a `Commit SHA` — use it as the sglang commit.
+
+For the **aiter commit**, download the job log and search for `[CI-AITER-CHECK]` markers emitted by `amd_ci_install_dependency.sh`. Determine the actual aiter version that ran using this priority:
+
+1. `AITER_COMMIT_OVERRIDE=<value>` — if present, this override was used.
+2. `Dev/patched version detected: <version>` — image had a dev build; it was preserved.
+3. `Dockerfile expects AITER_COMMIT=<value>` — the default. Used when the log says `AITER version matches` or `Version mismatch` (rebuilt from Dockerfile value).
+
+If no `[CI-AITER-CHECK]` markers exist in the log (e.g. docker-build workflows), report aiter as `N/A`.
+
 ### Output format
 
 ```
+### Commit Info
+- **sglang**: `<head_sha>`
+- **aiter**: `<actual_aiter_commit>` (source: Dockerfile default / override / dev image)
+
 ### Failure Summary
 (What failed and why, 2-3 sentences. Include link to the error in the log.)
 
