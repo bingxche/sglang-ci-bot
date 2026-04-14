@@ -18,10 +18,12 @@ from utils import (
     REPO,
     claude_code_analyze,
     claude_code_available,
+    create_agent_worktree,
     create_anthropic_client,
     ensure_sglang_repo,
     gh_headers,
     post_comment,
+    remove_agent_worktree,
 )
 
 MAX_DIFF_CHARS = 120000
@@ -194,12 +196,24 @@ def review_pr(
             print("  WARNING: --use-agent but Claude Code not found, falling back to API")
             use_agent = False
         else:
+            wt_path = None
             try:
                 pr_ref = f"pull/{pr_number}/head"
-                repo_path = ensure_sglang_repo(ref=pr_ref)
-                print(f"Reviewing PR #{pr_number} (agent mode)...")
+                ensure_sglang_repo()
+                wt_path = create_agent_worktree(f"review-pr{pr_number}")
+                # Fetch and checkout PR branch in the isolated worktree
+                import subprocess
+                subprocess.run(
+                    ["git", "fetch", "origin", pr_ref, "--depth", "100"],
+                    cwd=wt_path, capture_output=True, timeout=120,
+                )
+                subprocess.run(
+                    ["git", "checkout", "FETCH_HEAD", "--force"],
+                    cwd=wt_path, capture_output=True, timeout=30,
+                )
+                print(f"Reviewing PR #{pr_number} (agent mode, worktree)...")
                 review = review_pr_with_agent(
-                    pr_number, repo_path, focus_areas, review_context,
+                    pr_number, wt_path, focus_areas, review_context,
                 )
                 now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
                 body = f"""{requester_line}## Claude Code Review
@@ -220,6 +234,9 @@ def review_pr(
             except Exception as exc:
                 print(f"  WARNING: Agent failed ({exc}), falling back to API")
                 use_agent = False
+            finally:
+                if wt_path:
+                    remove_agent_worktree(wt_path)
 
     # --- Non-agent (API) path ---
     print(f"Reviewing PR #{pr_number}...")
