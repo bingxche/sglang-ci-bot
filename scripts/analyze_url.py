@@ -29,6 +29,7 @@ from utils import (
     REPO,
     claude_code_analyze,
     claude_code_available,
+    create_agent_worktree,
     create_anthropic_client,
     create_github_issue,
     cross_job_analysis,
@@ -39,6 +40,7 @@ from utils import (
     gh_headers,
     post_comment,
     prefilter_large_step_log,
+    remove_agent_worktree,
     update_comment,
 )
 
@@ -340,28 +342,40 @@ def run_analysis(
     log.info("Analyzing %d job(s) (%s mode, workers: %d)...", len(jobs), mode, max_workers)
 
     if use_agent and agent_repo_path:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    analyze_job_with_agent, job, run_url,
-                    agent_repo_path, workflow_name, head_sha=head_sha,
-                ): job
-                for job in jobs
-            }
-            for future in as_completed(futures):
-                job = futures[future]
+        worktrees: dict[int, Path] = {}
+        try:
+            for job in jobs:
+                wt = create_agent_worktree(job["id"])
+                worktrees[job["id"]] = wt
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        analyze_job_with_agent, job, run_url,
+                        worktrees[job["id"]], workflow_name, head_sha=head_sha,
+                    ): job
+                    for job in jobs
+                }
+                for future in as_completed(futures):
+                    job = futures[future]
+                    try:
+                        result = future.result()
+                        job_analyses.append(result)
+                        if issue_number and bot_repo:
+                            comment_body = (
+                                f"### `{result['job_name']}`\n\n{result['analysis']}"
+                            )
+                            post_comment(token, bot_repo, issue_number, comment_body)
+                            log.info("  Posted analysis for %s", result["job_name"])
+                    except Exception as e:
+                        log.error("  Error analyzing %s: %s", job["name"], e)
+                        traceback.print_exc()
+        finally:
+            for wt in worktrees.values():
                 try:
-                    result = future.result()
-                    job_analyses.append(result)
-                    if issue_number and bot_repo:
-                        comment_body = (
-                            f"### `{result['job_name']}`\n\n{result['analysis']}"
-                        )
-                        post_comment(token, bot_repo, issue_number, comment_body)
-                        log.info("  Posted analysis for %s", result["job_name"])
-                except Exception as e:
-                    log.error("  Error analyzing %s: %s", job["name"], e)
-                    traceback.print_exc()
+                    remove_agent_worktree(wt)
+                except Exception:
+                    log.warning("Failed to clean up worktree %s", wt)
     else:
         client = create_anthropic_client()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:

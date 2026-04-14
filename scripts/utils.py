@@ -695,6 +695,63 @@ def claude_code_available() -> bool:
         return False
 
 
+def create_agent_worktree(tag: str) -> Path:
+    """Create an isolated git worktree for a parallel agent.
+
+    Requires the main repo at ``SGLANG_REPO_PATH`` to exist (call
+    ``ensure_sglang_repo()`` first).  Each worktree lives at
+    ``/workspace/sglang-wt-{tag}`` and is a cheap copy that shares
+    the git object store with the main repo.
+
+    Returns the worktree path.  Call ``remove_agent_worktree()`` to
+    clean up when done.
+    """
+    safe_tag = re.sub(r"[^\w\-]", "_", str(tag))
+    wt_path = AGENT_WORKSPACE / f"sglang-wt-{safe_tag}"
+    branch_name = f"wt-{safe_tag}"
+
+    if wt_path.exists():
+        _agent_log.info("Removing stale worktree %s", wt_path)
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(wt_path)],
+            cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
+        )
+        if wt_path.exists():
+            shutil.rmtree(wt_path)
+
+    subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=10,
+    )
+
+    _agent_log.info("Creating worktree %s", wt_path)
+    result = subprocess.run(
+        ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
+        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git worktree add failed: {result.stderr.decode(errors='replace')}"
+        )
+
+    _deploy_claude_md(wt_path)
+    _agent_log.info("Worktree ready at %s", wt_path)
+    return wt_path
+
+
+def remove_agent_worktree(wt_path: Path):
+    """Remove a worktree created by ``create_agent_worktree()``."""
+    if not wt_path.exists():
+        return
+    _agent_log.info("Removing worktree %s", wt_path)
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(wt_path)],
+        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
+    )
+    if wt_path.exists():
+        shutil.rmtree(wt_path, ignore_errors=True)
+
+
 def ensure_sglang_repo(ref: str = "main") -> Path:
     """Clone or update the sglang repo for agent-based analysis.
 
@@ -748,8 +805,8 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
     return SGLANG_REPO_PATH
 
 
-def _deploy_claude_md():
-    """Copy agent/CLAUDE.md from the bot repo to /workspace/CLAUDE.md.
+def _deploy_claude_md(target_dir: Path | None = None):
+    """Copy agent/CLAUDE.md to the workspace (or a specific directory).
 
     Checks multiple possible locations for the bot repo source tree
     (GitHub Actions checkout, daemon clone at /tmp/bot, relative to
@@ -759,9 +816,10 @@ def _deploy_claude_md():
         Path(__file__).resolve().parent.parent / "agent" / "CLAUDE.md",
         Path("/tmp/bot/agent/CLAUDE.md"),
     ]
+    dest_parent = target_dir.parent if target_dir else AGENT_WORKSPACE
     for src in candidates:
         if src.exists():
-            dst = AGENT_WORKSPACE / "CLAUDE.md"
+            dst = dest_parent / "CLAUDE.md"
             shutil.copy2(src, dst)
             _agent_log.info("Deployed CLAUDE.md to %s", dst)
             return

@@ -38,6 +38,7 @@ from utils import (
     REPO,
     claude_code_analyze,
     claude_code_available,
+    create_agent_worktree,
     create_anthropic_client,
     create_github_issue,
     cross_job_analysis,
@@ -48,6 +49,7 @@ from utils import (
     gh_headers,
     post_comment,
     prefilter_large_step_log,
+    remove_agent_worktree,
     update_comment,
 )
 
@@ -599,25 +601,37 @@ def monitor_workflow(
                  len(jobs_to_analyze), mode, max_workers)
 
         if use_agent and agent_repo_path:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        _analyze_job_with_agent, job, run_url,
-                        agent_repo_path, workflow_file,
-                        head_sha=sha,
-                    ): job
-                    for job, run_url, sha in jobs_to_analyze
-                }
-                for future in as_completed(futures):
-                    job = futures[future]
+            worktrees: dict[int, Path] = {}
+            try:
+                for job, _, _ in jobs_to_analyze:
+                    wt = create_agent_worktree(job["id"])
+                    worktrees[job["id"]] = wt
+
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(
+                            _analyze_job_with_agent, job, run_url,
+                            worktrees[job["id"]], workflow_file,
+                            head_sha=sha,
+                        ): job
+                        for job, run_url, sha in jobs_to_analyze
+                    }
+                    for future in as_completed(futures):
+                        job = futures[future]
+                        try:
+                            result = future.result()
+                            new_job_analyses.append(result)
+                            new_job_ids.append(result["job_id"])
+                        except Exception as e:
+                            log.error("  Error analyzing %s: %s", job["name"], e)
+                            traceback.print_exc()
+                            new_job_ids.append(job["id"])
+            finally:
+                for wt in worktrees.values():
                     try:
-                        result = future.result()
-                        new_job_analyses.append(result)
-                        new_job_ids.append(result["job_id"])
-                    except Exception as e:
-                        log.error("  Error analyzing %s: %s", job["name"], e)
-                        traceback.print_exc()
-                        new_job_ids.append(job["id"])
+                        remove_agent_worktree(wt)
+                    except Exception:
+                        log.warning("Failed to clean up worktree %s", wt)
         else:
             client = create_anthropic_client()
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
