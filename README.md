@@ -13,6 +13,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 | Feature | Script | Trigger | What it does |
 |---------|--------|---------|--------------|
 | Cron CI Monitor | `monitor_ci.py` | Runner-1 dispatch (every 15min) | Monitors CI workflows, analyzes failures with historical comparison and regression detection, posts daily issue reports. Gate/finish jobs are automatically skipped — only actual upstream failures are analyzed. Reports use a results-first layout: summary table at top, then per-job details in collapsible sections. |
+| On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, analyzes failures, determines if failures are PR-related |
 | Comment Watcher | `watch_comments.py` | Daemon (15s poll) + Cron (5min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches workflows |
@@ -42,16 +43,19 @@ AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "
 
 When a task is triggered (CI failure analysis, PR review, or CI status check), the Python script:
 
-1. Clones/updates the sglang repo to `/workspace/sglang`
-2. Copies `agent/CLAUDE.md` to `/workspace/CLAUDE.md`
-3. Runs `claude -p "<task prompt>" --dangerously-skip-permissions` with `cwd=/workspace/sglang`
+1. Clones/updates the sglang repo to `/workspace/sglang` (shared git object store)
+2. Creates an **isolated git worktree** per agent (e.g. `/workspace/sglang-wt-{job_id}`)
+3. Copies `agent/CLAUDE.md` to `/workspace/CLAUDE.md`
+4. Runs `claude -p "<task prompt>" --dangerously-skip-permissions` with `cwd=<worktree>`
+
+Each agent gets its own worktree so parallel agents (e.g. analyzing multiple failed jobs simultaneously) and concurrent tasks (e.g. a PR review running alongside the cron CI monitor) cannot interfere with each other's git state. Worktrees are cleaned up automatically after analysis completes.
 
 Claude Code automatically reads `/workspace/CLAUDE.md` and follows the investigation methodology defined there:
 
 - **CI failures**: Download logs, compare with recent runs (5-7 days), detect regressions, find suspicious commits via `git log`/`git show`/`git blame`, check for accuracy/performance threshold changes
 - **PR reviews**: Fetch diff via GitHub API, read full source files in workspace, find callers of modified functions, verify AMD/ROCm parity, check test coverage
 
-The agent operates in a **read-only** workspace and treats each invocation as atomic.
+The agent treats each invocation as atomic.
 
 ### Fallback to API mode
 
@@ -185,7 +189,7 @@ Containers are fully isolated from the host. The only host files mounted are:
 - `runner/entrypoint.sh` — read-only bind mount
 - `sglang-runner-toolcache-{i}` — Docker named volume for GitHub Actions tool cache
 
-The bot code is cloned by `entrypoint.sh` to `/tmp/bot`. The sglang repo (`/workspace/sglang`) is cloned on-demand by `ensure_sglang_repo()` in `utils.py` when agent mode is invoked. All analysis happens entirely inside the container. The agent cannot modify host files.
+The bot code is cloned by `entrypoint.sh` to `/tmp/bot`. The sglang repo (`/workspace/sglang`) is cloned on-demand by `ensure_sglang_repo()` in `utils.py` when agent mode is invoked. Each agent runs in an isolated git worktree (`/workspace/sglang-wt-{tag}`) created by `create_agent_worktree()`, ensuring concurrent agents cannot interfere with each other. All analysis happens entirely inside the container.
 
 ---
 
@@ -199,8 +203,11 @@ nightly-test-amd-rocm720.yml
 release-docker-amd-nightly.yml
 release-docker-amd-rocm720-nightly.yml
 amd-aiter-scout.yml
-pr-test-amd-rocm720.yml
+pr-test-amd.yml              (schedule-only: every 6h)
+pr-test-amd-rocm720.yml      (schedule-only: daily)
 ```
+
+Workflows in `SCHEDULE_ONLY_WORKFLOWS` are filtered to only analyze `schedule`-triggered runs (not PR-triggered runs). Each workflow report includes the sglang commit (`head_sha`) in the header, and the agent extracts the aiter commit from `[CI-AITER-CHECK]` log markers.
 
 ---
 
@@ -212,6 +219,7 @@ pr-test-amd-rocm720.yml
 | `ci-status-check.yml` | Per comment ID | Duplicate dispatches cancelled |
 | `comment-watcher.yml` | Single instance | One watcher at a time |
 | `ci-monitor.yml` | Single instance | One monitor at a time |
+| `analyze-ci.yml` | Per run ID | Independent analyses run concurrently |
 
 The comment watcher uses **reaction-based idempotency**: before dispatching, it checks if amd-bot has already added a `rocket` reaction to the comment. Both daemon and cron watcher share this mechanism, so running both simultaneously is safe.
 
@@ -312,6 +320,29 @@ python scripts/check_ci_for_pr.py 1234 --no-post --use-agent
 | `--no-post` | false | Print to stdout |
 | `--use-agent` | false | Use Claude Code agent (also reads `USE_AGENT` env var) |
 
+### On-Demand Analysis
+
+Analyze any GitHub Actions run or job URL. When `--bot-repo` is provided, creates a new issue with results; otherwise prints to stdout.
+
+```bash
+# Analyze a run (all failed jobs)
+python scripts/analyze_url.py --url https://github.com/sgl-project/sglang/actions/runs/24384910439 --use-agent
+
+# Analyze a single job
+python scripts/analyze_url.py --url https://github.com/sgl-project/sglang/actions/runs/24384910439/job/71216400611 --use-agent
+
+# Create issue with results
+python scripts/analyze_url.py --url <url> --bot-repo bingxche/sglang-ci-bot --use-agent
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--url` | required | GitHub Actions run or job URL |
+| `--bot-repo` | none | Bot repo to create issue in (omit for stdout) |
+| `--use-agent` | false | Use Claude Code agent (also reads `USE_AGENT` env var) |
+
+Or via the Actions tab: go to **Analyze CI** workflow, paste the URL, and click Run. The bot creates an issue like `[Analyze] pr-test-amd.yml run #12345 (8fe9bbf)` with results posted as comments.
+
 ---
 
 ## Project structure
@@ -321,8 +352,9 @@ sglang-ci-bot/
   agent/
     CLAUDE.md               Agent instructions: ground rules, CI investigation methodology, PR review methodology
   scripts/
-    utils.py                Shared: GitHub API, Anthropic client, log parsing, Claude Code agent wrapper
+    utils.py                Shared: GitHub API, Anthropic client, log parsing, Claude Code agent wrapper, worktree management
     monitor_ci.py           CI failure monitor (one-shot)
+    analyze_url.py          On-demand analysis of a run/job URL
     check_ci_for_pr.py      PR CI status checker
     review_pr.py            PR code review
     watch_comments.py       Comment watcher / command dispatcher
@@ -330,6 +362,7 @@ sglang-ci-bot/
     verify_agent.sh         Claude Code agent verification
   .github/workflows/
     ci-monitor.yml          CI monitor (workflow_dispatch from runner-1 + manual)
+    analyze-ci.yml          On-demand URL analysis (workflow_dispatch)
     ci-status-check.yml     PR CI check (repository_dispatch + workflow_dispatch)
     pr-review.yml           PR review (repository_dispatch + workflow_dispatch)
     comment-watcher.yml     Comment poller (cron every 5min)
