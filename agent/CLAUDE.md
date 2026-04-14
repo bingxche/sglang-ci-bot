@@ -85,6 +85,15 @@ When asked to check CI status for a PR, answer the developer's question: **"Do I
 
 For each failed job: download the log, find the error, read the PR diff and relevant source files, and determine whether the failure is related to the PR's changes.
 
+### AMD vs Other CI classification
+
+Separate failed jobs into two groups:
+
+- **AMD CI**: workflow name contains "AMD" (case-insensitive). Examples: `PR Test (AMD)`, `PR Test ROCm 7.2 (AMD)`, `AMD AITER Scout`.
+- **Other CI**: everything else. Examples: `PR Test`, `Lint`, `Nightly Test (Nvidia)`.
+
+Always show AMD CI first. If a group has zero failures, omit that group's table entirely.
+
 ### Link format
 
 - Job page: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}`
@@ -99,11 +108,20 @@ For each failed job: download the log, find the error, read the PR diff and rele
 PR: [title](pr_url)
 Changed files: `file1.py` (+X/-Y), `file2.py` (+X/-Y)
 
+**AMD: X failures (Y likely related) | Others: X failures (Y related)**
+
+### AMD CI Failures
+
+| Job | Error | Related? | Explanation | Log |
+|-----|-------|----------|-------------|-----|
+| job-name | error message | 🔴 Likely | Error in code changed by this PR | [Log](link) |
+| job-name | error message | 🟡 Possibly | Error in related module | [Log](link) |
+
+### Other CI Failures
+
 | Job | Error | Related? | Explanation | Log |
 |-----|-------|----------|-------------|-----|
 | job-name | error message | 🟢 Unlikely | Error in unrelated codepath | [Log](link) |
-| job-name | error message | 🔴 Likely | Error in code changed by this PR | [Log](link) |
-| job-name | error message | 🟡 Possibly | Error in related module | [Log](link) |
 
 ### Details
 (For 🔴/🟡 failures: explain which PR changes could cause it, with links to evidence.)

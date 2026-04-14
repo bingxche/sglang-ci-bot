@@ -120,7 +120,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 
 ### Deploy self-hosted runners
 
-`runner/setup.sh` spawns 10 runner containers. Runner-1 runs two background daemons (comment watcher + CI monitor). Runners 2-10 are plain job executors.
+`runner/setup.sh` spawns 10 runner containers. Runner-1 runs a comment watcher daemon + a CI monitor dispatch loop (dispatches `ci-monitor.yml` every 15 minutes via `workflow_dispatch`). Runners 2-10 are plain job executors.
 
 ```bash
 bash runner/setup.sh \
@@ -150,11 +150,14 @@ bash runner/setup.sh \
 |--------|-------------|
 | `--pat` | bingxche's PAT (runner registration, requires repo admin) |
 | `--bot-pat` | amd-bot's PAT (daemon comment watcher + CI monitor) |
-| `--llm-gateway-key` | AMD LLM Gateway key (enables CI monitor daemon + API mode fallback) |
+| `--llm-gateway-key` | AMD LLM Gateway key (enables CI monitor dispatch + API mode fallback) |
+| `--llm-gateway-url` | AMD LLM Gateway endpoint URL |
 | `--claude-env` | Path to env file with all Claude Code variables (e.g. `.secrets/claude.env`) |
+| `--claude-config` | Path to Claude Code config directory |
 | `--use-agent` | Enable Claude Code agent mode |
 | `--image` | Pull image from registry instead of building |
 | `--build` | Force local build from Dockerfile |
+| `--repo` | GitHub repo (default: `bingxche/sglang-ci-bot`) |
 | `--count` | Number of runner containers (default: 10) |
 | `--name` | Runner name prefix (default: `amd-ci-bot-runner`) |
 
@@ -182,7 +185,7 @@ Containers are fully isolated from the host. The only host files mounted are:
 - `runner/entrypoint.sh` — read-only bind mount
 - `sglang-runner-toolcache-{i}` — Docker named volume for GitHub Actions tool cache
 
-The sglang repo (`/workspace/sglang`), bot code (`/tmp/bot`), and all analysis happen entirely inside the container. The agent cannot modify host files.
+The bot code is cloned by `entrypoint.sh` to `/tmp/bot`. The sglang repo (`/workspace/sglang`) is cloned on-demand by `ensure_sglang_repo()` in `utils.py` when agent mode is invoked. All analysis happens entirely inside the container. The agent cannot modify host files.
 
 ---
 
@@ -212,7 +215,7 @@ pr-test-amd-rocm720.yml
 
 The comment watcher uses **reaction-based idempotency**: before dispatching, it checks if amd-bot has already added a `rocket` reaction to the comment. Both daemon and cron watcher share this mechanism, so running both simultaneously is safe.
 
-The CI monitor uses **comment metadata deduplication**: each workflow comment embeds `<!-- processed_job_ids: 111,222,333 -->`. Both daemon and cron read these IDs before analyzing, preventing duplicate analysis.
+The CI monitor uses **comment metadata deduplication**: each workflow comment embeds `<!-- processed_job_ids: 111,222,333 -->`. Each run reads these IDs before analyzing, preventing duplicate analysis.
 
 Gate/finish jobs (e.g. `pr-test-amd-finish`, `wait-for-stage-b`) are automatically detected and skipped by the CI monitor. Only actual upstream failed jobs are analyzed, preventing redundant monolithic analyses under gate job names.
 
@@ -261,8 +264,8 @@ for i in $(seq 1 10); do docker rm -f amd-ci-bot-runner-$i; done
 # Agent mode (stdout)
 python scripts/monitor_ci.py --output stdout --hours-back 24 --use-agent
 
-# Agent mode (daemon, posts to daily issue)
-python scripts/monitor_ci.py --daemon --bot-repo bingxche/sglang-ci-bot --use-agent
+# Agent mode (post to daily issue)
+python scripts/monitor_ci.py --output daily-issue --bot-repo bingxche/sglang-ci-bot --use-agent
 
 # API mode fallback
 python scripts/monitor_ci.py --output stdout --hours-back 24
@@ -275,10 +278,9 @@ python scripts/monitor_ci.py --output stdout --hours-back 24
 | `--workflows` | all monitored | Space-separated workflow files |
 | `--job-name` | none | Filter: only jobs whose name contains this string |
 | `--branch` | `main` | Only analyze runs on this branch |
-| `--daemon` | false | Run as long-lived daemon |
-| `--poll-interval` | `60` | Active poll interval in daemon mode (seconds) |
 | `--use-agent` | false | Use Claude Code agent (also reads `USE_AGENT` env var) |
-| `--bot-repo` | none | Bot repo for posting issues (required for `daily-issue` and `--daemon`) |
+| `--bot-repo` | none | Bot repo for posting issues (required for `daily-issue`) |
+| `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token for API access |
 
 ### PR Review
 
@@ -296,7 +298,7 @@ python scripts/review_pr.py 1234 --no-post
 | `--focus` | none | Specific areas to focus on |
 | `--context` | none | Additional context |
 | `--no-post` | false | Print to stdout instead of posting |
-| `--use-agent` | false | Use Claude Code agent |
+| `--use-agent` | false | Use Claude Code agent (also reads `USE_AGENT` env var) |
 
 ### CI Status Check
 
@@ -308,7 +310,7 @@ python scripts/check_ci_for_pr.py 1234 --no-post --use-agent
 |--------|---------|-------------|
 | `pr_number` | required | PR number |
 | `--no-post` | false | Print to stdout |
-| `--use-agent` | false | Use Claude Code agent |
+| `--use-agent` | false | Use Claude Code agent (also reads `USE_AGENT` env var) |
 
 ---
 
@@ -320,20 +322,21 @@ sglang-ci-bot/
     CLAUDE.md               Agent instructions: ground rules, CI investigation methodology, PR review methodology
   scripts/
     utils.py                Shared: GitHub API, Anthropic client, log parsing, Claude Code agent wrapper
-    monitor_ci.py           CI failure monitor (daemon + one-shot)
+    monitor_ci.py           CI failure monitor (one-shot)
     check_ci_for_pr.py      PR CI status checker
     review_pr.py            PR code review
     watch_comments.py       Comment watcher / command dispatcher
     local_run.sh            Local dev runner
+    verify_agent.sh         Claude Code agent verification
   .github/workflows/
-    ci-monitor.yml          Cron CI monitor (runner-1 dispatch every 15min + manual)
-    ci-status-check.yml     PR CI check (repository_dispatch)
-    pr-review.yml           PR review (repository_dispatch)
+    ci-monitor.yml          CI monitor (workflow_dispatch from runner-1 + manual)
+    ci-status-check.yml     PR CI check (repository_dispatch + workflow_dispatch)
+    pr-review.yml           PR review (repository_dispatch + workflow_dispatch)
     comment-watcher.yml     Comment poller (cron every 5min)
   runner/
     Dockerfile              Runner image: Python 3.12, Node.js 22, Claude Code CLI, GitHub Actions runner
     setup.sh                Multi-runner deployment
-    entrypoint.sh           Container entrypoint (register + daemons + sglang repo clone)
+    entrypoint.sh           Container entrypoint (register + daemons + bot repo clone)
   .state/                   Persisted state files (gitignored)
   .secrets/                 Local secret files (gitignored): claude.env, llm_gateway_key, gh_pat
   requirements.txt          Python dependencies: anthropic, httpx, requests
@@ -382,11 +385,9 @@ Edit `BOT_LOGIN` in `scripts/watch_comments.py`.
 
 ### Polling intervals
 
-In `scripts/monitor_ci.py`:
-```python
-IDLE_POLL_INTERVAL = 300   # 5 min — no active runs
-ACTIVE_POLL_INTERVAL = 60  # 60s — tracking in-progress runs
-```
+Comment watcher daemon: `--poll-interval` in `scripts/watch_comments.py` (default: 30s, deployed as 15s via `setup.sh`).
+
+CI monitor dispatch: `entrypoint.sh` dispatches `ci-monitor.yml` via `workflow_dispatch` every 15 minutes (`sleep 900` loop).
 
 ### Schedules
 

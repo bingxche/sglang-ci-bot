@@ -3,8 +3,8 @@
 amd-bot CI status checker for a specific PR.
 
 Extracts error messages structurally, uses a single LLM call to assess
-PR correlation, and outputs ONE merged table for developers to scan
-in 5 seconds.
+PR correlation, and outputs separate AMD / Other CI tables for developers
+to scan in 5 seconds.
 """
 
 import argparse
@@ -102,6 +102,11 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-|check-all", re.IGNORECASE)
+
+
+def _is_amd_workflow(name: str) -> bool:
+    """Return True if the workflow name indicates an AMD CI workflow."""
+    return "amd" in name.lower()
 
 
 def _is_gate_job(job: dict) -> bool:
@@ -291,7 +296,7 @@ Rules for the "verdict" field — use EXACTLY one of these strings:
 
 
 # ---------------------------------------------------------------------------
-# Comment formatting — ONE merged table
+# Comment formatting — AMD and Other tables
 # ---------------------------------------------------------------------------
 
 _VERDICT_DISPLAY = {
@@ -304,30 +309,15 @@ _VERDICT_DISPLAY = {
 _VERDICT_SORT_ORDER = {"likely": 0, "possibly": 1, "unlikely": 2}
 
 
-def _format_merged_table(
-    analyses: list[dict],
-    correlation: list[dict],
+def _render_table(
+    jobs: list[dict],
+    corr_by_job: dict[str, dict],
 ) -> str:
-    """Build ONE table merging error messages + PR correlation verdicts.
-
-    Rows are sorted: likely-related first, then possibly, then unlikely.
-    """
-    corr_by_job: dict[str, dict] = {}
-    for c in correlation:
-        corr_by_job[c.get("job", "")] = c
-
-    real = [ja for ja in analyses if not ja.get("is_gate")]
-    real.sort(key=lambda ja: (
-        _VERDICT_SORT_ORDER.get(
-            corr_by_job.get(ja["job_name"], {}).get("verdict", ""), 3
-        ),
-        ja.get("workflow_name", ""),
-    ))
-
+    """Render a single markdown table for a list of job analyses."""
     rows = "| Workflow | Job | Error | Related? | Log |\n"
     rows += "|----------|-----|-------|----------|-----|\n"
 
-    for ja in real:
+    for ja in jobs:
         best = _pick_best_error(ja)
         if best:
             preview = best["preview"]
@@ -357,6 +347,47 @@ def _format_merged_table(
         rows += f"| {wf} | `{ja['job_name']}` | `{preview}` | {related_cell} | {log_link} |\n"
 
     return rows
+
+
+def _format_grouped_tables(
+    analyses: list[dict],
+    correlation: list[dict],
+) -> str:
+    """Build two tables — AMD CI Failures and Other CI Failures.
+
+    Each table is sorted: likely-related first, then possibly, then unlikely.
+    Groups with zero failures are omitted.
+    """
+    corr_by_job: dict[str, dict] = {}
+    for c in correlation:
+        corr_by_job[c.get("job", "")] = c
+
+    real = [ja for ja in analyses if not ja.get("is_gate")]
+
+    amd_jobs = [ja for ja in real if _is_amd_workflow(ja.get("workflow_name", ""))]
+    other_jobs = [ja for ja in real if not _is_amd_workflow(ja.get("workflow_name", ""))]
+
+    def _sort_key(ja):
+        return (
+            _VERDICT_SORT_ORDER.get(
+                corr_by_job.get(ja["job_name"], {}).get("verdict", ""), 3
+            ),
+            ja.get("workflow_name", ""),
+        )
+
+    amd_jobs.sort(key=_sort_key)
+    other_jobs.sort(key=_sort_key)
+
+    body = ""
+    if amd_jobs:
+        body += "### AMD CI Failures\n\n"
+        body += _render_table(amd_jobs, corr_by_job)
+        body += "\n"
+    if other_jobs:
+        body += "### Other CI Failures\n\n"
+        body += _render_table(other_jobs, corr_by_job)
+        body += "\n"
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -492,38 +523,48 @@ def check_ci_for_pr(
             )
             print(f"  Got {len(correlation)} correlation verdict(s)")
 
-        # Phase 3: build header + verdict summary + sorted merged table
+        # Phase 3: build header + verdict summary + grouped tables
         body = f"{requester_line}## CI Status for PR #{pr_number}\n\n"
 
-        # Verdict summary line
         corr_by_job: dict[str, dict] = {}
         for c in correlation:
             corr_by_job[c.get("job", "")] = c
 
-        n_likely = sum(
-            1 for ja in real_jobs
-            if corr_by_job.get(ja["job_name"], {}).get("verdict") == "likely"
-        )
-        n_possibly = sum(
-            1 for ja in real_jobs
-            if corr_by_job.get(ja["job_name"], {}).get("verdict") == "possibly"
-        )
-        n_total = len(real_jobs)
-        n_unrelated = n_total - n_likely - n_possibly
+        amd_jobs = [ja for ja in real_jobs if _is_amd_workflow(ja.get("workflow_name", ""))]
+        other_jobs = [ja for ja in real_jobs if not _is_amd_workflow(ja.get("workflow_name", ""))]
 
-        if n_likely == 0 and n_possibly == 0:
-            body += f"**All {n_total} failures appear unrelated to your PR**\n\n"
-        else:
-            parts = []
-            if n_likely > 0:
-                parts.append(f"**{n_likely} failure{'s' if n_likely > 1 else ''} likely related to your PR**")
-            if n_possibly > 0:
-                parts.append(f"{n_possibly} possibly related")
-            if n_unrelated > 0:
-                parts.append(f"{n_unrelated} unrelated")
-            body += " · ".join(parts) + "\n\n"
+        def _group_summary(jobs: list[dict], label: str) -> str:
+            n = len(jobs)
+            if n == 0:
+                return f"**{label}: 0 failures**"
+            n_related = sum(
+                1 for ja in jobs
+                if corr_by_job.get(ja["job_name"], {}).get("verdict") in ("likely", "possibly")
+            )
+            return f"**{label}: {n} failure{'s' if n != 1 else ''} ({n_related} likely related)**"
 
-        body += _format_merged_table(all_job_data, correlation)
+        amd_passed = [n for n in passed_names if _is_amd_workflow(n)]
+        amd_pending = [n for n in pending_names if _is_amd_workflow(n)]
+        other_passed = [n for n in passed_names if not _is_amd_workflow(n)]
+        other_pending = [n for n in pending_names if not _is_amd_workflow(n)]
+
+        body += _group_summary(amd_jobs, "AMD") + " · " + _group_summary(other_jobs, "Others") + "\n\n"
+
+        status_parts = []
+        if amd_passed or amd_pending:
+            s = f"AMD: {len(amd_passed)} passed"
+            if amd_pending:
+                s += f", {len(amd_pending)} pending"
+            status_parts.append(s)
+        if other_passed or other_pending:
+            s = f"Others: {len(other_passed)} passed"
+            if other_pending:
+                s += f", {len(other_pending)} pending"
+            status_parts.append(s)
+        if status_parts:
+            body += " | ".join(status_parts) + "\n\n"
+
+        body += _format_grouped_tables(all_job_data, correlation)
         body += "\n---\n*Generated by amd-bot using Claude API*\n"
 
     if post_comment_flag:
