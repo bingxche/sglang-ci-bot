@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""
+On-demand CI failure analysis for sglang.
+
+Accepts a GitHub Actions run or job URL, analyzes failed jobs using the
+Claude Code agent, and posts results to a new GitHub issue on the bot repo.
+
+Usage:
+  python analyze_url.py --url <run_or_job_url> [--bot-repo owner/repo] [--use-agent]
+
+URL formats:
+  Run:  https://github.com/sgl-project/sglang/actions/runs/24384910439
+  Job:  https://github.com/sgl-project/sglang/actions/runs/24384910439/job/71216400611
+"""
+
+import argparse
+import logging
+import os
+import re
+import sys
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import requests
+
+from utils import (
+    GATE_STEP_PATTERNS,
+    REPO,
+    claude_code_analyze,
+    claude_code_available,
+    create_anthropic_client,
+    create_github_issue,
+    cross_job_analysis,
+    download_job_logs,
+    ensure_sglang_repo,
+    extract_error_lines,
+    focused_job_analysis,
+    gh_headers,
+    post_comment,
+    prefilter_large_step_log,
+    update_comment,
+)
+
+log = logging.getLogger("analyze-url")
+
+SKIP_JOB_CONCLUSIONS = {"success", "skipped"}
+MAX_PARALLEL_JOBS = 2
+
+_GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-|check-all", re.IGNORECASE)
+
+_RUN_URL_RE = re.compile(
+    r"github\.com/([^/]+/[^/]+)/actions/runs/(\d+)(?:/job/(\d+))?"
+)
+
+
+def _is_gate_job(job: dict) -> bool:
+    if _GATE_JOB_NAME_RE.search(job.get("name", "")):
+        return True
+    failed_steps = [
+        s for s in job.get("steps", [])
+        if s.get("conclusion") == "failure"
+    ]
+    if not failed_steps:
+        return False
+    return all(GATE_STEP_PATTERNS.search(s["name"]) for s in failed_steps)
+
+
+# ---------------------------------------------------------------------------
+# GitHub API helpers
+# ---------------------------------------------------------------------------
+
+def get_run(token: str, run_id: int) -> dict:
+    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}"
+    resp = requests.get(url, headers=gh_headers(token))
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_job(token: str, job_id: int) -> dict:
+    url = f"https://api.github.com/repos/{REPO}/actions/jobs/{job_id}"
+    resp = requests.get(url, headers=gh_headers(token))
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_failed_jobs(token: str, run_id: int) -> list[dict]:
+    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
+    params = {"filter": "latest", "per_page": 100}
+    resp = requests.get(url, headers=gh_headers(token), params=params)
+    resp.raise_for_status()
+    jobs = resp.json().get("jobs", [])
+    return [
+        j for j in jobs
+        if j.get("status") == "completed"
+        and j.get("conclusion") not in SKIP_JOB_CONCLUSIONS
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Job analysis (mirrors monitor_ci.py)
+# ---------------------------------------------------------------------------
+
+def analyze_job_with_agent(
+    job: dict, run_url: str, repo_path: Path,
+    workflow_file: str = "", head_sha: str = "",
+) -> dict:
+    job_name = job["name"]
+    job_id = job["id"]
+
+    failed_step_names = {
+        s["name"]
+        for s in job.get("steps", [])
+        if s.get("conclusion") not in ("success", "skipped", None)
+    }
+
+    prompt = f"""Analyze this CI failure in sgl-project/sglang. The source code is in the current directory. GitHub API token is in $GH_PAT.
+
+Job: {job_name}
+Run: {run_url}
+Job ID: {job_id}
+Commit SHA: {head_sha}
+Workflow file: {workflow_file}
+Log URL: https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/logs"""
+
+    log.info("  [%s] Running Claude Code agent...", job_name)
+    analysis = claude_code_analyze(prompt=prompt, work_dir=repo_path)
+
+    log.info("  [%s] Agent analysis done.", job_name)
+    return {
+        "run_url": run_url,
+        "job_name": job_name,
+        "job_id": job_id,
+        "head_sha": head_sha,
+        "started_at": job.get("started_at"),
+        "failed_steps": sorted(failed_step_names),
+        "analysis": analysis,
+    }
+
+
+def analyze_job_api(
+    client, token: str, job: dict, run_url: str, head_sha: str = "",
+) -> dict:
+    job_name = job["name"]
+    job_id = job["id"]
+    run_id = int(run_url.rstrip("/").split("/")[-1])
+
+    failed_step_names = {
+        s["name"]
+        for s in job.get("steps", [])
+        if s.get("conclusion") not in ("success", "skipped", None)
+    }
+
+    log.info("  [%s] Downloading logs...", job_name)
+    raw_log = download_job_logs(token, job_id)
+    log.info("  [%s] Log: %s chars", job_name, f"{len(raw_log):,}")
+
+    all_errors = extract_error_lines(raw_log, job.get("steps", []), run_id, job_id)
+    error_lines = [e for e in all_errors if e["source"] != "tail"]
+    log.info("  [%s] Extracted %d error signal(s)", job_name, len(error_lines))
+
+    filtered_log = prefilter_large_step_log(raw_log)
+    if len(filtered_log) < len(raw_log):
+        log.info("  [%s] Pre-filtered log: %s -> %s chars",
+                 job_name, f"{len(raw_log):,}", f"{len(filtered_log):,}")
+
+    log.info("  [%s] Analyzing...", job_name)
+    analysis = focused_job_analysis(client, job_name, run_url, error_lines, filtered_log)
+
+    log.info("  [%s] Done.", job_name)
+    return {
+        "run_url": run_url,
+        "job_name": job_name,
+        "job_id": job_id,
+        "head_sha": head_sha,
+        "started_at": job.get("started_at"),
+        "failed_steps": sorted(failed_step_names),
+        "analysis": analysis,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Report rendering
+# ---------------------------------------------------------------------------
+
+def render_report(
+    run: dict,
+    job_analyses: list[dict],
+    cross_summary: str = "",
+    use_agent: bool = False,
+) -> str:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    head_sha = run.get("head_sha", "")
+    short_sha = head_sha[:7] if head_sha else "unknown"
+    run_url = run["html_url"]
+    workflow_name = run.get("path", run.get("name", "unknown")).split("/")[-1]
+
+    commit_link = (
+        f"[`{short_sha}`](https://github.com/{REPO}/commit/{head_sha})"
+        if head_sha else "unknown"
+    )
+
+    body = f"""## Analysis: `{workflow_name}` — {len(job_analyses)} failure(s)
+
+**Run**: [{run_url}]({run_url})
+**Commit**: sglang {commit_link}
+**Event**: `{run.get('event', 'unknown')}`
+**Analyzed**: {now}
+
+"""
+
+    if cross_summary:
+        cleaned = re.sub(
+            r"^#{1,3}\s+.*(?:Summary|Overview).*$", "",
+            cross_summary, flags=re.MULTILINE,
+        ).strip()
+        body += f"### Summary\n\n{cleaned}\n\n---\n\n"
+
+    job_table_rows = "\n".join(
+        f"| [`{ja['job_name']}`]({ja['run_url']}) "
+        f"| {', '.join(ja['failed_steps']) or 'N/A'} "
+        f"| {ja.get('started_at', 'N/A')[:16] if ja.get('started_at') else 'N/A'} |"
+        for ja in job_analyses
+    )
+    body += f"""| Job | Failed Steps | Started |
+|-----|-------------|---------|
+{job_table_rows}
+
+"""
+
+    per_job = ""
+    for ja in job_analyses:
+        per_job += f"""
+<details>
+<summary><b>{ja['job_name']}</b> — failed step(s): {', '.join(ja['failed_steps']) or 'N/A'}</summary>
+
+{ja['analysis']}
+
+</details>
+"""
+    body += f"### Per-Job Analysis\n{per_job}\n"
+
+    method = "Claude Code CLI" if use_agent else "Claude API"
+    body += f"\n---\n*Generated by amd-bot using {method} ({now})*\n"
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+def run_analysis(
+    token: str,
+    url: str,
+    bot_repo: str | None = None,
+    use_agent: bool = False,
+):
+    match = _RUN_URL_RE.search(url)
+    if not match:
+        log.error("Could not parse URL: %s", url)
+        sys.exit(1)
+
+    repo_in_url = match.group(1)
+    run_id = int(match.group(2))
+    single_job_id = int(match.group(3)) if match.group(3) else None
+
+    if repo_in_url != REPO:
+        log.warning("URL repo %s differs from target %s", repo_in_url, REPO)
+
+    log.info("Fetching run %d...", run_id)
+    run = get_run(token, run_id)
+    head_sha = run.get("head_sha", "")
+    run_url = run["html_url"]
+    workflow_name = run.get("path", run.get("name", "unknown")).split("/")[-1]
+    short_sha = head_sha[:7] if head_sha else "?"
+
+    # Determine jobs to analyze
+    if single_job_id:
+        log.info("Fetching single job %d...", single_job_id)
+        job = get_job(token, single_job_id)
+        jobs = [job]
+        title = f"[Analyze] {job['name']} (job {single_job_id})"
+    else:
+        log.info("Fetching failed jobs for run %d...", run_id)
+        all_failed = get_failed_jobs(token, run_id)
+        gate_jobs = [j for j in all_failed if _is_gate_job(j)]
+        for gj in gate_jobs:
+            log.info("  Skipping gate job: %s", gj["name"])
+        jobs = [j for j in all_failed if not _is_gate_job(j)]
+        title = f"[Analyze] {workflow_name} run #{run.get('run_number', run_id)} ({short_sha})"
+
+    if not jobs:
+        log.info("No failed jobs to analyze.")
+        title += " -- no failures found"
+        if bot_repo:
+            body = (
+                f"No failed jobs found in [{workflow_name} run #{run.get('run_number', run_id)}]"
+                f"({run_url}) (commit `{short_sha}`).\n\n"
+                f"All jobs passed or are still running."
+            )
+            issue = create_github_issue(token, title, body, labels=["analyze"], repo=bot_repo)
+            log.info("Created issue #%d: %s", issue["number"], title)
+        return
+
+    log.info("%d job(s) to analyze.", len(jobs))
+
+    # Create issue upfront so user can follow along
+    issue_number = None
+    if bot_repo:
+        job_list = "\n".join(f"- `{j['name']}`" for j in jobs)
+        body = (
+            f"**Run**: [{workflow_name} #{run.get('run_number', run_id)}]({run_url})\n"
+            f"**Commit**: [`{short_sha}`](https://github.com/{REPO}/commit/{head_sha})\n"
+            f"**Event**: `{run.get('event', 'unknown')}`\n\n"
+            f"**Jobs to analyze** ({len(jobs)}):\n{job_list}\n\n"
+            f"_Analysis in progress..._"
+        )
+        issue = create_github_issue(token, title, body, labels=["analyze"], repo=bot_repo)
+        issue_number = issue["number"]
+        log.info("Created issue #%d: %s", issue_number, title)
+
+    # Prepare agent
+    agent_repo_path = None
+    if use_agent:
+        if not claude_code_available():
+            log.warning("Claude Code CLI not found, falling back to API mode")
+            use_agent = False
+        else:
+            try:
+                agent_repo_path = ensure_sglang_repo()
+            except Exception:
+                log.exception("Failed to clone sglang repo, falling back to API mode")
+                use_agent = False
+
+    # Analyze jobs
+    job_analyses: list[dict] = []
+    max_workers = min(MAX_PARALLEL_JOBS if not use_agent else 2, len(jobs))
+    mode = "agent" if use_agent else "API"
+    log.info("Analyzing %d job(s) (%s mode, workers: %d)...", len(jobs), mode, max_workers)
+
+    if use_agent and agent_repo_path:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    analyze_job_with_agent, job, run_url,
+                    agent_repo_path, workflow_name, head_sha=head_sha,
+                ): job
+                for job in jobs
+            }
+            for future in as_completed(futures):
+                job = futures[future]
+                try:
+                    result = future.result()
+                    job_analyses.append(result)
+                    if issue_number and bot_repo:
+                        comment_body = (
+                            f"### `{result['job_name']}`\n\n{result['analysis']}"
+                        )
+                        post_comment(token, bot_repo, issue_number, comment_body)
+                        log.info("  Posted analysis for %s", result["job_name"])
+                except Exception as e:
+                    log.error("  Error analyzing %s: %s", job["name"], e)
+                    traceback.print_exc()
+    else:
+        client = create_anthropic_client()
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    analyze_job_api, client, token, job, run_url,
+                    head_sha=head_sha,
+                ): job
+                for job in jobs
+            }
+            for future in as_completed(futures):
+                job = futures[future]
+                try:
+                    result = future.result()
+                    job_analyses.append(result)
+                    if issue_number and bot_repo:
+                        comment_body = (
+                            f"### `{result['job_name']}`\n\n{result['analysis']}"
+                        )
+                        post_comment(token, bot_repo, issue_number, comment_body)
+                        log.info("  Posted analysis for %s", result["job_name"])
+                except Exception as e:
+                    log.error("  Error analyzing %s: %s", job["name"], e)
+                    traceback.print_exc()
+
+    if not job_analyses:
+        log.warning("No analyses produced.")
+        return
+
+    # Cross-job summary
+    cross = ""
+    if len(job_analyses) > 1:
+        try:
+            client = create_anthropic_client()
+            log.info("Cross-job analysis (%d jobs)...", len(job_analyses))
+            cross = cross_job_analysis(client, workflow_name, job_analyses)
+        except Exception:
+            log.exception("Cross-job analysis failed")
+
+    report = render_report(run, job_analyses, cross, use_agent=use_agent)
+
+    if issue_number and bot_repo:
+        # Update issue body with the final summary report
+        issue_url = f"https://api.github.com/repos/{bot_repo}/issues/{issue_number}"
+        resp = requests.patch(
+            issue_url,
+            headers=gh_headers(token),
+            json={"body": report},
+        )
+        resp.raise_for_status()
+        log.info("Updated issue #%d with final report.", issue_number)
+    else:
+        print(f"\n{'='*60}")
+        print(report)
+
+    log.info("Done. Analyzed %d job(s).", len(job_analyses))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze a GitHub Actions run or job URL")
+    parser.add_argument("--url", required=True, help="GitHub Actions run or job URL")
+    parser.add_argument(
+        "--bot-repo",
+        help="Bot repo to create issue in (e.g. 'user/sglang-ci-bot'). "
+             "If omitted, prints to stdout.",
+    )
+    parser.add_argument(
+        "--use-agent", action="store_true",
+        default=os.environ.get("USE_AGENT", "").lower() in ("true", "1", "yes"),
+        help="Use Claude Code agent for deeper analysis",
+    )
+    parser.add_argument(
+        "--github-token",
+        default=os.environ.get("BOT_PAT", os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", ""))),
+        help="GitHub token",
+    )
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO,
+        stream=sys.stdout,
+    )
+
+    if not args.github_token:
+        log.error("GitHub token required. Set GH_PAT.")
+        sys.exit(1)
+
+    if not args.use_agent:
+        if not os.environ.get("LLM_GATEWAY_KEY"):
+            log.error("LLM_GATEWAY_KEY env var required for API mode.")
+            sys.exit(1)
+        if not os.environ.get("LLM_GATEWAY_URL"):
+            log.error("LLM_GATEWAY_URL env var required for API mode.")
+            sys.exit(1)
+
+    run_analysis(args.github_token, args.url, args.bot_repo, args.use_agent)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,40 @@
+name: Analyze CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'GitHub Actions run or job URL to analyze'
+        required: true
+        type: string
+
+concurrency:
+  group: analyze-ci-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: [self-hosted, amd-internal]
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run analysis
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
+          LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
+          USE_AGENT: 'true'
+          AGENT_WORKSPACE: /workspace
+        run: |
+          python scripts/analyze_url.py \
+            --url "${{ github.event.inputs.url }}" \
+            --bot-repo "${{ github.repository }}" \
+            --use-agent

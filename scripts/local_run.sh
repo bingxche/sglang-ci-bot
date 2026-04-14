@@ -71,6 +71,15 @@ case "${1:-help}" in
         python "$SCRIPT_DIR/check_ci_for_pr.py" "$2" \
             2>&1 | tee "$LOG_DIR/ci_status_pr${2}_${TIMESTAMP}.log"
         ;;
+    analyze)
+        if [ -z "${2:-}" ]; then
+            echo "Usage: $0 analyze <run_or_job_url>"
+            exit 1
+        fi
+        echo "[$(date)] Analyzing: $2"
+        python "$SCRIPT_DIR/analyze_url.py" --url "$2" \
+            2>&1 | tee "$LOG_DIR/analyze_${TIMESTAMP}.log"
+        ;;
     watch)
         echo "[$(date)] Watching for comments..."
         python "$SCRIPT_DIR/watch_comments.py" \
@@ -83,6 +92,7 @@ case "${1:-help}" in
         echo ""
         echo "Commands:"
         echo "  monitor [output_mode] [hours_back]  - Monitor CI failures (default: stdout, 24h)"
+        echo "  analyze <url>                        - Analyze a CI run or job URL"
         echo "  review <pr_number> [focus]           - Review a PR"
         echo "  ci-status <pr_number>                - Check CI status for a PR"
         echo "  watch [hours_back]                   - Watch for bot commands in comments"
@@ -90,6 +100,7 @@ case "${1:-help}" in
         echo "Examples:"
         echo "  $0 monitor                    # Monitor last 24h, print to stdout"
         echo "  $0 monitor stdout 48          # Monitor last 48h, print to terminal"
+        echo "  $0 analyze https://github.com/sgl-project/sglang/actions/runs/12345"
         echo "  $0 review 1234                # Review PR #1234"
         echo "  $0 review 1234 'AMD ROCm'     # Review with focus area"
         echo "  $0 ci-status 1234             # Check CI for PR #1234"
