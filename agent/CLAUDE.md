@@ -73,6 +73,39 @@ For the **aiter commit**, download the job log and search for `[CI-AITER-CHECK]`
 
 If no `[CI-AITER-CHECK]` markers exist in the log (e.g. docker-build workflows), report aiter as `N/A`.
 
+### AITER analysis (when relevant)
+
+[aiter](https://github.com/ROCm/aiter) is AMD's attention/inference kernel library that sglang depends on. Failures may be caused by aiter changes rather than sglang changes. This is especially true for:
+
+- **AMD AITER Scout** workflow runs (which test sglang against a specific aiter commit)
+- Any failure involving MLA kernels, FlashAttention, fused attention, or custom Triton kernels
+- Errors like `hipErrorNoBinaryForGpu`, kernel launch failures, or numerical mismatches in attention output
+
+When the aiter commit differs from the Dockerfile default (i.e., an override or dev build), investigate what changed in aiter:
+
+1. **Get the aiter commit history** via GitHub API:
+   ```
+   curl -s -H "Authorization: token $GH_PAT" \
+     "https://api.github.com/repos/ROCm/aiter/commits?sha=<aiter_sha>&per_page=10"
+   ```
+
+2. **Compare with the previous aiter version** (Dockerfile default vs override):
+   ```
+   curl -s -H "Authorization: token $GH_PAT" \
+     "https://api.github.com/repos/ROCm/aiter/compare/<old_sha>...<new_sha>"
+   ```
+
+3. **Read a specific aiter commit's diff**:
+   ```
+   curl -s -H "Authorization: token $GH_PAT" \
+     "https://api.github.com/repos/ROCm/aiter/commits/<sha>"
+   ```
+
+In the Root Cause Analysis, clearly state whether the failure is caused by:
+- **sglang code change** — cite the sglang commit
+- **aiter code change** — cite the aiter commit and what it changed
+- **Interaction between both** — cite both
+
 ### Output format
 
 ```
@@ -98,11 +131,12 @@ New regression / Known recurring failure / Flaky test / Infrastructure issue
  Read the failing test source code to understand what it checks.)
 
 ### Suspicious Commits
-(If regression — list with SHA and explanation)
-- `abc1234` — changed X in file Y which affects Z
+(If regression — list sglang and/or aiter commits with SHA and explanation)
+- sglang `abc1234` — changed X in file Y which affects Z
+- aiter `def5678` — changed kernel K which affects attention output precision
 
 ### Suggested Fix Directions
-(Bullet points, direction only)
+(Bullet points, direction only. Specify whether the fix should be in sglang or aiter.)
 
 ### Priority
 Critical / High / Medium / Low — (one sentence justification)
