@@ -472,8 +472,8 @@ def monitor_workflow(
         if use_agent and agent_repo_path:
             worktrees: dict[int, Path] = {}
             try:
-                for job, _, _ in jobs_to_analyze:
-                    wt = create_agent_worktree(job["id"])
+                for job, _, sha in jobs_to_analyze:
+                    wt = create_agent_worktree(job["id"], head_sha=sha)
                     worktrees[job["id"]] = wt
 
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:

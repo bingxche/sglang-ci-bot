@@ -234,7 +234,7 @@ def run_analysis(
         worktrees: dict[int, Path] = {}
         try:
             for job in jobs:
-                wt = create_agent_worktree(job["id"])
+                wt = create_agent_worktree(job["id"], head_sha=head_sha)
                 worktrees[job["id"]] = wt
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:

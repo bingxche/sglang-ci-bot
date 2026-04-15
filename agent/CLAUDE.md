@@ -39,11 +39,22 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
 
 When the prompt asks you to analyze a CI job failure, answer three questions:
 
-1. **What failed?** — Identify the exact error, include the error message and a link to the specific log line.
+1. **What failed?** — Identify the exact test file(s) and test function(s) that failed. Include the error message and a link to the specific log line. Be precise: not just "the decode test job failed", but "test_mla_correctness in test/srt/test_mla_correctness.py failed with AssertionError on line 42".
 2. **When did it start?** — Check the last ~5 runs of the same workflow/job to determine if this is a new regression, a recurring failure, or a flaky test.
-3. **Why did it fail?** — For regressions, find the suspicious commit(s) merged between the last passing and first failing run. Read the relevant source code. Use git blame/log as needed.
+3. **Why did it fail?** — For regressions, find the suspicious commit(s) merged between the last passing and first failing run. Read the relevant source code at the commit that was tested (the workspace is checked out to that commit). Use git blame/log as needed.
 
 Include all evidence with hyperlinks.
+
+### Test-file level analysis (REQUIRED)
+
+CI jobs often run multiple test files. You MUST identify failures at the **test file + test function** level, not just the job level. From the log, extract:
+
+- The test file path (e.g. `test/srt/test_mla_correctness.py`)
+- The specific test function(s) that failed (e.g. `test_mla_correctness`)
+- The exact error type and message (e.g. `AssertionError: Tensor mismatch at rtol=0.01`)
+- Pass/fail counts if available (e.g. `3 passed, 1 failed`)
+
+If a job runs a test suite (pytest, unittest), always report which specific tests failed, not just "the job failed".
 
 ### Link format
 
@@ -69,15 +80,22 @@ If no `[CI-AITER-CHECK]` markers exist in the log (e.g. docker-build workflows),
 - **sglang**: `<head_sha>`
 - **aiter**: `<actual_aiter_commit>` (source: Dockerfile default / override / dev image)
 
+### Failed Tests
+| Test File | Test Function | Error | Log |
+|-----------|--------------|-------|-----|
+| `test/srt/test_mla.py` | `test_mla_correctness` | `AssertionError: rtol=0.01` | [Log](link) |
+(List ALL failed tests. If the failure is not a test — e.g. build error, server crash — describe it here instead.)
+
 ### Failure Summary
-(What failed and why, 2-3 sentences. Include link to the error in the log.)
+(What failed and why, 2-3 sentences. Reference the specific test files above.)
 
 ### Regression Status
 New regression / Known recurring failure / Flaky test / Infrastructure issue
 (Last known passing date, first observed failure date)
 
 ### Root Cause Analysis
-(Evidence-based analysis with file paths, line numbers, commit SHAs, and links)
+(Evidence-based analysis with file paths, line numbers, commit SHAs, and links.
+ Read the failing test source code to understand what it checks.)
 
 ### Suspicious Commits
 (If regression — list with SHA and explanation)
@@ -192,11 +210,14 @@ These errors were programmatically extracted from the log. Start your analysis f
 
 Produce a CONCISE report. Be brief — engineers will read this quickly then check the logs themselves.
 
-### Failure Summary
-One or two sentences: what failed and why.
+### Failed Tests
+| Test File | Test Function | Error |
+|-----------|--------------|-------|
+| `test/path/test_foo.py` | `test_function_name` | `ErrorType: message` |
+(List ALL failed tests from the log. If the failure is not a test — e.g. build error, server crash — describe it here instead.)
 
-### Failure Reasons
-List ALL distinct failure reasons as bullet points. Each bullet: one concise sentence.
+### Failure Summary
+One or two sentences: what failed and why. Reference the specific test files above.
 
 ### Stack Traces
 Include key error messages and stack traces verbatim (in code blocks). Only the relevant portions.
@@ -208,6 +229,7 @@ Bullet points with fix DIRECTIONS only (e.g. "pin transformers to <5.0.0"). No c
 Critical / High / Medium / Low — with one sentence justification.
 
 IMPORTANT:
+- Identify failures at the TEST FILE + FUNCTION level, not just the job level.
 - Focus on actual error messages and stack traces, not warnings from passing steps.
 - Do NOT include environment tables or version lists.
 - Do NOT write code examples.

@@ -762,13 +762,16 @@ def claude_code_available() -> bool:
         return False
 
 
-def create_agent_worktree(tag: str) -> Path:
+def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
     """Create an isolated git worktree for a parallel agent.
 
     Requires the main repo at ``SGLANG_REPO_PATH`` to exist (call
     ``ensure_sglang_repo()`` first).  Each worktree lives at
     ``/workspace/sglang-wt-{tag}`` and is a cheap copy that shares
     the git object store with the main repo.
+
+    If *head_sha* is provided, the worktree is checked out to that
+    commit so the agent sees the exact code that was tested in CI.
 
     Returns the worktree path.  Call ``remove_agent_worktree()`` to
     clean up when done.
@@ -791,15 +794,25 @@ def create_agent_worktree(tag: str) -> Path:
         cwd=SGLANG_REPO_PATH, capture_output=True, timeout=10,
     )
 
-    _agent_log.info("Creating worktree %s", wt_path)
+    start_point = head_sha if head_sha else "HEAD"
+    _agent_log.info("Creating worktree %s (at %s)", wt_path, start_point[:12])
     result = subprocess.run(
-        ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
+        ["git", "worktree", "add", "-b", branch_name, str(wt_path), start_point],
         cwd=SGLANG_REPO_PATH, capture_output=True, timeout=60,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            f"git worktree add failed: {result.stderr.decode(errors='replace')}"
-        )
+        if head_sha:
+            _agent_log.warning(
+                "Checkout %s failed, falling back to HEAD", head_sha[:12],
+            )
+            result = subprocess.run(
+                ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
+                cwd=SGLANG_REPO_PATH, capture_output=True, timeout=60,
+            )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git worktree add failed: {result.stderr.decode(errors='replace')}"
+            )
 
     _deploy_claude_md(wt_path)
     _agent_log.info("Worktree ready at %s", wt_path)
