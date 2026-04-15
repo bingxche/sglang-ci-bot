@@ -2,9 +2,10 @@
 Shared utilities for amd-bot scripts.
 
 Provides GitHub API helpers, Anthropic client creation, log parsing,
-progressive step-by-step CI log analysis, and Claude Code agent integration.
+CI log analysis, and Claude Code agent integration.
 """
 
+import contextlib
 import getpass
 import json
 import logging
@@ -75,6 +76,45 @@ GATE_STEP_PATTERNS = re.compile(
     r"Check all dependent job statuses|Wait for .* jobs to complete",
     re.IGNORECASE,
 )
+
+SKIP_JOB_CONCLUSIONS = {"success", "skipped"}
+
+_GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-|check-all", re.IGNORECASE)
+
+
+def is_gate_job(job: dict) -> bool:
+    """Return True if the job is a coordinator/gate job (e.g. pr-test-amd-finish).
+
+    Detects by job name (e.g. pr-test-finish, wait-for-stage-b) or by
+    step names (e.g. 'Check all dependent job statuses').
+    """
+    if _GATE_JOB_NAME_RE.search(job.get("name", "")):
+        return True
+    failed_steps = [
+        s for s in job.get("steps", [])
+        if s.get("conclusion") == "failure"
+    ]
+    if not failed_steps:
+        return False
+    return all(GATE_STEP_PATTERNS.search(s["name"]) for s in failed_steps)
+
+
+def get_failed_jobs(token: str, run_id: int) -> list[dict]:
+    """Get completed non-success, non-skipped jobs for a workflow run.
+
+    Only returns jobs whose status is 'completed' so that still-running
+    jobs in an in-progress workflow are not picked up prematurely.
+    """
+    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
+    params = {"filter": "latest", "per_page": 100}
+    resp = requests.get(url, headers=gh_headers(token), params=params)
+    resp.raise_for_status()
+    jobs = resp.json().get("jobs", [])
+    return [
+        j for j in jobs
+        if j.get("status") == "completed"
+        and j.get("conclusion") not in SKIP_JOB_CONCLUSIONS
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -448,109 +488,158 @@ def prefilter_large_step_log(
 
 
 # ---------------------------------------------------------------------------
-# Progressive step-by-step analysis with Claude (used by monitor_ci)
+# Prompt template loading from CLAUDE.md
 # ---------------------------------------------------------------------------
 
-def progressive_step_analysis(
-    client: anthropic.Anthropic,
-    job_name: str,
-    steps_with_logs: list[dict],
-    failed_step_names: set[str],
-) -> str:
-    """Analyze every step of a job progressively, accumulating shared context.
+def _find_claude_md() -> Path | None:
+    """Locate the CLAUDE.md file (checks multiple candidate paths)."""
+    candidates = [
+        Path(__file__).resolve().parent.parent / "agent" / "CLAUDE.md",
+        Path("/tmp/bot/agent/CLAUDE.md"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
 
-    Simulates how a human engineer reads CI logs: step by step, in order,
-    building up understanding of the environment, dependencies, and build
-    state before reaching the failed step.  Each step is summarized with
-    the accumulated summary of all prior steps as context.
+
+_TEMPLATE_HEADING_RE = re.compile(r"^### ([a-z][a-z0-9-]+)$", re.MULTILINE)
+
+
+def load_prompt_template(section_name: str) -> str | None:
+    """Load a prompt template from CLAUDE.md by section heading.
+
+    Looks for ``### <section_name>`` (kebab-case) under ``## API Mode Prompts``
+    and returns the text up to the next kebab-case ``### `` heading or
+    section end.  Content headings like ``### Failure Summary`` (Title Case)
+    inside the template are preserved.
     """
-    accumulated = ""
-    n = len(steps_with_logs)
+    path = _find_claude_md()
+    if path is None:
+        return None
 
-    for i, step in enumerate(steps_with_logs):
-        name = step["name"]
-        log = step["content"]
-        is_failed = name in failed_step_names
-        label = "FAILED" if is_failed else "PASSED"
+    text = path.read_text()
 
-        if len(log) > STEP_LOG_PREFILTER_THRESHOLD:
-            orig = len(log)
-            log = prefilter_large_step_log(log)
-            print(
-                f"      Pre-filtered '{name}': {orig:,} -> {len(log):,} chars"
-            )
+    api_marker = "## API Mode Prompts"
+    api_start = text.find(api_marker)
+    if api_start == -1:
+        return None
 
-        print(f"    [{i+1}/{n}] Summarizing: {name} ({label}, {len(log):,} chars)")
+    api_text = text[api_start:]
+    next_section = api_text.find("\n---\n\n## ", len(api_marker))
+    if next_section != -1:
+        api_text = api_text[:next_section]
 
-        prompt = f"""You are analyzing step {i+1} of {n} in CI job "{job_name}" for the sglang project (LLM serving framework on AMD GPUs).
+    headings = list(_TEMPLATE_HEADING_RE.finditer(api_text))
+    for i, m in enumerate(headings):
+        if m.group(1) == section_name:
+            body_start = m.end() + 1
+            body_end = headings[i + 1].start() if i + 1 < len(headings) else len(api_text)
+            return api_text[body_start:body_end].strip()
 
-## Context from previous steps
-{accumulated if accumulated else "(first step — no prior context)"}
-
-## Current Step: {name}
-**Status**: {label}
-
-```
-{log}
-```
-
-{"This step FAILED. Extract: (1) the full error message and stack trace verbatim, (2) which test(s) failed with pass/fail counts, (3) exit code. Be thorough on errors but skip non-error details." if is_failed else "This step passed. In 2-4 bullet points, note ONLY information that could be relevant to understanding a later failure (e.g. key package versions, dependency conflicts/warnings, GPU/Docker info). Skip routine output."}"""
-
-        msg = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024 if not is_failed else 2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        summary = msg.content[0].text
-        accumulated += f"\n### Step {i+1}: {name} [{label}]\n{summary}\n"
-
-    return accumulated
+    return None
 
 
-def final_job_analysis(
-    client: anthropic.Anthropic,
-    job_name: str,
-    run_url: str,
-    accumulated_summary: str,
-) -> str:
-    """Produce a concise, results-first analysis for a failed job."""
-    prompt = f"""You are a CI/CD expert analyzing a FAILED CI job in the sglang project (LLM serving framework on AMD GPUs).
+def analyze_job_with_agent(
+    job: dict, run_url: str, repo_path: Path,
+    workflow_file: str = "", head_sha: str = "",
+) -> dict:
+    """Invoke Claude Code agent to fully analyze a CI failure.
 
-## Job: {job_name}
-## Run: {run_url}
+    The agent handles everything autonomously: downloading logs via the
+    GitHub API (using ``$GH_PAT`` from the environment), parsing errors,
+    reading sglang source code, checking git history, and producing a
+    root-cause analysis.  Investigation methodology is defined in
+    ``CLAUDE.md`` which Claude Code reads automatically.
+    """
+    job_name = job["name"]
+    job_id = job["id"]
 
-{accumulated_summary}
+    failed_step_names = {
+        s["name"]
+        for s in job.get("steps", [])
+        if s.get("conclusion") not in ("success", "skipped", None)
+    }
 
-Produce a CONCISE report in the following format. Be brief — engineers will read this quickly and then go look at the logs themselves.
-
-### Failure Summary
-One or two sentences: what failed and why.
-
-### Failure Reasons
-List ALL distinct failure reasons as bullet points. Do NOT omit any. Each bullet should be one concise sentence.
-
-### Stack Traces
-Include the key error messages and stack traces verbatim (in code blocks). Engineers need these to locate the issue. Only include the relevant portions — not the entire log.
-
-### Suggested Fix Directions
-List potential fix directions as bullet points. Only state the DIRECTION (e.g. "pin transformers to <5.0.0", "add default value to vision_config field"). Do NOT write out code implementations or detailed steps.
-
-### Priority
-One word: Critical / High / Medium / Low — with a single sentence justification.
-
-IMPORTANT RULES:
-- Do NOT include environment tables, version tables, or lengthy context sections.
-- Do NOT write code examples for fixes.
-- Do NOT include "Environment Context" sections.
-- Keep the entire output under 300 lines of markdown.
-- Be direct and factual — no filler."""
-
-    msg = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}],
+    prompt = (
+        f"Task: CI Monitor\n"
+        f"Job: {job_name}\n"
+        f"Run: {run_url}\n"
+        f"Job ID: {job_id}\n"
+        f"Commit SHA: {head_sha}\n"
+        f"Workflow file: {workflow_file}\n"
+        f"Log URL: https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs\n"
+        f"Source: current directory\n"
+        f"GitHub API token: $GH_PAT"
     )
-    return msg.content[0].text
+
+    _log = logging.getLogger("ci-monitor")
+    _log.info("  [%s] Running Claude Code agent...", job_name)
+    analysis = claude_code_analyze(prompt=prompt, work_dir=repo_path)
+    _log.info("  [%s] Agent analysis done.", job_name)
+
+    return {
+        "run_url": run_url,
+        "job_name": job_name,
+        "job_id": job_id,
+        "head_sha": head_sha,
+        "started_at": job.get("started_at"),
+        "failed_steps": sorted(failed_step_names),
+        "analysis": analysis,
+    }
+
+
+def analyze_job_api(
+    client: anthropic.Anthropic,
+    token: str,
+    job: dict,
+    run_url: str,
+    head_sha: str = "",
+) -> dict:
+    """Download logs, extract errors, and run focused API analysis for one job."""
+    _log = logging.getLogger("ci-monitor")
+    job_name = job["name"]
+    job_id = job["id"]
+    run_id = int(run_url.rstrip("/").split("/")[-1])
+
+    failed_step_names = {
+        s["name"]
+        for s in job.get("steps", [])
+        if s.get("conclusion") not in ("success", "skipped", None)
+    }
+
+    _log.info("  [%s] Downloading logs...", job_name)
+    raw_log = download_job_logs(token, job_id)
+    _log.info("  [%s] Log: %s chars", job_name, f"{len(raw_log):,}")
+
+    all_errors = extract_error_lines(
+        raw_log, job.get("steps", []), run_id, job_id,
+    )
+    error_lines = [e for e in all_errors if e["source"] != "tail"]
+    _log.info("  [%s] Extracted %d error signal(s)", job_name, len(error_lines))
+
+    filtered_log = prefilter_large_step_log(raw_log)
+    if len(filtered_log) < len(raw_log):
+        _log.info(
+            "  [%s] Pre-filtered log: %s -> %s chars",
+            job_name, f"{len(raw_log):,}", f"{len(filtered_log):,}",
+        )
+
+    _log.info("  [%s] Analyzing...", job_name)
+    analysis = focused_job_analysis(
+        client, job_name, run_url, error_lines, filtered_log,
+    )
+
+    _log.info("  [%s] Done.", job_name)
+    return {
+        "run_url": run_url,
+        "job_name": job_name,
+        "job_id": job_id,
+        "head_sha": head_sha,
+        "started_at": job.get("started_at"),
+        "failed_steps": sorted(failed_step_names),
+        "analysis": analysis,
+    }
 
 
 def focused_job_analysis(
@@ -562,10 +651,7 @@ def focused_job_analysis(
 ) -> str:
     """Analyze a failed CI job using pre-extracted errors and pre-filtered logs.
 
-    Replaces the progressive_step_analysis + final_job_analysis pipeline
-    with a single LLM call.  Pre-extracted error messages are placed at
-    the top of the prompt so the model starts from actual errors rather
-    than accumulating noise from passing steps.
+    Prompt template is loaded from CLAUDE.md ``### focused-job-analysis``.
     """
     if error_lines:
         errors_section = "\n".join(
@@ -576,44 +662,24 @@ def focused_job_analysis(
     else:
         errors_section = "(no errors extracted programmatically — check the log below)"
 
-    prompt = f"""You are a CI/CD expert analyzing a FAILED CI job in the sglang project (LLM serving framework on AMD GPUs).
-
-## Job: {job_name}
-## Run: {run_url}
-
-## Pre-extracted Error Signals
-These errors were programmatically extracted from the log. Start your analysis from these:
-
-{errors_section}
-
-## Log (error-relevant sections)
-```
-{filtered_log}
-```
-
-Produce a CONCISE report. Be brief — engineers will read this quickly then check the logs themselves.
-
-### Failure Summary
-One or two sentences: what failed and why.
-
-### Failure Reasons
-List ALL distinct failure reasons as bullet points. Each bullet: one concise sentence.
-
-### Stack Traces
-Include key error messages and stack traces verbatim (in code blocks). Only the relevant portions.
-
-### Suggested Fix Directions
-Bullet points with fix DIRECTIONS only (e.g. "pin transformers to <5.0.0"). No code.
-
-### Priority
-Critical / High / Medium / Low — with one sentence justification.
-
-IMPORTANT:
-- Focus on actual error messages and stack traces, not warnings from passing steps.
-- Do NOT include environment tables or version lists.
-- Do NOT write code examples.
-- Keep output under 300 lines.
-- Be direct and factual."""
+    template = load_prompt_template("focused-job-analysis")
+    if template:
+        prompt = template.format(
+            job_name=job_name,
+            run_url=run_url,
+            errors_section=errors_section,
+            filtered_log=filtered_log,
+        )
+    else:
+        prompt = (
+            f"You are a CI/CD expert analyzing a FAILED CI job in the sglang project "
+            f"(LLM serving framework on AMD GPUs).\n\n"
+            f"## Job: {job_name}\n## Run: {run_url}\n\n"
+            f"## Pre-extracted Error Signals\n{errors_section}\n\n"
+            f"## Log (error-relevant sections)\n```\n{filtered_log}\n```\n\n"
+            f"Produce a CONCISE failure analysis with: Failure Summary, Failure Reasons, "
+            f"Stack Traces, Suggested Fix Directions, Priority."
+        )
 
     try:
         msg = client.messages.create(
@@ -643,27 +709,28 @@ def cross_job_analysis(
     workflow_name: str,
     job_analyses: list[dict],
 ) -> str:
-    """Find common patterns across multiple failed jobs — concise summary."""
+    """Find common patterns across multiple failed jobs — concise summary.
+
+    Prompt template is loaded from CLAUDE.md ``### cross-job-summary``.
+    """
     jobs_text = "\n\n---\n\n".join(
         f"### Job: {ja['job_name']}\n{ja['analysis']}" for ja in job_analyses
     )
 
-    prompt = f"""You are a CI/CD expert. {len(job_analyses)} jobs failed in workflow `{workflow_name}` (sglang project, AMD GPUs).
-
-{jobs_text}
-
-Write a SHORT cross-job summary (under 40 lines). Start with a summary table, then brief analysis.
-
-1. **Summary Table** (MUST be first): a markdown table with these columns:
-   | # | Job | Root Cause | Type | Priority |
-   Type examples: Threshold too tight, Infra flake, Server crash, Build error, Timeout, Flaky test.
-   Priority: Critical / High / Medium / Low.
-
-2. **Common Root Cause** (if any): one or two sentences.
-3. **Distinct vs Shared Failures**: which jobs share the same root cause, and which have unique issues.
-4. **Fix Priority**: one sentence on what to fix first and why.
-
-Do NOT repeat per-job analysis. Do NOT write code. Be brief."""
+    template = load_prompt_template("cross-job-summary")
+    if template:
+        prompt = template.format(
+            num_jobs=len(job_analyses),
+            workflow_name=workflow_name,
+            jobs_text=jobs_text,
+        )
+    else:
+        prompt = (
+            f"You are a CI/CD expert. {len(job_analyses)} jobs failed in workflow "
+            f"`{workflow_name}` (sglang project, AMD GPUs).\n\n{jobs_text}\n\n"
+            f"Write a SHORT cross-job summary (under 40 lines) with a summary table, "
+            f"common root cause, distinct vs shared failures, and fix priority."
+        )
 
     msg = client.messages.create(
         model=CLAUDE_MODEL,
@@ -750,6 +817,33 @@ def remove_agent_worktree(wt_path: Path):
     )
     if wt_path.exists():
         shutil.rmtree(wt_path, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def agent_worktree(tag: str, pr_number: int | None = None):
+    """Context manager: create an isolated worktree, optionally checkout a PR, and clean up.
+
+    Usage::
+
+        with agent_worktree("review-pr42", pr_number=42) as wt_path:
+            analysis = claude_code_analyze(prompt, work_dir=wt_path)
+    """
+    ensure_sglang_repo()
+    wt_path = create_agent_worktree(tag)
+    try:
+        if pr_number is not None:
+            pr_ref = f"pull/{pr_number}/head"
+            subprocess.run(
+                ["git", "fetch", "origin", pr_ref, "--depth", "100"],
+                cwd=wt_path, capture_output=True, timeout=120,
+            )
+            subprocess.run(
+                ["git", "checkout", "FETCH_HEAD", "--force"],
+                cwd=wt_path, capture_output=True, timeout=30,
+            )
+        yield wt_path
+    finally:
+        remove_agent_worktree(wt_path)
 
 
 def ensure_sglang_repo(ref: str = "main") -> Path:

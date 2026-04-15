@@ -10,7 +10,6 @@ to scan in 5 seconds.
 import argparse
 import json
 import os
-import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -18,22 +17,21 @@ import requests
 
 from utils import (
     CLAUDE_MODEL,
-    GATE_STEP_PATTERNS,
     REPO,
+    agent_worktree,
     claude_code_analyze,
     claude_code_available,
-    create_agent_worktree,
     create_anthropic_client,
     download_job_logs,
-    ensure_sglang_repo,
     extract_error_lines,
     get_pr_changed_files,
     get_pr_diff,
     get_run_jobs,
     get_workflow_runs_for_sha,
     gh_headers,
+    is_gate_job,
+    load_prompt_template,
     post_comment,
-    remove_agent_worktree,
 )
 
 MAX_DIFF_CHARS = 50_000
@@ -99,33 +97,9 @@ def collect_workflow_status(token: str, head_sha: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Gate job detection
-# ---------------------------------------------------------------------------
-
-_GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-|check-all", re.IGNORECASE)
-
-
 def _is_amd_workflow(name: str) -> bool:
     """Return True if the workflow name indicates an AMD CI workflow."""
     return "amd" in name.lower()
-
-
-def _is_gate_job(job: dict) -> bool:
-    """Return True if the job is a coordinator/gate job.
-
-    Detects by job name (e.g. pr-test-finish, wait-for-stage-b) or by
-    step names (e.g. 'Check all dependent job statuses').
-    """
-    if _GATE_JOB_NAME_RE.search(job.get("name", "")):
-        return True
-    failed_steps = [
-        s for s in job.get("steps", [])
-        if s.get("conclusion") == "failure"
-    ]
-    if not failed_steps:
-        return False
-    return all(GATE_STEP_PATTERNS.search(s["name"]) for s in failed_steps)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +122,7 @@ def collect_job_errors(
     if not failed_step_names:
         failed_step_names = {"(unknown)"}
 
-    if _is_gate_job(job):
+    if is_gate_job(job):
         print(f"\n  Job: {job_name} (ID: {job_id}) — gate job, skipped")
         return {
             "job_name": job_name,
@@ -246,35 +220,25 @@ def analyze_pr_correlation(
     job_names = [ja["job_name"] for ja in job_analyses]
     job_list = "\n".join(f'  - "{name}"' for name in job_names)
 
-    prompt = f"""You are a CI/CD expert. A developer submitted PR #{pr_number} to the sglang project (LLM serving framework). Some CI jobs failed. Assess whether each failure is likely caused by the PR changes or is a pre-existing / infrastructure issue.
-
-## PR Changed Files
-{files_summary}
-
-## PR Diff (may be truncated)
-```
-{diff_text}
-```
-
-## CI Failures
-{errors_text}
-
-## Instructions
-
-For EACH of these exact job names:
-{job_list}
-
-Return a JSON array with your assessment. Output ONLY the raw JSON, no markdown fences, no extra text:
-
-[
-  {{"job": "exact job name from list above", "verdict": "likely", "explanation": "one sentence"}},
-  {{"job": "exact job name from list above", "verdict": "unlikely", "explanation": "one sentence"}}
-]
-
-Rules for the "verdict" field — use EXACTLY one of these strings:
-- "likely" = the error clearly involves code paths touched by the PR
-- "possibly" = the error could be influenced by the PR but also has other explanations
-- "unlikely" = the error is in unrelated code, infrastructure, or a known flaky test"""
+    template = load_prompt_template("pr-correlation")
+    if template:
+        prompt = template.format(
+            pr_number=pr_number,
+            files_summary=files_summary,
+            diff_text=diff_text,
+            errors_text=errors_text,
+            job_list=job_list,
+        )
+    else:
+        prompt = (
+            f"You are a CI/CD expert. PR #{pr_number} to sglang has CI failures.\n\n"
+            f"## PR Changed Files\n{files_summary}\n\n"
+            f"## PR Diff\n```\n{diff_text}\n```\n\n"
+            f"## CI Failures\n{errors_text}\n\n"
+            f"For each job:\n{job_list}\n\n"
+            f"Return JSON: [{{\"job\": \"name\", \"verdict\": \"likely|possibly|unlikely\", "
+            f"\"explanation\": \"one sentence\"}}]"
+        )
 
     msg = client.messages.create(
         model=CLAUDE_MODEL,
@@ -397,15 +361,14 @@ def _format_grouped_tables(
 # ---------------------------------------------------------------------------
 
 def _check_ci_with_agent(pr_number: int, repo_path) -> str:
-    """Let the agent check PR CI status — no historical comparison."""
-    prompt = f"""This is a **PR CI Status Check** (not a CI Monitor investigation). Follow the "PR CI Status Check" section in CLAUDE.md.
-
-Check CI status for PR #{pr_number} in sgl-project/sglang. The source code is in the current directory (checked out to the PR branch). GitHub API token is in $GH_PAT.
-
-For each failed CI job, determine whether the failure is caused by this PR or is a pre-existing issue. Read the PR diff and the full source files in the workspace to correlate failures with the changed code.
-
-IMPORTANT: Do NOT perform regression bisection, search for the commit that broke main, or fetch historical workflow runs. That is the CI Monitor's job, not yours."""
-
+    """Let the agent check PR CI status (methodology defined in CLAUDE.md)."""
+    prompt = (
+        f"Task: PR CI Status Check\n"
+        f"PR: #{pr_number}\n"
+        f"Repo: sgl-project/sglang\n"
+        f"Source: current directory (checked out to PR branch)\n"
+        f"GitHub API token: $GH_PAT"
+    )
     return claude_code_analyze(
         prompt=prompt,
         work_dir=repo_path,
@@ -428,26 +391,21 @@ def check_ci_for_pr(
             print("  WARNING: --use-agent but Claude Code not found, falling back to API")
             use_agent = False
         else:
-            wt_path = None
             try:
-                ensure_sglang_repo()
-                wt_path = create_agent_worktree(f"ci-status-pr{pr_number}")
                 print(f"Checking CI for PR #{pr_number} (agent mode, worktree)...")
-                body = requester_line + _check_ci_with_agent(pr_number, wt_path)
-                body += "\n---\n*Generated by amd-bot using Claude Code CLI*\n"
+                with agent_worktree(f"ci-status-pr{pr_number}") as wt_path:
+                    body = requester_line + _check_ci_with_agent(pr_number, wt_path)
+                    body += "\n---\n*Generated by amd-bot using Claude Code CLI*\n"
 
-                if post_comment_flag:
-                    result = post_comment(token, REPO, pr_number, body)
-                    print(f"\n  Posted: {result['html_url']}")
-                    return result["html_url"]
-                print(body)
-                return body
+                    if post_comment_flag:
+                        result = post_comment(token, REPO, pr_number, body)
+                        print(f"\n  Posted: {result['html_url']}")
+                        return result["html_url"]
+                    print(body)
+                    return body
             except Exception as exc:
                 print(f"  WARNING: Agent failed ({exc}), falling back to API")
                 use_agent = False
-            finally:
-                if wt_path:
-                    remove_agent_worktree(wt_path)
 
     print(f"Checking CI for PR #{pr_number}...")
 
@@ -480,7 +438,7 @@ def check_ci_for_pr(
             (wf, job)
             for wf in failed_workflows
             for job in wf["failed_jobs"]
-            if not _is_gate_job(job)
+            if not is_gate_job(job)
         ]
         n_jobs = len(jobs_to_analyze)
         max_workers = min(n_jobs + 2, 6)

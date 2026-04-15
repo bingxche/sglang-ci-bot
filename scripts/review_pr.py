@@ -16,14 +16,13 @@ import requests
 from utils import (
     CLAUDE_MODEL,
     REPO,
+    agent_worktree,
     claude_code_analyze,
     claude_code_available,
-    create_agent_worktree,
     create_anthropic_client,
-    ensure_sglang_repo,
     gh_headers,
+    load_prompt_template,
     post_comment,
-    remove_agent_worktree,
 )
 
 MAX_DIFF_CHARS = 120000
@@ -108,40 +107,31 @@ def review_pr_with_claude(
     if review_context:
         context_section = f"\n## Additional Context\n{review_context}\n"
 
-    prompt = f"""You are an expert code reviewer for sglang, a fast serving framework for large language models. 
-The project supports NVIDIA, AMD (ROCm), NPU, and XPU backends.
-
-Review the following Pull Request carefully.
-
-## PR Information
-- **Title**: {pr_info['title']}
-- **Author**: {pr_info['user']['login']}
-- **Branch**: {pr_info['head']['ref']} -> {pr_info['base']['ref']}
-- **Description**: 
-{pr_info.get('body', 'No description provided.')}
-
-## Files Changed ({len(files)} files)
-{files_summary}
-{focus_section}{context_section}
-## Diff
-```diff
-{diff}
-```
-
-Please provide a thorough code review covering:
-
-1. **Summary**: What does this PR do? (2-3 sentences)
-2. **Code Quality**: 
-   - Any bugs, logic errors, or edge cases?
-   - Code style and readability
-   - Error handling
-3. **Performance**: Any performance concerns? Especially for serving/inference workloads.
-4. **Security**: Any security issues?
-5. **Testing**: Are the changes adequately tested? What tests should be added?
-6. **Suggestions**: Specific, actionable improvement suggestions with code examples where helpful.
-7. **Overall Assessment**: Approve / Request Changes / Comment, with reasoning.
-
-Format as clear Markdown. Be constructive and specific. Reference file names and line numbers when possible."""
+    template = load_prompt_template("pr-review-api")
+    if template:
+        prompt = template.format(
+            pr_title=pr_info['title'],
+            pr_author=pr_info['user']['login'],
+            pr_head_ref=pr_info['head']['ref'],
+            pr_base_ref=pr_info['base']['ref'],
+            pr_body=pr_info.get('body', 'No description provided.'),
+            num_files=len(files),
+            files_summary=files_summary,
+            focus_section=focus_section,
+            context_section=context_section,
+            diff=diff,
+        )
+    else:
+        prompt = (
+            f"You are an expert code reviewer for sglang (LLM serving framework, "
+            f"NVIDIA/AMD/NPU/XPU).\n\n"
+            f"## PR: {pr_info['title']} by {pr_info['user']['login']}\n\n"
+            f"## Files Changed ({len(files)} files)\n{files_summary}\n"
+            f"{focus_section}{context_section}\n"
+            f"## Diff\n```diff\n{diff}\n```\n\n"
+            f"Provide a thorough code review: Summary, Code Quality, Performance, "
+            f"Security, Testing, Suggestions, Overall Assessment."
+        )
 
     message = client.messages.create(
         model=CLAUDE_MODEL,
@@ -163,13 +153,18 @@ def review_pr_with_agent(
     finds callers of modified functions, checks test coverage, and
     explores related code.
     """
-    extras = ""
+    lines = [
+        f"Task: PR Code Review",
+        f"PR: #{pr_number}",
+        f"Repo: sgl-project/sglang",
+        f"Source: current directory (checked out to PR branch)",
+        f"GitHub API token: $GH_PAT",
+    ]
     if focus_areas:
-        extras += f"\nFocus especially on: {focus_areas}"
+        lines.append(f"Focus areas: {focus_areas}")
     if review_context:
-        extras += f"\nAdditional context: {review_context}"
-
-    prompt = f"""Review PR #{pr_number} in sgl-project/sglang. The source code is in the current directory (checked out to the PR branch). GitHub API token is in $GH_PAT.{extras}"""
+        lines.append(f"Additional context: {review_context}")
+    prompt = "\n".join(lines)
 
     return claude_code_analyze(
         prompt=prompt,
@@ -196,27 +191,14 @@ def review_pr(
             print("  WARNING: --use-agent but Claude Code not found, falling back to API")
             use_agent = False
         else:
-            wt_path = None
             try:
-                pr_ref = f"pull/{pr_number}/head"
-                ensure_sglang_repo()
-                wt_path = create_agent_worktree(f"review-pr{pr_number}")
-                # Fetch and checkout PR branch in the isolated worktree
-                import subprocess
-                subprocess.run(
-                    ["git", "fetch", "origin", pr_ref, "--depth", "100"],
-                    cwd=wt_path, capture_output=True, timeout=120,
-                )
-                subprocess.run(
-                    ["git", "checkout", "FETCH_HEAD", "--force"],
-                    cwd=wt_path, capture_output=True, timeout=30,
-                )
                 print(f"Reviewing PR #{pr_number} (agent mode, worktree)...")
-                review = review_pr_with_agent(
-                    pr_number, wt_path, focus_areas, review_context,
-                )
-                now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-                body = f"""{requester_line}## Claude Code Review
+                with agent_worktree(f"review-pr{pr_number}", pr_number=pr_number) as wt_path:
+                    review = review_pr_with_agent(
+                        pr_number, wt_path, focus_areas, review_context,
+                    )
+                    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                    body = f"""{requester_line}## Claude Code Review
 
 > PR #{pr_number} — Reviewed at {now}
 
@@ -225,18 +207,15 @@ def review_pr(
 ---
 *Generated by amd-bot using Claude Code CLI*
 """
-                if post_comment_flag:
-                    result = post_comment(token, REPO, pr_number, body)
-                    print(f"  Posted review: {result['html_url']}")
-                    return result["html_url"]
-                print(body)
-                return body
+                    if post_comment_flag:
+                        result = post_comment(token, REPO, pr_number, body)
+                        print(f"  Posted review: {result['html_url']}")
+                        return result["html_url"]
+                    print(body)
+                    return body
             except Exception as exc:
                 print(f"  WARNING: Agent failed ({exc}), falling back to API")
                 use_agent = False
-            finally:
-                if wt_path:
-                    remove_agent_worktree(wt_path)
 
     # --- Non-agent (API) path ---
     print(f"Reviewing PR #{pr_number}...")

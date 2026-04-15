@@ -34,21 +34,19 @@ from pathlib import Path
 import requests
 
 from utils import (
-    GATE_STEP_PATTERNS,
     REPO,
-    claude_code_analyze,
+    analyze_job_api,
+    analyze_job_with_agent,
     claude_code_available,
     create_agent_worktree,
     create_anthropic_client,
     create_github_issue,
     cross_job_analysis,
-    download_job_logs,
     ensure_sglang_repo,
-    extract_error_lines,
-    focused_job_analysis,
+    get_failed_jobs,
     gh_headers,
+    is_gate_job,
     post_comment,
-    prefilter_large_step_log,
     remove_agent_worktree,
     update_comment,
 )
@@ -71,26 +69,11 @@ SCHEDULE_ONLY_WORKFLOWS = {
 }
 
 SUCCESS_CONCLUSIONS = {"success"}
-SKIP_JOB_CONCLUSIONS = {"success", "skipped"}
 
 STATE_FILE = Path(__file__).parent.parent / ".state" / "ci_monitor.json"
 MAX_PARALLEL_JOBS = 3
 
 _PROCESSED_IDS_RE = re.compile(r"<!-- processed_job_ids: ([\d,]+) -->")
-_GATE_JOB_NAME_RE = re.compile(r"finish|wait-for-|check-all", re.IGNORECASE)
-
-
-def _is_gate_job(job: dict) -> bool:
-    """Return True if the job is a coordinator/gate job (e.g. pr-test-amd-finish)."""
-    if _GATE_JOB_NAME_RE.search(job.get("name", "")):
-        return True
-    failed_steps = [
-        s for s in job.get("steps", [])
-        if s.get("conclusion") == "failure"
-    ]
-    if not failed_steps:
-        return False
-    return all(GATE_STEP_PATTERNS.search(s["name"]) for s in failed_steps)
 
 
 # ---------------------------------------------------------------------------
@@ -175,22 +158,6 @@ def get_workflow_runs(
     return all_runs[:max_runs]
 
 
-def get_failed_jobs(token: str, run_id: int) -> list[dict]:
-    """Get completed non-success, non-skipped jobs for a workflow run.
-
-    Only returns jobs whose status is 'completed' so that still-running
-    jobs in an in-progress workflow are not picked up prematurely.
-    """
-    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
-    params = {"filter": "latest", "per_page": 100}
-    resp = requests.get(url, headers=gh_headers(token), params=params)
-    resp.raise_for_status()
-    jobs = resp.json().get("jobs", [])
-    return [
-        j for j in jobs
-        if j.get("status") == "completed"
-        and j.get("conclusion") not in SKIP_JOB_CONCLUSIONS
-    ]
 
 
 def get_pending_job_info(token: str, run_id: int) -> dict:
@@ -330,104 +297,6 @@ def find_or_create_daily_issue(
         token, title, body, labels=["ci-monitor"], repo=bot_repo
     )
     return issue["number"], True
-
-
-# ---------------------------------------------------------------------------
-# Single-job analysis (thread-safe)
-# ---------------------------------------------------------------------------
-
-def _analyze_job(client, token: str, job: dict, run_url: str, head_sha: str = "") -> dict:
-    """Download logs, extract errors, and run focused analysis for one job."""
-    job_name = job["name"]
-    job_id = job["id"]
-    run_id = int(run_url.rstrip("/").split("/")[-1])
-
-    failed_step_names = {
-        s["name"]
-        for s in job.get("steps", [])
-        if s.get("conclusion") not in ("success", "skipped", None)
-    }
-
-    log.info("  [%s] Downloading logs...", job_name)
-    raw_log = download_job_logs(token, job_id)
-    log.info("  [%s] Log: %s chars", job_name, f"{len(raw_log):,}")
-
-    all_errors = extract_error_lines(
-        raw_log, job.get("steps", []), run_id, job_id,
-    )
-    error_lines = [e for e in all_errors if e["source"] != "tail"]
-    log.info("  [%s] Extracted %d error signal(s)", job_name, len(error_lines))
-
-    filtered_log = prefilter_large_step_log(raw_log)
-    if len(filtered_log) < len(raw_log):
-        log.info(
-            "  [%s] Pre-filtered log: %s -> %s chars",
-            job_name, f"{len(raw_log):,}", f"{len(filtered_log):,}",
-        )
-
-    log.info("  [%s] Analyzing...", job_name)
-    analysis = focused_job_analysis(
-        client, job_name, run_url, error_lines, filtered_log,
-    )
-
-    log.info("  [%s] Done.", job_name)
-    return {
-        "run_url": run_url,
-        "job_name": job_name,
-        "job_id": job_id,
-        "head_sha": head_sha,
-        "started_at": job.get("started_at"),
-        "failed_steps": sorted(failed_step_names),
-        "analysis": analysis,
-    }
-
-
-def _analyze_job_with_agent(
-    job: dict, run_url: str, repo_path: Path, workflow_file: str = "",
-    head_sha: str = "",
-) -> dict:
-    """Invoke Claude Code agent to fully analyze a CI failure.
-
-    The agent handles everything autonomously: downloading logs via the
-    GitHub API (using ``$GH_PAT`` from the environment), parsing errors,
-    reading sglang source code, checking git history, and producing a
-    root-cause analysis.  Investigation methodology is defined in
-    ``/workspace/CLAUDE.md`` which Claude Code reads automatically.
-    """
-    job_name = job["name"]
-    job_id = job["id"]
-
-    failed_step_names = {
-        s["name"]
-        for s in job.get("steps", [])
-        if s.get("conclusion") not in ("success", "skipped", None)
-    }
-
-    prompt = f"""Analyze this CI failure in sgl-project/sglang. The source code is in the current directory. GitHub API token is in $GH_PAT.
-
-Job: {job_name}
-Run: {run_url}
-Job ID: {job_id}
-Commit SHA: {head_sha}
-Workflow file: {workflow_file}
-Log URL: https://api.github.com/repos/sgl-project/sglang/actions/jobs/{job_id}/logs"""
-
-    log.info("  [%s] Running Claude Code agent...", job_name)
-    analysis = claude_code_analyze(
-        prompt=prompt,
-        work_dir=repo_path,
-    )
-
-    log.info("  [%s] Agent analysis done.", job_name)
-    return {
-        "run_url": run_url,
-        "job_name": job_name,
-        "job_id": job_id,
-        "head_sha": head_sha,
-        "started_at": job.get("started_at"),
-        "failed_steps": sorted(failed_step_names),
-        "analysis": analysis,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -573,10 +442,10 @@ def monitor_workflow(
         if processed_job_ids:
             failed_jobs = [j for j in failed_jobs if j["id"] not in processed_job_ids]
 
-        gate_jobs = [j for j in failed_jobs if _is_gate_job(j)]
+        gate_jobs = [j for j in failed_jobs if is_gate_job(j)]
         for gj in gate_jobs:
             log.info("    Skipping gate job: %s (ID: %d)", gj["name"], gj["id"])
-        failed_jobs = [j for j in failed_jobs if not _is_gate_job(j)]
+        failed_jobs = [j for j in failed_jobs if not is_gate_job(j)]
 
         if failed_jobs:
             log.info("    %d new failed job(s) to analyze", len(failed_jobs))
@@ -610,7 +479,7 @@ def monitor_workflow(
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {
                         executor.submit(
-                            _analyze_job_with_agent, job, run_url,
+                            analyze_job_with_agent, job, run_url,
                             worktrees[job["id"]], workflow_file,
                             head_sha=sha,
                         ): job
@@ -636,7 +505,7 @@ def monitor_workflow(
             client = create_anthropic_client()
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(_analyze_job, client, token, job, run_url, head_sha=sha): job
+                    executor.submit(analyze_job_api, client, token, job, run_url, head_sha=sha): job
                     for job, run_url, sha in jobs_to_analyze
                 }
                 for future in as_completed(futures):
