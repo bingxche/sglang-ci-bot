@@ -2,7 +2,7 @@
 
 Automated CI monitoring and PR review bot for [sglang](https://github.com/sgl-project/sglang), powered by Claude via AMD LLM Gateway.
 
-All analysis runs through **Claude Code agent mode**: the agent autonomously downloads CI logs, reads sglang source code, checks git history, compares with historical runs, and produces root-cause analyses. Investigation methodology is defined in [`agent/CLAUDE.md`](agent/CLAUDE.md), which Claude Code reads automatically at runtime.
+All AI behavior — both agent mode and API mode — is defined in a single file: [`agent/CLAUDE.md`](agent/CLAUDE.md). Agent mode reads it automatically; API mode loads prompt templates from it at runtime via `load_prompt_template()`. To change any AI behavior, edit only this file.
 
 All public-facing comments are posted under the dedicated **[amd-bot](https://github.com/amd-bot)** GitHub account.
 
@@ -45,21 +45,30 @@ When a task is triggered (CI failure analysis, PR review, or CI status check), t
 
 1. Clones/updates the sglang repo to `/workspace/sglang` (shared git object store)
 2. Creates an **isolated git worktree** per agent (e.g. `/workspace/sglang-wt-{job_id}`)
-3. Copies `agent/CLAUDE.md` to `/workspace/CLAUDE.md`
-4. Runs `claude -p "<task prompt>" --dangerously-skip-permissions` with `cwd=<worktree>`
+3. For CI analysis: **checks out the exact commit** that was tested in CI (`head_sha`), so the agent reads the correct source code
+4. For PR tasks: **checks out the PR branch** in the worktree
+5. Copies `agent/CLAUDE.md` to `/workspace/CLAUDE.md`
+6. Runs `claude -p "<task prompt>" --dangerously-skip-permissions` with `cwd=<worktree>`
 
-Each agent gets its own worktree so parallel agents (e.g. analyzing multiple failed jobs simultaneously) and concurrent tasks (e.g. a PR review running alongside the cron CI monitor) cannot interfere with each other's git state. Worktrees are cleaned up automatically after analysis completes.
+### Task dispatch
 
-Claude Code automatically reads `/workspace/CLAUDE.md` and follows the investigation methodology defined there:
+Agent prompts are **data-only** — they contain a `Task:` line and metadata, but no instructions. All methodology and output format is defined in `CLAUDE.md`. The agent routes to the correct section based on the task type:
 
-- **CI failures**: Download logs, compare with recent runs (5-7 days), detect regressions, find suspicious commits via `git log`/`git show`/`git blame`, check for accuracy/performance threshold changes
-- **PR reviews**: Fetch diff via GitHub API, read full source files in workspace, find callers of modified functions, verify AMD/ROCm parity, check test coverage
+| Prompt `Task:` line | CLAUDE.md section |
+|---------------------|-------------------|
+| `Task: CI Monitor` | CI Monitor — Nightly/Cron Failure Investigation |
+| `Task: PR CI Status Check` | PR CI Status Check |
+| `Task: PR Code Review` | PR Code Review |
 
-The agent treats each invocation as atomic.
+### Agent capabilities
+
+- **CI failures**: Download logs via GitHub API, identify failed tests at the **test file + function** level, compare with recent runs, detect regressions, find suspicious commits via `git log`/`git show`/`git blame`, analyze [aiter](https://github.com/ROCm/aiter) changes via GitHub API when relevant
+- **PR reviews**: Read full source files in workspace, find callers of modified functions, verify AMD/ROCm parity, check test coverage
+- **Isolation**: Each agent gets its own worktree — parallel agents (up to 2 in agent mode) and concurrent tasks cannot interfere with each other
 
 ### Fallback to API mode
 
-If Claude Code CLI is not available, all scripts automatically fall back to API mode (single-shot Anthropic API calls via AMD LLM Gateway). API mode requires `LLM_GATEWAY_KEY` and `LLM_GATEWAY_URL` environment variables.
+If Claude Code CLI is not available, all scripts automatically fall back to API mode (single-shot Anthropic API calls via AMD LLM Gateway). API mode loads prompt templates from the `## API Mode Prompts` section of `CLAUDE.md` via `load_prompt_template()`, ensuring both modes follow the same output format. API mode requires `LLM_GATEWAY_KEY` and `LLM_GATEWAY_URL` environment variables.
 
 ### Comment footers
 
@@ -189,7 +198,7 @@ Containers are fully isolated from the host. The only host files mounted are:
 - `runner/entrypoint.sh` — read-only bind mount
 - `sglang-runner-toolcache-{i}` — Docker named volume for GitHub Actions tool cache
 
-The bot code is cloned by `entrypoint.sh` to `/tmp/bot`. The sglang repo (`/workspace/sglang`) is cloned on-demand by `ensure_sglang_repo()` in `utils.py` when agent mode is invoked. Each agent runs in an isolated git worktree (`/workspace/sglang-wt-{tag}`) created by `create_agent_worktree()`, ensuring concurrent agents cannot interfere with each other. All analysis happens entirely inside the container.
+The bot code is cloned by `entrypoint.sh` to `/tmp/bot`. The sglang repo (`/workspace/sglang`) is cloned on-demand by `ensure_sglang_repo()` in `utils.py` when agent mode is invoked. Each agent runs in an isolated git worktree (`/workspace/sglang-wt-{tag}`) created by `create_agent_worktree(tag, head_sha)`, checked out to the exact CI commit being analyzed. Concurrent agents (up to 2 in agent mode) cannot interfere with each other. All analysis happens entirely inside the container.
 
 ---
 
@@ -350,10 +359,25 @@ Or via the Actions tab: go to **Analyze CI** workflow, paste the URL, and click 
 ```
 sglang-ci-bot/
   agent/
-    CLAUDE.md               Agent instructions: ground rules, CI investigation methodology, PR review methodology
+    CLAUDE.md               Single source of truth for ALL AI behavior:
+                              - Task dispatch routing
+                              - Ground rules (read-only workspace, evidence-based, etc.)
+                              - CI Monitor methodology + output format
+                              - PR CI Status Check methodology + output format
+                              - PR Code Review methodology + output format
+                              - AITER analysis instructions (GitHub API)
+                              - API Mode prompt templates (loaded at runtime)
   scripts/
-    utils.py                Shared: GitHub API, Anthropic client, log parsing, Claude Code agent wrapper, worktree management
-    monitor_ci.py           CI failure monitor (one-shot)
+    utils.py                Shared utilities:
+                              - GitHub API helpers
+                              - Anthropic client (AMD LLM Gateway)
+                              - Log parsing and error extraction
+                              - is_gate_job(), get_failed_jobs()
+                              - analyze_job_with_agent(), analyze_job_api()
+                              - load_prompt_template() — reads CLAUDE.md API templates
+                              - Worktree management: create/remove/agent_worktree()
+                              - Claude Code CLI wrapper: claude_code_analyze()
+    monitor_ci.py           CI failure monitor (one-shot, cron-triggered)
     analyze_url.py          On-demand analysis of a run/job URL
     check_ci_for_pr.py      PR CI status checker
     review_pr.py            PR code review
@@ -368,7 +392,7 @@ sglang-ci-bot/
     comment-watcher.yml     Comment poller (cron every 5min)
   runner/
     Dockerfile              Runner image: Python 3.12, Node.js 22, Claude Code CLI, GitHub Actions runner
-    setup.sh                Multi-runner deployment
+    setup.sh                Multi-runner deployment (default 10 containers)
     entrypoint.sh           Container entrypoint (register + daemons + bot repo clone)
   .state/                   Persisted state files (gitignored)
   .secrets/                 Local secret files (gitignored): claude.env, llm_gateway_key, gh_pat
@@ -408,9 +432,14 @@ Edit `CLAUDE_MODEL` in `scripts/utils.py` (currently `claude-opus-4-6`).
 
 Set via `ANTHROPIC_MODEL` env var in `.secrets/claude.env`.
 
-### Agent behavior
+### Agent behavior and prompt templates
 
-Edit `agent/CLAUDE.md`. Changes take effect on next `git push` + container restart (for daemon) or next workflow run (for workflow-triggered tasks).
+Edit `agent/CLAUDE.md`. This is the **single source of truth** for all AI behavior:
+
+- **Agent mode sections** (CI Monitor, PR CI Status Check, PR Code Review): methodology, output format, ground rules
+- **API Mode Prompts** section: `{placeholder}` templates loaded by `load_prompt_template()` at runtime
+
+Changes take effect on next `git push` + container restart (for daemon) or next workflow run (for workflow-triggered tasks).
 
 ### Bot identity
 
