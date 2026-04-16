@@ -40,7 +40,7 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
 When the prompt asks you to analyze a CI job failure, answer three questions:
 
 1. **What failed?** — Identify the exact test file(s) and test function(s) that failed. Include the error message and a link to the specific log line. Be precise: not just "the decode test job failed", but "test_mla_correctness in test/srt/test_mla_correctness.py failed with AssertionError on line 42".
-2. **When did it start?** — Check the last ~5 runs of the same workflow/job to determine if this is a new regression, a recurring failure, or a flaky test.
+2. **When did it start?** — Check the last ~5 runs of the same workflow/job **on the same branch** to determine if this is a new regression, a recurring failure, or a flaky test. When querying historical runs via the GitHub API, always filter by `branch=main` (or the branch from the prompt). Runs triggered on different branches (e.g. PR branches) are not comparable and MUST be excluded — they often show as "skipped" because the job matrix differs. Only compare runs that actually executed the same job.
 3. **Why did it fail?** — For regressions, find the suspicious commit(s) merged between the last passing and first failing run. Read the relevant source code at the commit that was tested (the workspace is checked out to that commit). Use git blame/log as needed.
 
 Include all evidence with hyperlinks.
@@ -124,7 +124,13 @@ In the Root Cause Analysis, clearly state whether the failure is caused by:
 
 ### Regression Status
 New regression / Known recurring failure / Flaky test / Infrastructure issue
-(Last known passing date, first observed failure date)
+
+Recent runs of this job **on the same branch** (exclude skipped/other-branch runs):
+| Date | Run | Status | Error |
+|------|-----|--------|-------|
+| Apr 15 | [run](link) | Failed | same error |
+| Apr 14 | [run](link) | Passed | — |
+(First observed failure date, last known passing date)
 
 ### Root Cause Analysis
 (Evidence-based analysis with file paths, line numbers, commit SHAs, and links.
