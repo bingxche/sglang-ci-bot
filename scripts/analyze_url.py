@@ -78,7 +78,7 @@ def render_report(
     run: dict,
     job_analyses: list[dict],
     cross_summary: str = "",
-    use_agent: bool = False,
+    use_agent: bool = True,
 ) -> str:
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -145,7 +145,7 @@ def run_analysis(
     token: str,
     url: str,
     bot_repo: str | None = None,
-    use_agent: bool = False,
+    use_agent: bool = True,
 ):
     match = _RUN_URL_RE.search(url)
     if not match:
@@ -300,9 +300,11 @@ def run_analysis(
     cross = ""
     if len(job_analyses) > 1:
         try:
-            client = create_anthropic_client()
-            log.info("Cross-job analysis (%d jobs)...", len(job_analyses))
-            cross = cross_job_analysis(client, workflow_name, job_analyses)
+            log.info("Cross-job analysis (%d jobs, agent=%s)...", len(job_analyses), use_agent)
+            cross = cross_job_analysis(
+                None, workflow_name, job_analyses,
+                use_agent=use_agent, repo_path=agent_repo_path,
+            )
         except Exception:
             log.exception("Cross-job analysis failed")
 
@@ -338,9 +340,9 @@ def main():
              "If omitted, prints to stdout.",
     )
     parser.add_argument(
-        "--use-agent", action="store_true",
-        default=os.environ.get("USE_AGENT", "").lower() in ("true", "1", "yes"),
-        help="Use Claude Code agent for deeper analysis",
+        "--use-agent", action=argparse.BooleanOptionalAction,
+        default=os.environ.get("USE_AGENT", "").lower() not in ("false", "0", "no"),
+        help="Use Claude Code agent (default: enabled, use --no-use-agent to disable)",
     )
     parser.add_argument(
         "--github-token",

@@ -17,6 +17,8 @@ The prompt starts with a `Task:` line indicating which task to perform. Follow t
 - `Task: CI Monitor` → **CI Monitor — Nightly/Cron Failure Investigation**
 - `Task: PR CI Status Check` → **PR CI Status Check**
 - `Task: PR Code Review` → **PR Code Review**
+- `Task: Cross-Job Summary` → **Cross-Job Summary**
+- `Task: PR Correlation` → **PR Correlation**
 
 The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All methodology and output format instructions are in the sections below.
 
@@ -237,6 +239,72 @@ When asked to review a PR: read the diff, read the full source files for context
 ## Overall
 Approve / Request Changes / Comment — (with reasoning)
 ```
+
+---
+
+## Cross-Job Summary
+
+When asked to summarize failures across multiple jobs in a workflow, read the per-job analyses from `.ci-context/per-job-analyses.md` and produce a concise cross-job summary.
+
+You have access to the sglang source code in the current directory. Use it to verify patterns — e.g., if multiple jobs fail in tests that import the same module, check that module for recent changes.
+
+### Steps
+
+1. Read `.ci-context/per-job-analyses.md` to understand each job's failures.
+2. Identify common root causes across jobs (same test file, same error type, same module).
+3. If patterns suggest a shared root cause, use `git log`, `git blame`, or file reads to verify.
+4. Produce a summary under 40 lines.
+
+### Output format
+
+1. **Summary Table** (MUST be first): a markdown table with these columns:
+   | # | Job | Test File | Test Function | Root Cause | Type | Priority |
+   Type examples: Threshold too tight, Infra flake, Server crash, Build error, Timeout, Flaky test.
+   Priority: Critical / High / Medium / Low.
+   Always identify failures at the test file + function level, not just the job level.
+
+2. **Common Root Cause** (if any): one or two sentences. Identify which test files share the same root cause.
+3. **Distinct vs Shared Failures**: which test files share the same root cause, and which have unique issues.
+4. **Fix Priority**: one sentence on what to fix first and why.
+
+Do NOT repeat per-job analysis. Do NOT write code. Be brief.
+
+---
+
+## PR Correlation
+
+When asked to assess whether CI failures are caused by a PR's changes, analyze the PR diff, changed files, and CI errors to determine correlation.
+
+The prompt provides:
+- PR number and job list (exact job names to assess)
+- Context files in `.ci-context/`:
+  - `pr-diff.txt` — the PR diff
+  - `pr-files.txt` — list of changed files
+  - `ci-errors.md` — extracted error signals per job
+
+You have access to the sglang source code. Use it to:
+1. Read the full source files that were changed by the PR (not just the diff).
+2. Read the test files that failed to understand what they test.
+3. Trace the call chain: does the modified code affect the failing test?
+
+### Output format
+
+Output ONLY a raw JSON array. No markdown fences, no explanation text before or after:
+
+```
+[
+  {"job": "exact job name", "test_file": "test/path/test_foo.py", "test_function": "test_name", "verdict": "likely", "explanation": "one sentence"},
+  {"job": "exact job name", "test_file": "test/path/test_bar.py", "test_function": "test_other", "verdict": "unlikely", "explanation": "one sentence"}
+]
+```
+
+If a job has multiple failing test files, include one entry per test file.
+If the failure is not a test (e.g. build error), use "N/A" for test_file and test_function.
+
+Rules for "verdict":
+- "likely" = the error clearly involves code paths touched by the PR
+- "possibly" = the error could be influenced by the PR but also has other explanations
+- "unlikely" = the error is in unrelated code, infrastructure, or a known flaky test
 
 ---
 

@@ -18,11 +18,13 @@ import requests
 from utils import (
     CLAUDE_MODEL,
     REPO,
+    SGLANG_REPO_PATH,
     agent_worktree,
     claude_code_analyze,
     claude_code_available,
     create_anthropic_client,
     download_job_logs,
+    ensure_sglang_repo,
     extract_error_lines,
     get_pr_changed_files,
     get_pr_diff,
@@ -185,17 +187,37 @@ def _pick_best_error(ja: dict) -> dict | None:
 # PR correlation analysis (single LLM call, returns structured data)
 # ---------------------------------------------------------------------------
 
+def _parse_correlation_json(raw: str) -> list[dict]:
+    """Extract a JSON array from LLM/agent output, stripping markdown fences."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"  WARNING: Failed to parse correlation JSON")
+        return []
+
+
 def analyze_pr_correlation(
     client,
     pr_number: int,
     changed_files: list[dict],
     pr_diff: str,
     job_analyses: list[dict],
+    use_agent: bool = True,
+    repo_path: "Path | None" = None,
 ) -> list[dict]:
-    """Single LLM call: assess whether each failure correlates with the PR.
+    """Assess whether each CI failure correlates with the PR.
 
-    Returns a list of dicts: [{job, verdict, emoji, explanation}, ...].
-    Falls back to an empty list on parse failure.
+    When *use_agent* is True, delegates to the Claude Code agent which can
+    read sglang source code to trace call chains and verify correlation.
+    Falls back to API on agent failure.
+
+    Returns a list of dicts: [{job, verdict, explanation}, ...].
     """
     files_summary = "\n".join(
         f"- `{f['filename']}` ({f.get('status', '?')}, "
@@ -219,6 +241,39 @@ def analyze_pr_correlation(
 
     job_names = [ja["job_name"] for ja in job_analyses]
     job_list = "\n".join(f'  - "{name}"' for name in job_names)
+
+    if use_agent:
+        try:
+            work_dir = repo_path or SGLANG_REPO_PATH
+            if not work_dir.exists():
+                raise FileNotFoundError(f"Repo not found at {work_dir}")
+
+            prompt = (
+                f"Task: PR Correlation\n"
+                f"PR: #{pr_number}\n"
+                f"Job list:\n{job_list}\n"
+                f"Context files: .ci-context/pr-diff.txt, "
+                f".ci-context/pr-files.txt, .ci-context/ci-errors.md\n"
+                f"Source: current directory\n"
+                f"GitHub API token: $GH_PAT"
+            )
+            raw = claude_code_analyze(
+                prompt=prompt,
+                work_dir=work_dir,
+                context_files={
+                    "pr-diff.txt": diff_text,
+                    "pr-files.txt": files_summary,
+                    "ci-errors.md": errors_text,
+                },
+                max_turns=50,
+                timeout_secs=300,
+            )
+            return _parse_correlation_json(raw)
+        except Exception as exc:
+            print(f"  WARNING: Agent correlation failed ({exc}), falling back to API")
+
+    if client is None:
+        client = create_anthropic_client()
 
     template = load_prompt_template("pr-correlation")
     if template:
@@ -246,20 +301,7 @@ def analyze_pr_correlation(
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw = msg.content[0].text.strip()
-
-    # Strip markdown fences if present
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-        if raw.endswith("```"):
-            raw = raw[:-3]
-        raw = raw.strip()
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        print(f"  WARNING: Failed to parse correlation JSON, falling back")
-        return []
+    return _parse_correlation_json(msg.content[0].text)
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +423,7 @@ def check_ci_for_pr(
     token: str,
     pr_number: int,
     post_comment_flag: bool = True,
-    use_agent: bool = False,
+    use_agent: bool = True,
 ) -> str:
     """Check CI status for a PR: one table with errors + PR correlation."""
     comment_author = os.environ.get("COMMENT_AUTHOR", "")
@@ -405,8 +447,7 @@ def check_ci_for_pr(
                     print(body)
                     return body
             except Exception as exc:
-                print(f"  WARNING: Agent failed ({exc}), falling back to API")
-                use_agent = False
+                print(f"  WARNING: Full agent mode failed ({exc}), using hybrid approach")
 
     print(f"Checking CI for PR #{pr_number}...")
 
@@ -479,13 +520,23 @@ def check_ci_for_pr(
 
         real_jobs = [ja for ja in all_job_data if not ja.get("is_gate")]
 
-        # Phase 2: single LLM call for PR correlation
+        # Phase 2: PR correlation (agent when available, API fallback)
         correlation: list[dict] = []
         if real_jobs and pr_diff:
-            print("\n  Running PR correlation analysis (1 LLM call)...")
-            client = create_anthropic_client()
+            agent_repo = None
+            if use_agent:
+                print("\n  Running PR correlation analysis (agent)...")
+                try:
+                    agent_repo = ensure_sglang_repo()
+                except Exception:
+                    pass
+            else:
+                print("\n  Running PR correlation analysis (1 LLM call)...")
+
             correlation = analyze_pr_correlation(
-                client, pr_number, changed_files, pr_diff, real_jobs,
+                None, pr_number, changed_files, pr_diff, real_jobs,
+                use_agent=use_agent and agent_repo is not None,
+                repo_path=agent_repo,
             )
             print(f"  Got {len(correlation)} correlation verdict(s)")
 
@@ -531,7 +582,8 @@ def check_ci_for_pr(
             body += " | ".join(status_parts) + "\n\n"
 
         body += _format_grouped_tables(all_job_data, correlation)
-        body += "\n---\n*Generated by amd-bot using Claude API*\n"
+        method = "Claude Code CLI" if use_agent else "Claude API"
+        body += f"\n---\n*Generated by amd-bot using {method}*\n"
 
     if post_comment_flag:
         result = post_comment(token, REPO, pr_number, body)
@@ -551,9 +603,9 @@ def main():
         "--no-post", action="store_true", help="Print only, don't post",
     )
     parser.add_argument(
-        "--use-agent", action="store_true",
-        default=os.environ.get("USE_AGENT", "").lower() in ("true", "1", "yes"),
-        help="Use Claude Code agent for deeper analysis",
+        "--use-agent", action=argparse.BooleanOptionalAction,
+        default=os.environ.get("USE_AGENT", "").lower() not in ("false", "0", "no"),
+        help="Use Claude Code agent (default: enabled, use --no-use-agent to disable)",
     )
     parser.add_argument(
         "--github-token",

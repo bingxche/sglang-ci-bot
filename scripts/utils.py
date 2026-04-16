@@ -708,17 +708,49 @@ def focused_job_analysis(
 
 
 def cross_job_analysis(
-    client: anthropic.Anthropic,
+    client: anthropic.Anthropic | None,
     workflow_name: str,
     job_analyses: list[dict],
+    use_agent: bool = True,
+    repo_path: Path | None = None,
 ) -> str:
     """Find common patterns across multiple failed jobs — concise summary.
 
-    Prompt template is loaded from CLAUDE.md ``### cross-job-summary``.
+    When *use_agent* is True, delegates to the Claude Code agent which can
+    read sglang source code to verify patterns.  Falls back to API on failure.
     """
+    _log = logging.getLogger("ci-monitor")
+
     jobs_text = "\n\n---\n\n".join(
         f"### Job: {ja['job_name']}\n{ja['analysis']}" for ja in job_analyses
     )
+
+    if use_agent:
+        try:
+            work_dir = repo_path or SGLANG_REPO_PATH
+            if not work_dir.exists():
+                raise FileNotFoundError(f"Repo not found at {work_dir}")
+
+            prompt = (
+                f"Task: Cross-Job Summary\n"
+                f"Workflow: {workflow_name}\n"
+                f"Number of failed jobs: {len(job_analyses)}\n"
+                f"Per-job analyses: .ci-context/per-job-analyses.md\n"
+                f"Source: current directory\n"
+                f"GitHub API token: $GH_PAT"
+            )
+            return claude_code_analyze(
+                prompt=prompt,
+                work_dir=work_dir,
+                context_files={"per-job-analyses.md": jobs_text},
+                max_turns=30,
+                timeout_secs=300,
+            )
+        except Exception as exc:
+            _log.warning("Agent cross-job analysis failed (%s), falling back to API", exc)
+
+    if client is None:
+        client = create_anthropic_client()
 
     template = load_prompt_template("cross-job-summary")
     if template:

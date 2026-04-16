@@ -180,7 +180,7 @@ def review_pr(
     focus_areas: str | None = None,
     review_context: str | None = None,
     post_comment_flag: bool = True,
-    use_agent: bool = False,
+    use_agent: bool = True,
 ) -> str:
     """Main function to review a PR."""
     comment_author = os.environ.get("COMMENT_AUTHOR", "")
@@ -271,9 +271,9 @@ def main():
         help="Print review to stdout instead of posting",
     )
     parser.add_argument(
-        "--use-agent", action="store_true",
-        default=os.environ.get("USE_AGENT", "").lower() in ("true", "1", "yes"),
-        help="Use Claude Code agent for deeper review (reads full source files)",
+        "--use-agent", action=argparse.BooleanOptionalAction,
+        default=os.environ.get("USE_AGENT", "").lower() not in ("false", "0", "no"),
+        help="Use Claude Code agent (default: enabled, use --no-use-agent to disable)",
     )
     parser.add_argument(
         "--github-token",

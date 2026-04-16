@@ -308,7 +308,7 @@ def render_workflow_comment(
     job_analyses: list[dict],
     pending_info: list[dict] | None = None,
     cross_summary: str = "",
-    use_agent: bool = False,
+    use_agent: bool = True,
 ) -> str:
     """Render the full markdown comment body for a workflow.
 
@@ -403,7 +403,7 @@ def monitor_workflow(
     processed_job_ids: set[int] | None = None,
     job_name_filter: str | None = None,
     branch: str = "main",
-    use_agent: bool = False,
+    use_agent: bool = True,
     agent_repo_path: Path | None = None,
     event: str | None = None,
 ) -> tuple[list[dict], list[int], list[dict]]:
@@ -537,7 +537,8 @@ def publish_workflow_report(
     pending_info: list[dict],
     state: dict,
     gh_comments: list[dict] | None = None,
-    use_agent: bool = False,
+    use_agent: bool = True,
+    agent_repo_path: "Path | None" = None,
 ):
     """Publish or update the workflow comment in the daily issue.
 
@@ -590,9 +591,11 @@ def publish_workflow_report(
     total_pending = sum(p["count"] for p in pending_info) if pending_info else 0
     cross = ""
     if len(all_analyses) > 1:
-        client = create_anthropic_client()
-        log.info("  Cross-job analysis (%d jobs)...", len(all_analyses))
-        cross = cross_job_analysis(client, workflow_file, all_analyses)
+        log.info("  Cross-job analysis (%d jobs, agent=%s)...", len(all_analyses), use_agent)
+        cross = cross_job_analysis(
+            None, workflow_file, all_analyses,
+            use_agent=use_agent, repo_path=agent_repo_path,
+        )
 
     body = render_workflow_comment(
         workflow_file, all_analyses, pending_info, cross,
@@ -623,7 +626,7 @@ def run_oneshot(
     hours_back: int,
     branch: str,
     job_name_filter: str | None = None,
-    use_agent: bool = False,
+    use_agent: bool = True,
 ):
     """Run the CI monitor once and exit."""
     agent_repo_path = None
@@ -683,8 +686,10 @@ def run_oneshot(
             if output == "stdout":
                 cross = ""
                 if len(new_analyses) > 1:
-                    client = create_anthropic_client()
-                    cross = cross_job_analysis(client, wf, new_analyses)
+                    cross = cross_job_analysis(
+                        None, wf, new_analyses,
+                        use_agent=use_agent, repo_path=agent_repo_path,
+                    )
                 body = render_workflow_comment(
                     wf, new_analyses, pending, cross,
                     use_agent=use_agent,
@@ -697,6 +702,7 @@ def run_oneshot(
                     token, bot_repo, wf, new_analyses, pending, state,
                     gh_comments=gh_comments,
                     use_agent=use_agent,
+                    agent_repo_path=agent_repo_path,
                 )
 
             save_state(state)
@@ -748,9 +754,9 @@ def main():
         help="Only analyze runs triggered on this branch (default: main)",
     )
     parser.add_argument(
-        "--use-agent", action="store_true",
-        default=os.environ.get("USE_AGENT", "").lower() in ("true", "1", "yes"),
-        help="Use Claude Code agent for deeper analysis (reads source code, git history)",
+        "--use-agent", action=argparse.BooleanOptionalAction,
+        default=os.environ.get("USE_AGENT", "").lower() not in ("false", "0", "no"),
+        help="Use Claude Code agent (default: enabled, use --no-use-agent to disable)",
     )
     parser.add_argument(
         "--github-token",
