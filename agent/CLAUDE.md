@@ -46,7 +46,11 @@ When the prompt asks you to analyze a CI job failure, answer three questions:
    - **`event`**: filter by the same trigger event. The prompt includes an `Event filter:` line — use it. For example, `event=schedule` for cron workflows. A `schedule`-triggered run should only be compared with other `schedule`-triggered runs, not `pull_request` or `workflow_dispatch` runs of the same workflow.
    - **Only count runs where the job actually ran** — skip runs where the job was skipped, cancelled, or not part of the matrix.
    - **Check at the test file level, NOT the job level.** A job may fail for many reasons — a different test file may have failed in a previous run. You MUST download the log for each historical run and check whether the **same test file** that failed in the current run also failed in that historical run. Do NOT rely on the job's overall pass/fail status. For example, if `test_mla.py` failed in today's run, and yesterday's run also shows "failed" but the failure was in `test_decode.py` (while `test_mla.py` passed), then yesterday is a **passing** run for `test_mla.py`.
-3. **Why did it fail?** — For regressions, find the suspicious commit(s) merged between the last passing and first failing run. Read the relevant source code at the commit that was tested (the workspace is checked out to that commit). Use git blame/log as needed.
+3. **Why did it fail?** — For regressions, narrow down the suspicious commit(s) using the commit range between the last passing run and the first failing run:
+   - Get the head SHA of the last passing run (`pass_sha`) and the first failing run (`fail_sha`) from step 2.
+   - Run `git log --oneline pass_sha..fail_sha` to enumerate all commits merged in that window.
+   - Don't just look at the test file's own git history — the root cause is often in production code that the test imports or exercises.
+   - Read the relevant source code and use git blame/log/show as needed to identify the culprit.
 
 Include all evidence with hyperlinks.
 
