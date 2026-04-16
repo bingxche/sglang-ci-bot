@@ -543,6 +543,7 @@ def load_prompt_template(section_name: str) -> str | None:
 def analyze_job_with_agent(
     job: dict, run_url: str, repo_path: Path,
     workflow_file: str = "", head_sha: str = "",
+    event_filter: str = "",
 ) -> dict:
     """Invoke Claude Code agent to fully analyze a CI failure.
 
@@ -561,6 +562,7 @@ def analyze_job_with_agent(
         if s.get("conclusion") not in ("success", "skipped", None)
     }
 
+    event_line = f"Event filter: {event_filter}\n" if event_filter else ""
     prompt = (
         f"Task: CI Monitor\n"
         f"Job: {job_name}\n"
@@ -568,6 +570,7 @@ def analyze_job_with_agent(
         f"Job ID: {job_id}\n"
         f"Commit SHA: {head_sha}\n"
         f"Workflow file: {workflow_file}\n"
+        f"{event_line}"
         f"Log URL: https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs\n"
         f"Source: current directory\n"
         f"GitHub API token: $GH_PAT"

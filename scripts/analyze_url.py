@@ -241,7 +241,9 @@ def run_analysis(
                 futures = {
                     executor.submit(
                         analyze_job_with_agent, job, run_url,
-                        worktrees[job["id"]], workflow_name, head_sha=head_sha,
+                        worktrees[job["id"]], workflow_name,
+                        head_sha=head_sha,
+                        event_filter=run.get("event", ""),
                     ): job
                     for job in jobs
                 }

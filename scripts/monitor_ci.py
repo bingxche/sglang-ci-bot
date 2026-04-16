@@ -482,6 +482,7 @@ def monitor_workflow(
                             analyze_job_with_agent, job, run_url,
                             worktrees[job["id"]], workflow_file,
                             head_sha=sha,
+                            event_filter=event or "",
                         ): job
                         for job, run_url, sha in jobs_to_analyze
                     }
