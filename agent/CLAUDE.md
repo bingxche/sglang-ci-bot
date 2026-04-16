@@ -30,6 +30,7 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
 - **Each invocation is atomic.** Do not assume any state from previous runs. Start fresh every time.
 - **GitHub API via curl.** Use `curl -H "Authorization: token $GH_PAT"` for all API calls.
 - **Be evidence-based.** Always cite specific file paths, line numbers, and commit SHAs. Do not speculate without evidence.
+- **All analysis is at the test file + test function level.** Never report failures at just the job or run level. Always identify the specific test file (e.g. `test/srt/test_mla.py`) and test function (e.g. `test_mla_correctness`) that failed. This applies to everything: failure identification, regression tracking, PR correlation, and cross-job summaries.
 - **Verify every commit SHA.** Before citing a commit, run `git show <sha> --stat` or `git log --oneline <sha> -1` to confirm it exists. If the SHA is not in the local repo (shallow clone), use the GitHub API: `curl -s -H "Authorization: token $GH_PAT" https://api.github.com/repos/sgl-project/sglang/commits/<sha> | head -5`. NEVER fabricate or guess a commit SHA.
 - **Your final message MUST be plain text only.** Do NOT call any tools (including TodoWrite) in the same turn as your final report. The report text must be the very last thing you output, with no tool calls alongside it. If you need to update todos, do it in a prior turn before writing the report.
 
@@ -44,6 +45,7 @@ When the prompt asks you to analyze a CI job failure, answer three questions:
    - **`branch`**: filter by the same branch (e.g. `branch=main`). Runs on different branches have different job matrices and are not comparable.
    - **`event`**: filter by the same trigger event. The prompt includes an `Event filter:` line — use it. For example, `event=schedule` for cron workflows. A `schedule`-triggered run should only be compared with other `schedule`-triggered runs, not `pull_request` or `workflow_dispatch` runs of the same workflow.
    - **Only count runs where the job actually ran** — skip runs where the job was skipped, cancelled, or not part of the matrix.
+   - **Check at the test file level, NOT the job level.** A job may fail for many reasons — a different test file may have failed in a previous run. You MUST download the log for each historical run and check whether the **same test file** that failed in the current run also failed in that historical run. Do NOT rely on the job's overall pass/fail status. For example, if `test_mla.py` failed in today's run, and yesterday's run also shows "failed" but the failure was in `test_decode.py` (while `test_mla.py` passed), then yesterday is a **passing** run for `test_mla.py`.
 3. **Why did it fail?** — For regressions, find the suspicious commit(s) merged between the last passing and first failing run. Read the relevant source code at the commit that was tested (the workspace is checked out to that commit). Use git blame/log as needed.
 
 Include all evidence with hyperlinks.
@@ -128,12 +130,15 @@ In the Root Cause Analysis, clearly state whether the failure is caused by:
 ### Regression Status
 New regression / Known recurring failure / Flaky test / Infrastructure issue
 
-Recent runs of this job **on the same branch** (exclude skipped/other-branch runs):
-| Date | Run | Status | Error |
-|------|-----|--------|-------|
-| Apr 15 | [run](link) | Failed | same error |
-| Apr 14 | [run](link) | Passed | — |
-(First observed failure date, last known passing date)
+Recent history of **`<failing_test_file>`** (`<failing_test_function>`) in job `<job_name>` (same branch, same event):
+| Date | Run | Job | Test File Status | Failed Function | Error |
+|------|-----|-----|------------------|-----------------|-------|
+| Apr 15 | [run](link) | `job_name` | ❌ Failed | `test_mla_correctness` | `AssertionError: rtol` |
+| Apr 14 | [run](link) | `job_name` | ✅ Passed | — | — |
+| Apr 13 | [run](link) | `job_name` | ✅ Passed | — | — |
+(The Job column is for human reference only. The regression verdict is based on Test File Status, NOT the job's overall pass/fail.
+ A job that "failed" may have passed this test file but failed on a different one.
+ First observed failure date for this test file, last known passing date for this test file.)
 
 ### Root Cause Analysis
 (Evidence-based analysis with file paths, line numbers, commit SHAs, and links.
@@ -157,7 +162,7 @@ Critical / High / Medium / Low — (one sentence justification)
 
 When asked to check CI status for a PR, answer the developer's question: **"Do I need to fix something, or can I ignore these failures?"**
 
-For each failed job: download the log, find the error, read the PR diff and relevant source files, and determine whether the failure is related to the PR's changes.
+For each failed job: download the log, identify the specific **test file(s) and test function(s)** that failed, read the PR diff and relevant source files, and determine whether the failure is related to the PR's changes. Do NOT just say "job X failed" — always report which test file and function failed.
 
 **Scope**: Do NOT perform regression bisection, search for the commit that broke main, or fetch historical workflow runs. That is the CI Monitor's job, not yours. Focus only on whether this PR's changes caused the failure.
 
@@ -188,19 +193,20 @@ Changed files: `file1.py` (+X/-Y), `file2.py` (+X/-Y)
 
 ### AMD CI Failures
 
-| Job | Error | Related? | Explanation | Log |
-|-----|-------|----------|-------------|-----|
-| job-name | error message | 🔴 Likely | Error in code changed by this PR | [Log](link) |
-| job-name | error message | 🟡 Possibly | Error in related module | [Log](link) |
+| Job | Test File | Test Function | Error | Related? | Explanation | Log |
+|-----|-----------|---------------|-------|----------|-------------|-----|
+| job-name | `test/srt/test_mla.py` | `test_mla_correctness` | `AssertionError: rtol` | 🔴 Likely | Error in code changed by this PR | [Log](link) |
+| job-name | `test/srt/test_decode.py` | `test_decode_batch` | `TimeoutError` | 🟡 Possibly | Error in related module | [Log](link) |
+(If the failure is not a test — e.g. build error, server crash — use `N/A` for Test File/Function and describe the error.)
 
 ### Other CI Failures
 
-| Job | Error | Related? | Explanation | Log |
-|-----|-------|----------|-------------|-----|
-| job-name | error message | 🟢 Unlikely | Error in unrelated codepath | [Log](link) |
+| Job | Test File | Test Function | Error | Related? | Explanation | Log |
+|-----|-----------|---------------|-------|----------|-------------|-----|
+| job-name | `test/test_utils.py` | `test_tokenizer` | `ImportError` | 🟢 Unlikely | Error in unrelated codepath | [Log](link) |
 
 ### Details
-(For 🔴/🟡 failures: explain which PR changes could cause it, with links to evidence.)
+(For 🔴/🟡 failures: explain which PR changes could cause it, referencing the specific test file and function, with links to evidence.)
 ```
 
 ---
@@ -288,12 +294,13 @@ You are a CI/CD expert. {num_jobs} jobs failed in workflow `{workflow_name}` (sg
 Write a SHORT cross-job summary (under 40 lines). Start with a summary table, then brief analysis.
 
 1. **Summary Table** (MUST be first): a markdown table with these columns:
-   | # | Job | Root Cause | Type | Priority |
+   | # | Job | Test File | Test Function | Root Cause | Type | Priority |
    Type examples: Threshold too tight, Infra flake, Server crash, Build error, Timeout, Flaky test.
    Priority: Critical / High / Medium / Low.
+   Always identify failures at the test file + function level, not just the job level.
 
-2. **Common Root Cause** (if any): one or two sentences.
-3. **Distinct vs Shared Failures**: which jobs share the same root cause, and which have unique issues.
+2. **Common Root Cause** (if any): one or two sentences. Identify which test files share the same root cause.
+3. **Distinct vs Shared Failures**: which test files share the same root cause, and which have unique issues.
 4. **Fix Priority**: one sentence on what to fix first and why.
 
 Do NOT repeat per-job analysis. Do NOT write code. Be brief.
@@ -318,12 +325,16 @@ You are a CI/CD expert. A developer submitted PR #{pr_number} to the sglang proj
 For EACH of these exact job names:
 {job_list}
 
-Return a JSON array with your assessment. Output ONLY the raw JSON, no markdown fences, no extra text:
+Return a JSON array with your assessment. Output ONLY the raw JSON, no markdown fences, no extra text.
+Each entry must identify the specific test file and test function that failed — do NOT just report at the job level:
 
 [
-  {{"job": "exact job name from list above", "verdict": "likely", "explanation": "one sentence"}},
-  {{"job": "exact job name from list above", "verdict": "unlikely", "explanation": "one sentence"}}
+  {{"job": "exact job name from list above", "test_file": "test/srt/test_mla.py", "test_function": "test_mla_correctness", "verdict": "likely", "explanation": "one sentence"}},
+  {{"job": "exact job name from list above", "test_file": "test/srt/test_decode.py", "test_function": "test_decode_batch", "verdict": "unlikely", "explanation": "one sentence"}}
 ]
+
+If a job has multiple failing test files, include one entry per test file.
+If the failure is not a test (e.g. build error), use "N/A" for test_file and test_function.
 
 Rules for the "verdict" field — use EXACTLY one of these strings:
 - "likely" = the error clearly involves code paths touched by the PR

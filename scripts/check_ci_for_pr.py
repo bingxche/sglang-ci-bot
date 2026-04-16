@@ -236,8 +236,9 @@ def analyze_pr_correlation(
             f"## PR Diff\n```\n{diff_text}\n```\n\n"
             f"## CI Failures\n{errors_text}\n\n"
             f"For each job:\n{job_list}\n\n"
-            f"Return JSON: [{{\"job\": \"name\", \"verdict\": \"likely|possibly|unlikely\", "
-            f"\"explanation\": \"one sentence\"}}]"
+            f"Return JSON: [{{\"job\": \"name\", \"test_file\": \"test/path/test_foo.py\", "
+            f"\"test_function\": \"test_func_name\", \"verdict\": \"likely|possibly|unlikely\", "
+            f"\"explanation\": \"one sentence\"}}]. One entry per failing test file."
         )
 
     msg = client.messages.create(
