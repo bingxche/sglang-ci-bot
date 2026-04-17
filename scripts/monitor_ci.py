@@ -321,6 +321,12 @@ def render_workflow_comment(
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    started_ats = [ja.get("started_at") for ja in job_analyses if ja.get("started_at")]
+    run_started = (
+        min(started_ats)[:16].replace("T", " ") + " UTC"
+        if started_ats else "N/A"
+    )
+
     job_ids_csv = ",".join(str(ja["job_id"]) for ja in job_analyses)
     metadata = f"<!-- processed_job_ids: {job_ids_csv} -->"
 
@@ -333,11 +339,45 @@ def render_workflow_comment(
 
     per_job = ""
     for ja in job_analyses:
-        per_job += f"""
-<details>
-<summary><b>{ja['job_name']}</b> — failed step(s): {', '.join(ja['failed_steps']) or 'N/A'}</summary>
+        job_id = ja.get("job_id", 0)
+        run_url = ja.get("run_url", "")
+        job_log_url = (
+            f"{run_url.rstrip('/')}/job/{job_id}" if run_url and job_id else ""
+        )
 
-{ja['analysis']}
+        analysis_text = (ja.get("analysis") or "").strip()
+        stub_marker = (
+            not analysis_text
+            or len(analysis_text) < 200
+            or analysis_text.lower().startswith(
+                ("stub", "analysis failed", "agent timed out")
+            )
+        )
+
+        if stub_marker:
+            summary_suffix = " — ⚠️ analysis failed"
+            started = ja.get("started_at") or "N/A"
+            failed_steps_line = ", ".join(ja["failed_steps"]) or "N/A"
+            details_body = (
+                "**Analysis did not complete.** The per-job agent produced no "
+                "usable output (likely a timeout, log download failure, or "
+                "subprocess crash). Manual triage required.\n\n"
+                f"- **Run**: [{run_url}]({run_url})\n"
+                f"- **Job log**: [{job_log_url}]({job_log_url})\n"
+                f"- **Job ID**: `{job_id}`\n"
+                f"- **Failed step(s)**: {failed_steps_line}\n"
+                f"- **Started (UTC)**: {started[:16].replace('T', ' ') if started != 'N/A' else 'N/A'}\n"
+            )
+        else:
+            summary_suffix = ""
+            details_body = analysis_text
+
+        per_job += f"""
+<a id="job-{job_id}"></a>
+<details>
+<summary><b>{ja['job_name']}</b> — failed step(s): {', '.join(ja['failed_steps']) or 'N/A'}{summary_suffix}</summary>
+
+{details_body}
 
 </details>
 """
@@ -360,7 +400,8 @@ def render_workflow_comment(
     body = f"""{metadata}
 ## `{workflow_file}` — {len(job_analyses)} failure(s)
 
-**Scanned**: {now}
+**Run started (UTC)**: {run_started}
+**Last scanned (UTC)**: {now}
 {commits_line}"""
 
     if cross_summary:

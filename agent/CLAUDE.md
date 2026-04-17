@@ -34,6 +34,16 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
 - **Be evidence-based.** Always cite specific file paths, line numbers, and commit SHAs. Do not speculate without evidence.
 - **All analysis is at the test file + test function level.** Never report failures at just the job or run level. Always identify the specific test file (e.g. `test/srt/test_mla.py`) and test function (e.g. `test_mla_correctness`) that failed. This applies to everything: failure identification, regression tracking, PR correlation, and cross-job summaries.
 - **Verify every commit SHA.** Before citing a commit, run `git show <sha> --stat` or `git log --oneline <sha> -1` to confirm it exists. If the SHA is not in the local repo (shallow clone), use the GitHub API: `curl -s -H "Authorization: token $GH_PAT" https://api.github.com/repos/sgl-project/sglang/commits/<sha> | head -5`. NEVER fabricate or guess a commit SHA.
+- **Link hygiene (REQUIRED).** Every commit SHA, PR number, and run/job ID you reference in a report MUST be rendered as a clickable markdown link. Never print a bare SHA like `` `e991be1c` `` — render it as `` [`e991be1c`](https://github.com/ROCm/aiter/commit/e991be1c) ``. Use these URL templates:
+  - sglang commit `<sha>` → `` [`<sha>`](https://github.com/sgl-project/sglang/commit/<sha>) ``
+  - aiter commit `<sha>` → `` [`<sha>`](https://github.com/ROCm/aiter/commit/<sha>) ``
+  - sglang PR `#<num>` → `` [#<num>](https://github.com/sgl-project/sglang/pull/<num>) ``
+  - aiter PR `#<num>` → `` [#<num>](https://github.com/ROCm/aiter/pull/<num>) ``
+  - Workflow run `<run_id>` → `` [<run_id>](https://github.com/sgl-project/sglang/actions/runs/<run_id>) ``
+  - Workflow job `<job_id>` in run `<run_id>` → `` [<short label>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) ``
+  - Log line: `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>#step:<step>:<line>`
+
+  When a PR number appears inside a commit message you are citing (e.g. `Revert "fix(car): graph capture err (#2638)"`), you MUST also turn that PR number into a link to the correct repo (aiter PR if the commit is an aiter commit, sglang PR if it's an sglang commit). Never leave `#<num>` as plain text in a report.
 - **Your final message MUST be plain text only.** Do NOT call any tools (including TodoWrite) in the same turn as your final report. The report text must be the very last thing you output, with no tool calls alongside it. If you need to update todos, do it in a prior turn before writing the report.
 
 ---
@@ -117,6 +127,46 @@ In the Root Cause Analysis, clearly state whether the failure is caused by:
 - **aiter code change** — cite the aiter commit and what it changed
 - **Interaction between both** — cite both
 
+### Baseline A/B check (REQUIRED for `amd-aiter-scout.yml`)
+
+The **AMD AITER Scout** workflow calls the regular nightly and PR-test workflows but forces an aiter rebuild via `AITER_COMMIT_OVERRIDE`. Every job in a scout run has a sister job in one of the regular workflows that runs with the Dockerfile default aiter. If the same test fails in both, the failure is **pre-existing in sglang** and MUST NOT be attributed to aiter.
+
+You MUST perform this A/B check for every scout failure before writing the Root Cause Analysis or Suspicious Commits.
+
+**1. Derive the sister workflow and sister job name** from the scout job name prefix:
+
+| Scout job name | Sister workflow file | Sister job name |
+|----------------|----------------------|-----------------|
+| `call-nightly-amd / <name>` | `nightly-test-amd.yml` | `<name>` |
+| `call-nightly-amd-rocm720 / <name>` | `nightly-test-amd-rocm720.yml` | `<name>` |
+| `call-pr-test-amd / <name>` | `pr-test-amd.yml` | `<name>` |
+| `call-pr-test-amd-rocm720 / <name>` | `pr-test-amd-rocm720.yml` | `<name>` |
+
+The `<name>` may contain matrix suffixes like `(linux-mi325-1gpu-sglang, 11)` — keep it verbatim when matching sister jobs.
+
+**2. List the sister workflow's recent scheduled runs** (filter to `event=schedule` and same branch so you never pick up another scout's `workflow_call` run):
+```
+curl -s -H "Authorization: token $GH_PAT" \
+  "https://api.github.com/repos/sgl-project/sglang/actions/workflows/<sister>.yml/runs?event=schedule&branch=main&per_page=10"
+```
+
+Pick the most recent completed run whose `head_sha` is closest to (but not after) the scout's `head_sha`. Fall back to the most recent completed schedule run if nothing earlier exists.
+
+**3. Find the sister job in that run** and download its log:
+```
+curl -s -H "Authorization: token $GH_PAT" \
+  "https://api.github.com/repos/sgl-project/sglang/actions/runs/<baseline_run_id>/jobs?per_page=100"
+curl -sL -H "Authorization: token $GH_PAT" \
+  "https://api.github.com/repos/sgl-project/sglang/actions/jobs/<baseline_job_id>/logs"
+```
+
+**4. Check whether the SAME test file + test function** that failed in the scout also failed in the sister job's log. The comparison MUST be at the test file + function level, not the job's overall pass/fail.
+
+**5. Classify each scout failure**:
+- **`pre-existing (sglang)`** — same test file + function fails in the sister job's most recent scheduled run. The failure is NOT caused by the aiter override; do NOT list aiter commits as suspicious.
+- **`aiter-caused`** — test fails in the scout but passes (or doesn't appear as a failure) in the sister baseline. Investigate the aiter commit range per the AITER analysis subsection above.
+- **`unclear`** — the sister baseline is unavailable (job skipped, workflow changed, no comparable run in the last 48 h, sister job didn't reach this test, etc.). Explain why in the Failure Origin field.
+
 ### Output format
 
 ```
@@ -146,12 +196,25 @@ Recent history of **`<failing_test_file>`** (`<failing_test_function>`) in job `
  A job that "failed" may have passed this test file but failed on a different one.
  First observed failure date for this test file, last known passing date for this test file.)
 
+### Failure Origin (REQUIRED for `amd-aiter-scout.yml`, omit otherwise)
+`aiter-caused` | `pre-existing (sglang)` | `unclear` — one line per failing test.
+
+| Test File | Test Function | Origin | Baseline Run | Baseline Status |
+|-----------|---------------|--------|--------------|-----------------|
+| `test/srt/test_mla.py` | `test_mla_correctness` | `aiter-caused` | [run](link) | ✅ Passed (sister job, default aiter) |
+| `test/srt/test_lora.py` | `test_lora_logprob` | `pre-existing (sglang)` | [run](link) | ❌ Same failure in sister job |
+
+(Cite the sister workflow's latest scheduled run as the baseline, per the Baseline A/B check subsection above.
+ If Origin is `pre-existing (sglang)`, the Suspicious Commits section below MUST NOT list aiter commits.)
+
 ### Root Cause Analysis
 (Evidence-based analysis with file paths, line numbers, commit SHAs, and links.
  Read the failing test source code to understand what it checks.)
 
 ### Suspicious Commits
-(If regression — list sglang and/or aiter commits with SHA and explanation)
+(If regression — list sglang and/or aiter commits with SHA and explanation.
+ For `amd-aiter-scout.yml` runs, only list aiter commits when the Failure Origin is `aiter-caused`.
+ When the Failure Origin is `pre-existing (sglang)`, list sglang commits only.)
 - sglang `abc1234` — changed X in file Y which affects Z
 - aiter `def5678` — changed kernel K which affects attention output precision
 
@@ -250,24 +313,71 @@ You have access to the sglang source code in the current directory. Use it to ve
 
 ### Steps
 
-1. Read `.ci-context/per-job-analyses.md` to understand each job's failures.
+1. Read `.ci-context/per-job-analyses.md` to understand each job's failures. Each per-job section is headed by `### Job: <job_name>` and includes `**Job ID:** <numeric_job_id>` — memorize the `job_id` for each job; you will need it for anchor links.
 2. Identify common root causes across jobs (same test file, same error type, same module).
 3. If patterns suggest a shared root cause, use `git log`, `git blame`, or file reads to verify.
-4. Produce a summary under 40 lines.
+4. For `amd-aiter-scout.yml` summaries, extract the `Failure Origin` from each per-job analysis; if a per-job analysis is missing this field, treat it as `unclear` rather than assuming aiter caused it.
+5. Produce a summary under 60 lines.
+
+### Row reference rule (MUST follow)
+
+When referring to rows in prose, use `row 1`, `row 2`, ... (or the full job name). **NEVER** write `#1`, `#2`, etc. — GitHub auto-links `#N` to issues/PRs in the repo and produces misleading link text in the rendered comment.
+
+### Summary Table sort order (MUST follow)
+
+Sort the Summary Table rows in this order:
+1. **Priority** DESC: `Critical` → `High` → `Medium` → `Low`.
+2. For `amd-aiter-scout.yml` only — then by **Origin**: `aiter-caused` → `pre-existing (sglang)` → `unclear`. (Skip this step for non-scout workflows.)
+3. Then **Job name** ASC (alphabetical).
+
+The `#` column is the 1-based row index in this SORTED order.
+
+### Job column anchor link (MUST follow)
+
+The `Job` cell MUST be a clickable markdown link to the corresponding per-job detail block:
+```
+[<job_name>](#job-<job_id>)
+```
+where `<job_id>` is the numeric ID from the per-job analysis header. Example:
+`[call-nightly-amd / nightly-test-1-gpu-unit](#job-71716987472)`.
 
 ### Output format
 
-1. **Summary Table** (MUST be first): a markdown table with these columns:
-   | # | Job | Test File | Test Function | Root Cause | Type | Priority |
+1. **Counts** (MUST be the very first line, before the table): a one-line aggregate with totals.
+   - For `amd-aiter-scout.yml`:
+     `**Counts**: 27 failures · Origin: 20 aiter-caused · 4 pre-existing (sglang) · 3 unclear · Priority: 8 Critical · 9 High · 7 Medium · 3 Low`
+   - For other workflows (no Origin):
+     `**Counts**: 27 failures · Priority: 8 Critical · 9 High · 7 Medium · 3 Low`
+
+2. **Summary Table** (immediately after Counts): a markdown table.
+   - For `amd-aiter-scout.yml`, columns MUST be:
+     `| # | Job | Test File | Test Function | Origin | Root Cause | Type | Priority |`
+     Origin values: `aiter-caused` | `pre-existing (sglang)` | `unclear`.
+   - For all other workflows, columns are:
+     `| # | Job | Test File | Test Function | Root Cause | Type | Priority |`
    Type examples: Threshold too tight, Infra flake, Server crash, Build error, Timeout, Flaky test.
    Priority: Critical / High / Medium / Low.
+   The Job cell MUST be a `[name](#job-<job_id>)` anchor link per the rule above.
+   The Root Cause cell SHOULD cite the specific suspicious commit as a link, e.g. `aiter [\`e991be1c\`](https://github.com/ROCm/aiter/commit/e991be1c) — FlyDSL tile_m=16 removed`.
    Always identify failures at the test file + function level, not just the job level.
 
-2. **Common Root Cause** (if any): one or two sentences. Identify which test files share the same root cause.
-3. **Distinct vs Shared Failures**: which test files share the same root cause, and which have unique issues.
-4. **Fix Priority**: one sentence on what to fix first and why.
+3. **Common Root Causes** (if any): one or two sentences. Identify which test files share the same root cause. Reference rows using `row N` only.
+   - For `amd-aiter-scout.yml`: only discuss failures with `Origin = aiter-caused` here. Do NOT attribute `pre-existing (sglang)` failures to aiter.
 
-Do NOT repeat per-job analysis. Do NOT write code. Be brief.
+4. **Pre-existing sglang failures (not caused by aiter)** — this heading is REQUIRED and MUST appear for `amd-aiter-scout.yml` whenever at least one row has `Origin = pre-existing (sglang)`. List those rows and note that they are already failing in the regular (non-override) workflow runs. Omit this heading for non-scout workflows.
+
+5. **Distinct vs Shared Failures**: which test files share the same root cause, and which have unique issues. Reference rows using `row N` only.
+
+6. **Fix Priority** — MUST be a ranked table (NOT prose). Columns:
+   `| Rank | Fix | Owner | Blocks | Effort |`
+   - `Rank`: 1, 2, 3, ... in the order fixes should be attempted.
+   - `Fix`: one-line concrete action (e.g. "Bisect aiter [`b633fba..e991be1c`](https://github.com/ROCm/aiter/compare/b633fba...e991be1c) and pin scout to [`b633fba1`](https://github.com/ROCm/aiter/commit/b633fba1) as workaround").
+   - `Owner`: `aiter team` | `sglang` | `infra` | `test author` | a specific GitHub user if obvious.
+   - `Blocks`: short text — "rows 1-3, 6, 8" or "20 jobs".
+   - `Effort`: rough estimate — "1 line", "~10 lines", "2-3 days bisect", "hardware investigation".
+   For `amd-aiter-scout.yml`: rank `aiter-caused` and `pre-existing (sglang)` fixes together in this single table, using the Owner column to make the responsibility split explicit.
+
+Do NOT repeat per-job analysis. Do NOT write code. Remember the Link hygiene rule in the Ground Rules: every commit SHA, PR number, and run ID you reference MUST be a clickable markdown link.
 
 ---
 
@@ -343,8 +453,13 @@ One or two sentences: what failed and why. Reference the specific test files abo
 ### Stack Traces
 Include key error messages and stack traces verbatim (in code blocks). Only the relevant portions.
 
+### Failure Origin (include ONLY when the job name starts with `call-nightly-amd`, `call-nightly-amd-rocm720`, `call-pr-test-amd`, or `call-pr-test-amd-rocm720` — i.e. the job is an AMD AITER Scout sub-job)
+API mode cannot query the sister workflow's baseline run, so the Origin MUST be reported as `unclear`. Add this line verbatim:
+`Origin: unclear — API-mode analyzer cannot perform baseline A/B check against the sister workflow; re-run in agent mode for a definitive classification.`
+
 ### Suggested Fix Directions
 Bullet points with fix DIRECTIONS only (e.g. "pin transformers to <5.0.0"). No code.
+For AMD AITER Scout sub-jobs where Origin is `unclear`, do NOT pre-emptively recommend aiter-side fixes; the sister-workflow comparison is required first.
 
 ### Priority
 Critical / High / Medium / Low — with one sentence justification.
@@ -361,19 +476,54 @@ IMPORTANT:
 
 You are a CI/CD expert. {num_jobs} jobs failed in workflow `{workflow_name}` (sglang project, AMD GPUs).
 
+Each per-job section below includes a `**Job ID:** <numeric_id>` line — memorize it, you will need it for anchor links.
+
 {jobs_text}
 
-Write a SHORT cross-job summary (under 40 lines). Start with a summary table, then brief analysis.
+Write a SHORT cross-job summary (under 60 lines).
 
-1. **Summary Table** (MUST be first): a markdown table with these columns:
-   | # | Job | Test File | Test Function | Root Cause | Type | Priority |
+**Row reference rule**: when referencing rows in prose, use `row 1`, `row 2`, ... NEVER `#1`, `#2`, etc. — GitHub auto-links `#N` to issues in the repo and produces misleading link text.
+
+**Link hygiene rule**: every commit SHA, PR number, and run/job ID MUST be a clickable markdown link.
+- sglang commit `<sha>` → `` [`<sha>`](https://github.com/sgl-project/sglang/commit/<sha>) ``
+- aiter commit `<sha>` → `` [`<sha>`](https://github.com/ROCm/aiter/commit/<sha>) ``
+- sglang PR `#<num>` → `[#<num>](https://github.com/sgl-project/sglang/pull/<num>)`
+- aiter PR `#<num>` → `[#<num>](https://github.com/ROCm/aiter/pull/<num>)`
+- Workflow run `<run_id>` → `[<run_id>](https://github.com/sgl-project/sglang/actions/runs/<run_id>)`
+
+**Summary Table sort order**: Priority DESC (`Critical` → `High` → `Medium` → `Low`), then for `amd-aiter-scout.yml` by Origin (`aiter-caused` → `pre-existing (sglang)` → `unclear`), then Job name ASC. The `#` column reflects this sorted order.
+
+**Job column anchor rule**: the `Job` cell MUST be `[<job_name>](#job-<job_id>)` using the numeric `Job ID` shown in each per-job section above.
+
+1. **Counts** (MUST be the very first line):
+   - For `amd-aiter-scout.yml`: `**Counts**: N failures · Origin: A aiter-caused · B pre-existing (sglang) · C unclear · Priority: X Critical · Y High · Z Medium · W Low`
+   - For other workflows: `**Counts**: N failures · Priority: X Critical · Y High · Z Medium · W Low`
+
+2. **Summary Table** (immediately after Counts): a markdown table.
+   - For `amd-aiter-scout.yml`, columns MUST be:
+     `| # | Job | Test File | Test Function | Origin | Root Cause | Type | Priority |`
+     Origin values: `aiter-caused` | `pre-existing (sglang)` | `unclear`. Extract Origin from each per-job analysis's `Failure Origin` field; if missing, use `unclear`.
+   - For other workflows, columns are:
+     `| # | Job | Test File | Test Function | Root Cause | Type | Priority |`
+   The Job cell MUST be a `[name](#job-<job_id>)` anchor link. The Root Cause cell SHOULD cite suspicious commit(s) as links.
    Type examples: Threshold too tight, Infra flake, Server crash, Build error, Timeout, Flaky test.
    Priority: Critical / High / Medium / Low.
    Always identify failures at the test file + function level, not just the job level.
 
-2. **Common Root Cause** (if any): one or two sentences. Identify which test files share the same root cause.
-3. **Distinct vs Shared Failures**: which test files share the same root cause, and which have unique issues.
-4. **Fix Priority**: one sentence on what to fix first and why.
+3. **Common Root Causes**: one or two sentences. Identify which test files share the same root cause. Use `row N` references only.
+   - For `amd-aiter-scout.yml`: only discuss failures with `Origin = aiter-caused` here. Do NOT attribute `pre-existing (sglang)` failures to aiter.
+
+4. **Pre-existing sglang failures (not caused by aiter)** — REQUIRED heading for `amd-aiter-scout.yml` when at least one row has `Origin = pre-existing (sglang)`. List those rows and note they already fail in the regular non-override runs. Omit this heading for other workflows.
+
+5. **Distinct vs Shared Failures**: which test files share the same root cause, and which have unique issues. Use `row N` references only.
+
+6. **Fix Priority** — MUST be a ranked table (NOT prose). Columns:
+   `| Rank | Fix | Owner | Blocks | Effort |`
+   - `Rank`: 1, 2, 3, ...
+   - `Fix`: one-line concrete action, with any commit/PR references rendered as links per the Link hygiene rule.
+   - `Owner`: `aiter team` | `sglang` | `infra` | `test author`.
+   - `Blocks`: short text like "rows 1-3, 6, 8" or "20 jobs".
+   - `Effort`: "1 line", "~10 lines", "2-3 days bisect", etc.
 
 Do NOT repeat per-job analysis. Do NOT write code. Be brief.
 

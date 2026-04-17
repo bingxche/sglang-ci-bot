@@ -722,7 +722,10 @@ def cross_job_analysis(
     _log = logging.getLogger("ci-monitor")
 
     jobs_text = "\n\n---\n\n".join(
-        f"### Job: {ja['job_name']}\n{ja['analysis']}" for ja in job_analyses
+        f"### Job: {ja['job_name']}\n"
+        f"**Job ID:** `{ja.get('job_id', 'unknown')}`\n\n"
+        f"{ja['analysis']}"
+        for ja in job_analyses
     )
 
     if use_agent:
