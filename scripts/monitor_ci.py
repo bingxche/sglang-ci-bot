@@ -42,6 +42,7 @@ from utils import (
     create_anthropic_client,
     create_github_issue,
     cross_job_analysis,
+    delete_comment,
     ensure_sglang_repo,
     get_failed_jobs,
     gh_headers,
@@ -73,7 +74,18 @@ SUCCESS_CONCLUSIONS = {"success"}
 STATE_FILE = Path(__file__).parent.parent / ".state" / "ci_monitor.json"
 MAX_PARALLEL_JOBS = 3
 
+
+def _agent_parallel() -> int:
+    """Max parallel Claude Code agents per run. Configurable via AGENT_PARALLEL."""
+    try:
+        return max(1, int(os.environ.get("AGENT_PARALLEL", "3")))
+    except ValueError:
+        return 3
+
 _PROCESSED_IDS_RE = re.compile(r"<!-- processed_job_ids: ([\d,]+) -->")
+_PART_RE = re.compile(r"<!-- ci-monitor-part: (\d+)/(\d+) -->")
+
+COMMENT_MAX_BYTES = 60000
 
 
 # ---------------------------------------------------------------------------
@@ -107,10 +119,12 @@ def get_workflow_state(daily: dict, workflow_file: str) -> dict:
     if workflow_file not in wfs:
         wfs[workflow_file] = {
             "comment_id": None,
+            "overflow_ids": [],
             "owned": False,
             "job_analyses": [],
             "last_pending_count": 0,
         }
+    wfs[workflow_file].setdefault("overflow_ids", [])
     return wfs[workflow_file]
 
 
@@ -211,19 +225,68 @@ _DETAILS_BLOCK_RE = re.compile(
 def find_workflow_comment(
     comments: list[dict], workflow_file: str,
 ) -> dict | None:
-    """Find the most recent comment for a workflow. Returns comment dict or None."""
+    """Find the most recent main (part 1) comment for a workflow.
+
+    Returns comment dict or None. Prefers explicit part-1 markers; falls back
+    to any workflow comment (legacy single-comment format) when no part
+    markers are found.
+    """
     marker = f"## `{workflow_file}`"
+    legacy_fallback: dict | None = None
     for comment in reversed(comments):
-        if marker in comment.get("body", ""):
+        body = comment.get("body", "")
+        if marker not in body:
+            continue
+        part_m = _PART_RE.search(body)
+        if part_m is None:
+            if legacy_fallback is None:
+                legacy_fallback = comment
+            continue
+        if int(part_m.group(1)) == 1:
             return comment
-    return None
+    return legacy_fallback
+
+
+def find_workflow_comment_parts(
+    comments: list[dict], workflow_file: str,
+) -> tuple[dict | None, list[dict]]:
+    """Return (main_comment, overflow_comments) for a workflow.
+
+    - main_comment: part 1 (or legacy single comment with no part marker).
+    - overflow_comments: parts 2..N, sorted by part index.
+    """
+    marker = f"## `{workflow_file}`"
+    main: dict | None = None
+    legacy: dict | None = None
+    overflows: list[tuple[int, dict]] = []
+    for comment in comments:
+        body = comment.get("body", "")
+        if marker not in body:
+            continue
+        part_m = _PART_RE.search(body)
+        if part_m is None:
+            if legacy is None:
+                legacy = comment
+            continue
+        part_idx = int(part_m.group(1))
+        if part_idx == 1:
+            if main is None or comment["id"] < main["id"]:
+                main = comment
+        else:
+            overflows.append((part_idx, comment))
+    if main is None:
+        main = legacy
+    overflows.sort(key=lambda t: (t[0], t[1]["id"]))
+    return main, [c for _, c in overflows]
 
 
 def parse_job_analyses_from_comment(body: str) -> list[dict]:
-    """Reconstruct job_analyses list from an existing comment body.
+    """Reconstruct job_analyses list from one or more concatenated comment bodies.
 
     Parses the processed_job_ids metadata, job table rows, and <details>
     blocks to recover the structured data needed for merging with new analyses.
+    Callers with multi-part comments should concatenate their bodies before
+    invoking this helper.
     """
     ids_match = _PROCESSED_IDS_RE.search(body)
     job_ids = (
@@ -303,21 +366,69 @@ def find_or_create_daily_issue(
 # Comment rendering
 # ---------------------------------------------------------------------------
 
-def render_workflow_comment(
+def _render_per_job_block(ja: dict) -> str:
+    """Render a single <details> block for one job analysis."""
+    job_id = ja.get("job_id", 0)
+    run_url = ja.get("run_url", "")
+    job_log_url = (
+        f"{run_url.rstrip('/')}/job/{job_id}" if run_url and job_id else ""
+    )
+
+    analysis_text = (ja.get("analysis") or "").strip()
+    stub_marker = (
+        not analysis_text
+        or len(analysis_text) < 200
+        or analysis_text.lower().startswith(
+            ("stub", "analysis failed", "agent timed out")
+        )
+    )
+
+    if stub_marker:
+        summary_suffix = " — ⚠️ analysis failed"
+        started = ja.get("started_at") or "N/A"
+        failed_steps_line = ", ".join(ja["failed_steps"]) or "N/A"
+        details_body = (
+            "**Analysis did not complete.** The per-job agent produced no "
+            "usable output (likely a timeout, log download failure, or "
+            "subprocess crash). Manual triage required.\n\n"
+            f"- **Run**: [{run_url}]({run_url})\n"
+            f"- **Job log**: [{job_log_url}]({job_log_url})\n"
+            f"- **Job ID**: `{job_id}`\n"
+            f"- **Failed step(s)**: {failed_steps_line}\n"
+            f"- **Started (UTC)**: {started[:16].replace('T', ' ') if started != 'N/A' else 'N/A'}\n"
+        )
+    else:
+        summary_suffix = ""
+        details_body = analysis_text
+
+    return (
+        f"\n<a id=\"job-{job_id}\"></a>\n"
+        f"<details>\n"
+        f"<summary><b>{ja['job_name']}</b> — failed step(s): "
+        f"{', '.join(ja['failed_steps']) or 'N/A'}{summary_suffix}</summary>\n\n"
+        f"{details_body}\n\n"
+        f"</details>\n"
+    )
+
+
+def render_workflow_comment_parts(
     workflow_file: str,
     job_analyses: list[dict],
     pending_info: list[dict] | None = None,
     cross_summary: str = "",
     use_agent: bool = True,
-) -> str:
-    """Render the full markdown comment body for a workflow.
+    max_bytes: int = COMMENT_MAX_BYTES,
+) -> list[str]:
+    """Render the workflow report as a list of comment bodies.
 
-    Layout: results-first — cross-job summary at the top, then job table,
-    then per-job details in collapsible sections.
+    Produces part 1 (with header / cross summary / job table) plus zero or
+    more overflow parts carrying the remaining per-job ``<details>`` blocks.
+    Every part embeds the full ``processed_job_ids`` metadata and a
+    ``ci-monitor-part: i/N`` marker so that downstream readers
+    (dedup + adoption logic) can recognise and reassemble the full report.
 
-    Embeds ``<!-- processed_job_ids: ... -->`` as the first line so that
-    any process (daemon or cron) can extract already-processed IDs without
-    parsing the human-readable markdown.
+    Each part is kept under *max_bytes* (default ~60 KB, well below
+    GitHub's 65 536-char comment limit).
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -328,7 +439,7 @@ def render_workflow_comment(
     )
 
     job_ids_csv = ",".join(str(ja["job_id"]) for ja in job_analyses)
-    metadata = f"<!-- processed_job_ids: {job_ids_csv} -->"
+    metadata_ids = f"<!-- processed_job_ids: {job_ids_csv} -->"
 
     job_table_rows = "\n".join(
         f"| [`{ja['job_name']}`]({ja['run_url']}) "
@@ -336,51 +447,6 @@ def render_workflow_comment(
         f"| {ja.get('started_at', 'N/A')[:16] if ja.get('started_at') else 'N/A'} |"
         for ja in job_analyses
     )
-
-    per_job = ""
-    for ja in job_analyses:
-        job_id = ja.get("job_id", 0)
-        run_url = ja.get("run_url", "")
-        job_log_url = (
-            f"{run_url.rstrip('/')}/job/{job_id}" if run_url and job_id else ""
-        )
-
-        analysis_text = (ja.get("analysis") or "").strip()
-        stub_marker = (
-            not analysis_text
-            or len(analysis_text) < 200
-            or analysis_text.lower().startswith(
-                ("stub", "analysis failed", "agent timed out")
-            )
-        )
-
-        if stub_marker:
-            summary_suffix = " — ⚠️ analysis failed"
-            started = ja.get("started_at") or "N/A"
-            failed_steps_line = ", ".join(ja["failed_steps"]) or "N/A"
-            details_body = (
-                "**Analysis did not complete.** The per-job agent produced no "
-                "usable output (likely a timeout, log download failure, or "
-                "subprocess crash). Manual triage required.\n\n"
-                f"- **Run**: [{run_url}]({run_url})\n"
-                f"- **Job log**: [{job_log_url}]({job_log_url})\n"
-                f"- **Job ID**: `{job_id}`\n"
-                f"- **Failed step(s)**: {failed_steps_line}\n"
-                f"- **Started (UTC)**: {started[:16].replace('T', ' ') if started != 'N/A' else 'N/A'}\n"
-            )
-        else:
-            summary_suffix = ""
-            details_body = analysis_text
-
-        per_job += f"""
-<a id="job-{job_id}"></a>
-<details>
-<summary><b>{ja['job_name']}</b> — failed step(s): {', '.join(ja['failed_steps']) or 'N/A'}{summary_suffix}</summary>
-
-{details_body}
-
-</details>
-"""
 
     unique_shas = dict.fromkeys(
         ja.get("head_sha", "") for ja in job_analyses
@@ -397,40 +463,123 @@ def render_workflow_comment(
         if commit_parts else ""
     )
 
-    body = f"""{metadata}
-## `{workflow_file}` — {len(job_analyses)} failure(s)
+    method = "Claude Code CLI" if use_agent else "Claude API"
+    footer = f"\n---\n*Generated by amd-bot using {method} (last updated: {now})*\n"
+
+    total_pending = sum(p["count"] for p in pending_info) if pending_info else 0
+    pending_block = ""
+    if total_pending > 0:
+        run_links = ", ".join(
+            f"[run](https://github.com/{REPO}/actions/runs/{p['run_id']})"
+            for p in pending_info if p["count"] > 0
+        )
+        pending_block = (
+            f"\n---\n"
+            f"\u23f3 **{total_pending} job(s) still running** "
+            f"({run_links}) — will update when complete\n"
+        )
+
+    part1_header = f"""## `{workflow_file}` — {len(job_analyses)} failure(s)
 
 **Run started (UTC)**: {run_started}
 **Last scanned (UTC)**: {now}
 {commits_line}"""
 
     if cross_summary:
-        cleaned = re.sub(r"^#{1,3}\s+.*(?:Summary|Overview).*$", "", cross_summary, flags=re.MULTILINE).strip()
-        body += f"### Summary\n\n{cleaned}\n\n---\n\n"
+        cleaned = re.sub(
+            r"^#{1,3}\s+.*(?:Summary|Overview).*$", "",
+            cross_summary, flags=re.MULTILINE,
+        ).strip()
+        part1_header += f"### Summary\n\n{cleaned}\n\n---\n\n"
 
-    body += f"""| Job | Failed Steps | Started |
-|-----|-------------|---------|
-{job_table_rows}
+    part1_header += (
+        f"| Job | Failed Steps | Started |\n"
+        f"|-----|-------------|---------|\n"
+        f"{job_table_rows}\n\n"
+        f"### Per-Job Analysis\n"
+    )
 
-"""
+    detail_blocks = [_render_per_job_block(ja) for ja in job_analyses]
 
-    body += f"### Per-Job Analysis\n{per_job}\n"
-
-    total_pending = sum(p["count"] for p in pending_info) if pending_info else 0
-    if total_pending > 0:
-        run_links = ", ".join(
-            f"[run](https://github.com/{REPO}/actions/runs/{p['run_id']})"
-            for p in pending_info if p["count"] > 0
-        )
-        body += (
-            f"\n---\n"
-            f"\u23f3 **{total_pending} job(s) still running** "
-            f"({run_links}) — will update when complete\n"
+    def part_prefix(idx: int, total: int) -> str:
+        return (
+            f"{metadata_ids}\n"
+            f"<!-- ci-monitor-part: {idx}/{total} -->\n"
         )
 
-    method = "Claude Code CLI" if use_agent else "Claude API"
-    body += f"\n---\n*Generated by amd-bot using {method} (last updated: {now})*\n"
-    return body
+    def overflow_header(idx: int, total: int) -> str:
+        return (
+            f"## `{workflow_file}` — Per-Job Analysis "
+            f"(continued {idx}/{total})\n\n"
+        )
+
+    slack = 400
+
+    def _try_pack(total_parts: int) -> list[str] | None:
+        bodies: list[str] = []
+        remaining = list(detail_blocks)
+        for idx in range(1, total_parts + 1):
+            prefix = part_prefix(idx, total_parts)
+            header = part1_header if idx == 1 else overflow_header(idx, total_parts)
+            is_last = (idx == total_parts)
+            tail = (pending_block if is_last else "") + footer
+            budget = max_bytes - len(prefix) - len(header) - len(tail) - slack
+            if budget <= 0:
+                return None
+            body_mid = ""
+            while remaining:
+                blk = remaining[0]
+                if len(body_mid) + len(blk) > budget and body_mid:
+                    break
+                body_mid += blk
+                remaining.pop(0)
+                if not body_mid and len(blk) > budget:
+                    body_mid = blk
+                    break
+            if idx < total_parts and not body_mid:
+                return None
+            bodies.append(prefix + header + body_mid + tail)
+        if remaining:
+            return None
+        return bodies
+
+    if not detail_blocks:
+        only = (
+            part_prefix(1, 1) + part1_header
+            + "\n_(no per-job analyses yet)_\n"
+            + pending_block + footer
+        )
+        return [only]
+
+    for total in range(1, len(detail_blocks) + 2):
+        packed = _try_pack(total)
+        if packed is not None:
+            return packed
+
+    chunks = []
+    for i, blk in enumerate(detail_blocks, start=1):
+        header = part1_header if i == 1 else overflow_header(i, len(detail_blocks))
+        prefix = part_prefix(i, len(detail_blocks))
+        tail = (pending_block if i == len(detail_blocks) else "") + footer
+        chunks.append(prefix + header + blk + tail)
+    return chunks
+
+
+def render_workflow_comment(
+    workflow_file: str,
+    job_analyses: list[dict],
+    pending_info: list[dict] | None = None,
+    cross_summary: str = "",
+    use_agent: bool = True,
+) -> str:
+    """Back-compat: render all parts concatenated (used by stdout mode)."""
+    parts = render_workflow_comment_parts(
+        workflow_file, job_analyses,
+        pending_info=pending_info,
+        cross_summary=cross_summary,
+        use_agent=use_agent,
+    )
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +652,7 @@ def monitor_workflow(
 
     if jobs_to_analyze:
         max_workers = min(
-            MAX_PARALLEL_JOBS if not use_agent else 2,
+            _agent_parallel() if use_agent else MAX_PARALLEL_JOBS,
             len(jobs_to_analyze),
         )
         mode = "agent" if use_agent else "API"
@@ -581,11 +730,12 @@ def publish_workflow_report(
     use_agent: bool = True,
     agent_repo_path: "Path | None" = None,
 ):
-    """Publish or update the workflow comment in the daily issue.
+    """Publish or update the workflow comment(s) in the daily issue.
 
-    Adopts an existing comment for this workflow if one exists in the issue
-    (recovering state from the comment body), ensuring one comment per workflow
-    even across process restarts or cache eviction.
+    Supports multi-part comments: the primary (part 1) comment carries the
+    header / cross summary / job table; overflow comments (parts 2..N) carry
+    the remaining per-job ``<details>`` blocks. Existing comments are
+    adopted so a re-run patches in place instead of duplicating content.
     """
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = get_daily_state(state, date_str)
@@ -597,28 +747,41 @@ def publish_workflow_report(
 
     issue_num = daily["issue_number"]
     wf_state = get_workflow_state(daily, workflow_file)
+    wf_state.setdefault("overflow_ids", [])
 
-    # Adopt existing comment if we don't own one yet
-    if not (wf_state.get("comment_id") and wf_state.get("owned")):
-        if gh_comments is None:
-            try:
-                gh_comments = get_issue_comments(token, bot_repo, issue_num)
-            except Exception:
-                gh_comments = []
+    if gh_comments is None:
+        try:
+            gh_comments = get_issue_comments(token, bot_repo, issue_num)
+        except Exception:
+            gh_comments = []
 
-        existing_comment = find_workflow_comment(gh_comments, workflow_file)
-        if existing_comment:
-            wf_state["comment_id"] = existing_comment["id"]
-            wf_state["owned"] = True
-            recovered = parse_job_analyses_from_comment(existing_comment["body"])
-            if recovered:
-                recovered_ids = {ja["job_id"] for ja in recovered}
-                for ja in wf_state.get("job_analyses", []):
-                    if ja["job_id"] not in recovered_ids:
-                        recovered.append(ja)
-                wf_state["job_analyses"] = recovered
-                log.info("  Adopted comment %d for %s (%d existing analyses)",
-                         existing_comment["id"], workflow_file, len(recovered))
+    main_comment, overflow_comments = find_workflow_comment_parts(
+        gh_comments, workflow_file,
+    )
+
+    if main_comment is not None:
+        if wf_state.get("comment_id") != main_comment["id"]:
+            log.info(
+                "  Adopting main comment %d for %s",
+                main_comment["id"], workflow_file,
+            )
+        wf_state["comment_id"] = main_comment["id"]
+        wf_state["owned"] = True
+        combined_body = main_comment["body"] + "\n" + "\n".join(
+            c["body"] for c in overflow_comments
+        )
+        recovered = parse_job_analyses_from_comment(combined_body)
+        if recovered:
+            recovered_ids = {ja["job_id"] for ja in recovered}
+            for ja in wf_state.get("job_analyses", []):
+                if ja["job_id"] not in recovered_ids:
+                    recovered.append(ja)
+            wf_state["job_analyses"] = recovered
+            log.info(
+                "  Recovered %d analyses from %d comment part(s) for %s",
+                len(recovered), 1 + len(overflow_comments), workflow_file,
+            )
+    wf_state["overflow_ids"] = [c["id"] for c in overflow_comments]
 
     existing = wf_state.get("job_analyses", [])
     existing_ids = {ja["job_id"] for ja in existing}
@@ -638,21 +801,69 @@ def publish_workflow_report(
             use_agent=use_agent, repo_path=agent_repo_path,
         )
 
-    body = render_workflow_comment(
+    parts = render_workflow_comment_parts(
         workflow_file, all_analyses, pending_info, cross,
         use_agent=use_agent,
     )
     wf_state["last_pending_count"] = total_pending
 
-    comment_id = wf_state.get("comment_id")
-    if comment_id and wf_state.get("owned"):
-        update_comment(token, bot_repo, comment_id, body)
-        log.info("  Updated comment %d for %s", comment_id, workflow_file)
-    else:
-        resp = post_comment(token, bot_repo, issue_num, body)
-        wf_state["comment_id"] = resp["id"]
+    main_id = wf_state.get("comment_id") if wf_state.get("owned") else None
+    if main_id:
+        try:
+            update_comment(token, bot_repo, main_id, parts[0])
+            log.info("  Updated main comment %d for %s (part 1/%d)",
+                     main_id, workflow_file, len(parts))
+        except Exception as exc:
+            log.warning(
+                "  Main comment %d update failed (%s); posting fresh main",
+                main_id, exc,
+            )
+            main_id = None
+    if not main_id:
+        resp = post_comment(token, bot_repo, issue_num, parts[0])
+        main_id = resp["id"]
+        wf_state["comment_id"] = main_id
         wf_state["owned"] = True
-        log.info("  Posted comment %d for %s", resp["id"], workflow_file)
+        log.info("  Posted main comment %d for %s (part 1/%d)",
+                 main_id, workflow_file, len(parts))
+
+    old_overflow_ids = list(wf_state.get("overflow_ids") or [])
+    new_overflow_ids: list[int] = []
+    for i, body in enumerate(parts[1:], start=1):
+        if i - 1 < len(old_overflow_ids):
+            cid = old_overflow_ids[i - 1]
+            try:
+                update_comment(token, bot_repo, cid, body)
+                new_overflow_ids.append(cid)
+                log.info("  Updated overflow comment %d for %s (part %d/%d)",
+                         cid, workflow_file, i + 1, len(parts))
+                continue
+            except Exception as exc:
+                log.warning(
+                    "  Overflow comment %d update failed (%s); reposting",
+                    cid, exc,
+                )
+                try:
+                    delete_comment(token, bot_repo, cid)
+                except Exception:
+                    pass
+        resp = post_comment(token, bot_repo, issue_num, body)
+        new_overflow_ids.append(resp["id"])
+        log.info("  Posted overflow comment %d for %s (part %d/%d)",
+                 resp["id"], workflow_file, i + 1, len(parts))
+
+    for leftover_id in old_overflow_ids[len(parts) - 1:]:
+        try:
+            delete_comment(token, bot_repo, leftover_id)
+            log.info("  Deleted stale overflow comment %d for %s",
+                     leftover_id, workflow_file)
+        except Exception as exc:
+            log.warning(
+                "  Failed to delete stale overflow comment %d (%s)",
+                leftover_id, exc,
+            )
+
+    wf_state["overflow_ids"] = new_overflow_ids
 
 
 # ---------------------------------------------------------------------------

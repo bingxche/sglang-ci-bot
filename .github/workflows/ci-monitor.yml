@@ -34,12 +34,65 @@ concurrency:
   group: ci-monitor
   cancel-in-progress: false
 
+env:
+  DEFAULT_WORKFLOWS: |
+    nightly-test-amd.yml
+    nightly-test-amd-rocm720.yml
+    release-docker-amd-nightly.yml
+    release-docker-amd-rocm720-nightly.yml
+    amd-aiter-scout.yml
+    pr-test-amd.yml
+    pr-test-amd-rocm720.yml
+
 jobs:
-  monitor:
+  prepare:
     runs-on: [self-hosted, amd-internal]
     permissions:
       issues: write
       contents: read
+    outputs:
+      workflows: ${{ steps.resolve.outputs.workflows }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve workflow list
+        id: resolve
+        env:
+          INPUT_WORKFLOWS: ${{ github.event.inputs.workflows }}
+        run: |
+          WF_JSON=$(python3 -c "
+          import json, os
+          raw = os.environ.get('INPUT_WORKFLOWS') or os.environ['DEFAULT_WORKFLOWS']
+          seps = [',', '\n']
+          for s in seps:
+              raw = raw.replace(s, '\n')
+          items = [x.strip() for x in raw.split('\n') if x.strip()]
+          print(json.dumps(items))
+          ")
+          echo "workflows=$WF_JSON" >> "$GITHUB_OUTPUT"
+          echo "Resolved workflows: $WF_JSON"
+
+      - name: Ensure daily issue exists
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          BOT_REPO: ${{ github.repository }}
+        run: python scripts/ensure_daily_issue.py
+
+  monitor:
+    needs: prepare
+    runs-on: [self-hosted, amd-internal]
+    permissions:
+      issues: write
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 7
+      matrix:
+        workflow: ${{ fromJSON(needs.prepare.outputs.workflows) }}
 
     steps:
       - name: Checkout
@@ -48,34 +101,37 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Derive safe cache key
+        id: cachekey
+        run: |
+          SAFE=$(echo "${{ matrix.workflow }}" | tr '/.' '--')
+          echo "key=$SAFE" >> "$GITHUB_OUTPUT"
+
       - name: Restore state
         uses: actions/cache@v4
         with:
           path: .state/
-          key: ci-monitor-state-${{ github.run_id }}
+          key: ci-monitor-state-${{ steps.cachekey.outputs.key }}-${{ github.run_id }}
           restore-keys: |
-            ci-monitor-state-
+            ci-monitor-state-${{ steps.cachekey.outputs.key }}-
 
       - name: Reset state
         if: ${{ github.event.inputs.reset_state == 'true' }}
         run: rm -rf .state/
 
-      - name: Run CI Monitor
+      - name: Run CI Monitor for ${{ matrix.workflow }}
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
+          AGENT_PARALLEL: '3'
+          AGENT_TIMEOUT_SECS: '900'
+          AGENT_MAX_TURNS: '80'
         run: |
           HOURS="${{ github.event.inputs.hours_back || '24' }}"
           OUTPUT="${{ github.event.inputs.output_mode || 'daily-issue' }}"
-          WORKFLOWS="${{ github.event.inputs.workflows }}"
 
-          ARGS="--hours-back $HOURS --output $OUTPUT --bot-repo ${{ github.repository }}"
-
-          if [ -n "$WORKFLOWS" ]; then
-            IFS=',' read -ra WF_ARRAY <<< "$WORKFLOWS"
-            ARGS="$ARGS --workflows ${WF_ARRAY[*]}"
-          fi
+          ARGS="--hours-back $HOURS --output $OUTPUT --bot-repo ${{ github.repository }} --workflows ${{ matrix.workflow }}"
 
           USE_AGENT="${{ github.event.inputs.use_agent || 'true' }}"
           if [ "$USE_AGENT" = "true" ]; then
@@ -89,4 +145,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .state/
-          key: ci-monitor-state-${{ github.run_id }}
+          key: ci-monitor-state-${{ steps.cachekey.outputs.key }}-${{ github.run_id }}

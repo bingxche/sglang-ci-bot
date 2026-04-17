@@ -179,6 +179,15 @@ def update_comment(token: str, repo: str, comment_id: int, body: str) -> dict:
     return resp.json()
 
 
+def delete_comment(token: str, repo: str, comment_id: int) -> None:
+    """Delete a comment on an issue or PR. Silently no-op on 404."""
+    url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
+    resp = requests.delete(url, headers=gh_headers(token))
+    if resp.status_code == 404:
+        return
+    resp.raise_for_status()
+
+
 def create_github_issue(
     token: str,
     title: str,
@@ -578,7 +587,12 @@ def analyze_job_with_agent(
 
     _log = logging.getLogger("ci-monitor")
     _log.info("  [%s] Running Claude Code agent...", job_name)
-    analysis = claude_code_analyze(prompt=prompt, work_dir=repo_path)
+    analysis = claude_code_analyze(
+        prompt=prompt,
+        work_dir=repo_path,
+        max_turns=int(os.environ.get("AGENT_MAX_TURNS", "1000")),
+        timeout_secs=int(os.environ.get("AGENT_TIMEOUT_SECS", "1800")),
+    )
     _log.info("  [%s] Agent analysis done.", job_name)
 
     return {
