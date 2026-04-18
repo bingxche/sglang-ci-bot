@@ -1116,6 +1116,16 @@ def claude_code_analyze(
         )
 
     except subprocess.TimeoutExpired:
+        recovered = _recover_text_from_session_log(work_dir)
+        if recovered:
+            _agent_log.info(
+                "Claude Code timed out after %ds; recovered %d chars from session log",
+                timeout_secs, len(recovered),
+            )
+            return recovered + (
+                f"\n\n---\n*Note: agent timed out after {timeout_secs}s; "
+                f"showing the last assistant response captured before the kill.*\n"
+            )
         raise RuntimeError(f"Claude Code timed out after {timeout_secs}s")
     except FileNotFoundError:
         raise RuntimeError(

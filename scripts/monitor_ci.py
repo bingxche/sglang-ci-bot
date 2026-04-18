@@ -120,11 +120,13 @@ def get_workflow_state(daily: dict, workflow_file: str) -> dict:
         wfs[workflow_file] = {
             "comment_id": None,
             "overflow_ids": [],
+            "cross_run_comment_id": None,
             "owned": False,
             "job_analyses": [],
             "last_pending_count": 0,
         }
     wfs[workflow_file].setdefault("overflow_ids", [])
+    wfs[workflow_file].setdefault("cross_run_comment_id", None)
     return wfs[workflow_file]
 
 
@@ -583,6 +585,279 @@ def render_workflow_comment(
 
 
 # ---------------------------------------------------------------------------
+# Cross-run pattern summary (multiple scheduled runs in the lookback window)
+# ---------------------------------------------------------------------------
+
+CROSS_RUN_MARKER_TMPL = "<!-- ci-monitor-cross-run-summary: {wf} -->"
+_CROSS_RUN_RE_TMPL = r"<!-- ci-monitor-cross-run-summary: {wf} -->"
+
+
+def _runs_from_analyses(job_analyses: list[dict]) -> list[dict]:
+    """Group job analyses by their run_url and return per-run summaries."""
+    by_run: dict[str, list[dict]] = {}
+    for ja in job_analyses:
+        by_run.setdefault(ja.get("run_url", ""), []).append(ja)
+
+    runs: list[dict] = []
+    for run_url, jas in by_run.items():
+        if not run_url:
+            continue
+        run_id = run_url.rstrip("/").split("/")[-1]
+        starts = [ja.get("started_at") for ja in jas if ja.get("started_at")]
+        started = min(starts) if starts else ""
+        sha = next((ja.get("head_sha") for ja in jas if ja.get("head_sha")), "")
+        runs.append({
+            "run_url": run_url,
+            "run_id": run_id,
+            "started_at": started,
+            "head_sha": sha,
+            "job_names": sorted(ja["job_name"] for ja in jas),
+            "n_jobs": len(jas),
+        })
+    runs.sort(key=lambda r: r.get("started_at") or r.get("run_id"))
+    return runs
+
+
+def _compute_cross_run_patterns(runs: list[dict]) -> dict:
+    """Bucket job names into persistent / regression / flaky across runs."""
+    job_to_runs: dict[str, list[str]] = {}
+    for run in runs:
+        for jn in run["job_names"]:
+            job_to_runs.setdefault(jn, []).append(run["run_id"])
+
+    n_runs = len(runs)
+    latest_id = runs[-1]["run_id"] if runs else None
+    persistent: list[tuple[str, list[str]]] = []
+    regression: list[tuple[str, list[str]]] = []
+    flaky: list[tuple[str, list[str]]] = []
+
+    for jn, ids in sorted(job_to_runs.items()):
+        unique = sorted(set(ids))
+        if n_runs > 1 and len(unique) == n_runs:
+            persistent.append((jn, unique))
+        elif latest_id and unique == [latest_id]:
+            regression.append((jn, unique))
+        else:
+            flaky.append((jn, unique))
+
+    return {
+        "n_runs": n_runs,
+        "persistent": persistent,
+        "regression": regression,
+        "flaky": flaky,
+    }
+
+
+def _format_pattern_table(
+    workflow_file: str,
+    runs: list[dict],
+    patterns: dict,
+) -> str:
+    """Format the deterministic (no-LLM) portion of the cross-run summary."""
+    run_id_to_url = {r["run_id"]: r["run_url"] for r in runs}
+
+    runs_table_rows = "\n".join(
+        f"| [`{r['run_id']}`]({r['run_url']}) "
+        f"| {(r.get('started_at') or 'N/A')[:16].replace('T', ' ')} "
+        f"| {r['n_jobs']} |"
+        for r in runs
+    )
+
+    def _fmt_bucket(bucket: list[tuple[str, list[str]]]) -> str:
+        if not bucket:
+            return "_(none)_\n"
+        out = ""
+        for jn, ids in bucket:
+            run_links = ", ".join(
+                f"[`{rid[-7:]}`]({run_id_to_url.get(rid, '#')})" for rid in ids
+            )
+            out += f"- `{jn}` — in {len(ids)}/{patterns['n_runs']} runs ({run_links})\n"
+        return out
+
+    return (
+        f"### Runs analysed\n\n"
+        f"| Run | Started (UTC) | Failed jobs |\n"
+        f"|-----|--------------|-------------|\n"
+        f"{runs_table_rows}\n\n"
+        f"### Persistent failures (in every run)\n\n"
+        f"{_fmt_bucket(patterns['persistent'])}\n"
+        f"### Latest-only failures (potential regressions)\n\n"
+        f"{_fmt_bucket(patterns['regression'])}\n"
+        f"### Flaky / intermittent failures\n\n"
+        f"{_fmt_bucket(patterns['flaky'])}"
+    )
+
+
+def _render_cross_run_summary(
+    workflow_file: str,
+    runs: list[dict],
+    patterns: dict,
+    agent_text: str = "",
+    use_agent: bool = True,
+) -> str:
+    """Render the full cross-run summary comment body."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    marker = CROSS_RUN_MARKER_TMPL.format(wf=workflow_file)
+    pattern_block = _format_pattern_table(workflow_file, runs, patterns)
+    method = "Claude Code CLI" if use_agent else "Claude API"
+
+    body = (
+        f"{marker}\n"
+        f"## `{workflow_file}` — Cross-Run Pattern Summary "
+        f"({patterns['n_runs']} runs in lookback window)\n\n"
+        f"**Last scanned (UTC)**: {now}\n\n"
+    )
+    if agent_text:
+        cleaned = re.sub(
+            r"^#{1,3}\s+.*(?:Summary|Overview|Cross-Run).*$", "",
+            agent_text, flags=re.MULTILINE,
+        ).strip()
+        body += f"### Agent assessment\n\n{cleaned}\n\n---\n\n"
+    body += pattern_block
+    body += f"\n---\n*Generated by amd-bot using {method} (last updated: {now})*\n"
+    return body
+
+
+def _build_cross_run_prompt(
+    workflow_file: str,
+    runs: list[dict],
+    patterns: dict,
+    job_analyses: list[dict],
+) -> str:
+    """Compose the prompt used to ask the agent for cross-run insight."""
+    runs_lines = []
+    for r in runs:
+        runs_lines.append(
+            f"- run {r['run_id']} ({(r.get('started_at') or 'N/A')[:16]}): "
+            f"{r['n_jobs']} failed jobs, sha {r.get('head_sha', '')[:7]}"
+        )
+
+    def _bucket_text(name: str, bucket: list[tuple[str, list[str]]]) -> str:
+        if not bucket:
+            return f"{name}: (none)\n"
+        rows = "\n".join(
+            f"  - {jn} (runs: {', '.join(ids)})" for jn, ids in bucket
+        )
+        return f"{name}:\n{rows}\n"
+
+    persistent_block = _bucket_text("Persistent (every run)", patterns["persistent"])
+    regression_block = _bucket_text("Regression candidates (latest only)", patterns["regression"])
+    flaky_block = _bucket_text("Flaky / intermittent", patterns["flaky"])
+
+    return (
+        f"Task: Cross-Run Pattern Analysis\n"
+        f"Workflow: {workflow_file}\n"
+        f"Runs in window: {patterns['n_runs']}\n\n"
+        f"Per-run summary:\n" + "\n".join(runs_lines) + "\n\n"
+        f"Failure buckets (computed):\n"
+        f"{persistent_block}\n"
+        f"{regression_block}\n"
+        f"{flaky_block}\n"
+        f"Per-job analyses are available in .ci-context/per-job-analyses.md.\n\n"
+        f"Produce a CONCISE Markdown report (no top-level heading; the harness "
+        f"adds its own) covering:\n"
+        f"1. Headline: are failures dominated by persistent infrastructure issues, "
+        f"flakiness, or genuine regressions?\n"
+        f"2. Top 3 persistent failure clusters with shared root cause (cite "
+        f"job names + run ids).\n"
+        f"3. Newly-introduced regressions worth bisecting (cite suspect commits "
+        f"if visible).\n"
+        f"4. Recommended next actions (rerun / disable / open issue / bisect / "
+        f"escalate to owner).\n"
+        f"Every job/run reference must be a markdown link. Skip empty sections.\n"
+    )
+
+
+def maybe_publish_cross_run_summary(
+    token: str,
+    bot_repo: str,
+    issue_num: int,
+    workflow_file: str,
+    job_analyses: list[dict],
+    wf_state: dict,
+    gh_comments: list[dict],
+    use_agent: bool = True,
+    agent_repo_path: "Path | None" = None,
+) -> None:
+    """Post or update a cross-run pattern summary if multiple runs are present.
+
+    Triggered for SCHEDULE_ONLY workflows (e.g. pr-test-amd.yml) where the
+    24-hour lookback typically includes 2-4 scheduled runs. Skipped silently
+    when only one run's worth of analyses are available.
+    """
+    runs = _runs_from_analyses(job_analyses)
+    if len(runs) < 2:
+        return
+
+    patterns = _compute_cross_run_patterns(runs)
+
+    agent_text = ""
+    if use_agent and agent_repo_path is not None:
+        try:
+            from utils import claude_code_analyze
+            jobs_text = _format_per_job_dump(job_analyses)
+            prompt = _build_cross_run_prompt(
+                workflow_file, runs, patterns, job_analyses,
+            )
+            agent_text = claude_code_analyze(
+                prompt=prompt,
+                work_dir=agent_repo_path,
+                context_files={"per-job-analyses.md": jobs_text},
+                max_turns=int(os.environ.get("AGENT_MAX_TURNS", "150")),
+                timeout_secs=int(os.environ.get("CROSS_RUN_TIMEOUT_SECS", "600")),
+            )
+        except Exception as exc:
+            log.warning("  Cross-run agent analysis failed (%s)", exc)
+
+    body = _render_cross_run_summary(
+        workflow_file, runs, patterns, agent_text=agent_text, use_agent=use_agent,
+    )
+
+    cross_marker = CROSS_RUN_MARKER_TMPL.format(wf=workflow_file)
+    existing = next(
+        (c for c in gh_comments if cross_marker in c.get("body", "")),
+        None,
+    )
+    cached_id = wf_state.get("cross_run_comment_id")
+    target_id = (existing or {}).get("id") or cached_id
+
+    if target_id:
+        try:
+            update_comment(token, bot_repo, target_id, body)
+            wf_state["cross_run_comment_id"] = target_id
+            log.info(
+                "  Updated cross-run summary comment %d for %s (%d runs)",
+                target_id, workflow_file, patterns["n_runs"],
+            )
+            return
+        except Exception as exc:
+            log.warning(
+                "  Cross-run summary update for %d failed (%s); reposting",
+                target_id, exc,
+            )
+
+    resp = post_comment(token, bot_repo, issue_num, body)
+    wf_state["cross_run_comment_id"] = resp["id"]
+    log.info(
+        "  Posted cross-run summary comment %d for %s (%d runs)",
+        resp["id"], workflow_file, patterns["n_runs"],
+    )
+
+
+def _format_per_job_dump(job_analyses: list[dict]) -> str:
+    """Compact per-job dump used as context for cross-run analysis."""
+    out = []
+    for ja in job_analyses:
+        out.append(
+            f"### Run {ja.get('run_url', '?')}\n"
+            f"**Job**: {ja.get('job_name', '?')} (id {ja.get('job_id', '?')})\n"
+            f"**Failed steps**: {', '.join(ja.get('failed_steps', [])) or 'N/A'}\n"
+            f"**Analysis**:\n{(ja.get('analysis') or '').strip()}\n"
+        )
+    return "\n---\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # Core monitoring logic
 # ---------------------------------------------------------------------------
 
@@ -864,6 +1139,17 @@ def publish_workflow_report(
             )
 
     wf_state["overflow_ids"] = new_overflow_ids
+
+    if workflow_file in SCHEDULE_ONLY_WORKFLOWS:
+        try:
+            maybe_publish_cross_run_summary(
+                token, bot_repo, issue_num, workflow_file,
+                wf_state["job_analyses"], wf_state, gh_comments,
+                use_agent=use_agent, agent_repo_path=agent_repo_path,
+            )
+        except Exception as exc:
+            log.warning("  Cross-run summary publish failed for %s: %s",
+                        workflow_file, exc)
 
 
 # ---------------------------------------------------------------------------

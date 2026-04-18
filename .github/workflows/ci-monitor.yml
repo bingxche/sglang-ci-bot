@@ -125,8 +125,8 @@ jobs:
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
           AGENT_PARALLEL: '3'
-          AGENT_TIMEOUT_SECS: '900'
-          AGENT_MAX_TURNS: '80'
+          AGENT_TIMEOUT_SECS: '1500'
+          AGENT_MAX_TURNS: '150'
         run: |
           HOURS="${{ github.event.inputs.hours_back || '24' }}"
           OUTPUT="${{ github.event.inputs.output_mode || 'daily-issue' }}"
