@@ -724,7 +724,14 @@ def _build_cross_run_prompt(
     patterns: dict,
     job_analyses: list[dict],
 ) -> str:
-    """Compose the prompt used to ask the agent for cross-run insight."""
+    """Compose a data-only prompt for ``Task: Cross-Run Pattern Analysis``.
+
+    Methodology and output format live in ``agent/CLAUDE.md`` under
+    ``## Cross-Run Pattern Analysis``. This function only assembles the
+    deterministic data the agent needs (per-run summary + pre-computed
+    persistent / regression / flaky buckets) so the same instructions
+    don't have to be maintained in two places.
+    """
     runs_lines = []
     for r in runs:
         runs_lines.append(
@@ -740,9 +747,15 @@ def _build_cross_run_prompt(
         )
         return f"{name}:\n{rows}\n"
 
-    persistent_block = _bucket_text("Persistent (every run)", patterns["persistent"])
-    regression_block = _bucket_text("Regression candidates (latest only)", patterns["regression"])
-    flaky_block = _bucket_text("Flaky / intermittent", patterns["flaky"])
+    persistent_block = _bucket_text(
+        "Persistent (every completed run in window)", patterns["persistent"],
+    )
+    regression_block = _bucket_text(
+        "Regression candidates (latest completed run only)", patterns["regression"],
+    )
+    flaky_block = _bucket_text(
+        "Flaky / intermittent", patterns["flaky"],
+    )
 
     return (
         f"Task: Cross-Run Pattern Analysis\n"
@@ -754,17 +767,8 @@ def _build_cross_run_prompt(
         f"{regression_block}\n"
         f"{flaky_block}\n"
         f"Per-job analyses are available in .ci-context/per-job-analyses.md.\n\n"
-        f"Produce a CONCISE Markdown report (no top-level heading; the harness "
-        f"adds its own) covering:\n"
-        f"1. Headline: are failures dominated by persistent infrastructure issues, "
-        f"flakiness, or genuine regressions?\n"
-        f"2. Top 3 persistent failure clusters with shared root cause (cite "
-        f"job names + run ids).\n"
-        f"3. Newly-introduced regressions worth bisecting (cite suspect commits "
-        f"if visible).\n"
-        f"4. Recommended next actions (rerun / disable / open issue / bisect / "
-        f"escalate to owner).\n"
-        f"Every job/run reference must be a markdown link. Skip empty sections.\n"
+        f"Source: current directory\n"
+        f"GitHub API token: $GH_PAT"
     )
 
 
@@ -1250,6 +1254,23 @@ def run_oneshot(
             traceback.print_exc()
 
     save_state(state)
+
+    if (
+        output == "daily-issue"
+        and bot_repo
+        and total_reports > 0
+        and os.environ.get("BUILD_DAILY_BOARD", "true").lower() not in ("false", "0", "no")
+    ):
+        try:
+            from build_daily_status_board import build_and_publish_board
+            log.info(
+                "Building daily cross-workflow status board (%d workflow(s) updated)",
+                total_reports,
+            )
+            build_and_publish_board(token, bot_repo, use_agent=use_agent)
+        except Exception as exc:
+            log.warning("Daily status board build failed: %s", exc)
+            traceback.print_exc()
 
     gh_out = os.environ.get("GITHUB_OUTPUT")
     if gh_out:

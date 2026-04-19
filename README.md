@@ -12,7 +12,8 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 
 | Feature | Script | Trigger | What it does |
 |---------|--------|---------|--------------|
-| Cron CI Monitor | `monitor_ci.py` | Runner-1 dispatch (every 15min) | Monitors CI workflows, analyzes failures with historical comparison and regression detection, posts daily issue reports. Gate/finish jobs are automatically skipped — only actual upstream failures are analyzed. Reports use a results-first layout: summary table at top, then per-job details in collapsible sections. |
+| Cron CI Monitor | `monitor_ci.py` | Runner-1 dispatch (every 15min) | Monitors CI workflows, analyzes failures with historical comparison and regression detection, posts daily issue reports. Gate/finish jobs are automatically skipped — only actual upstream failures are analyzed. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After processing all workflows, automatically invokes `build_daily_status_board.py` when at least one workflow had failures. |
+| Daily Status Board | `build_daily_status_board.py` | Auto from `monitor_ci.py` (when `total_reports > 0`); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling top-of-issue comment. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes one comment in place, identified by `<!-- ci-monitor-daily-status-board -->` marker. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, analyzes failures, determines if failures are PR-related |
@@ -56,15 +57,32 @@ Agent prompts are **data-only** — they contain a `Task:` line and metadata, bu
 
 | Prompt `Task:` line | CLAUDE.md section |
 |---------------------|-------------------|
-| `Task: CI Monitor` | CI Monitor — Nightly/Cron Failure Investigation |
+| `Task: CI Monitor` | CI Monitor — Per-Job Failure Investigation |
+| `Task: Cross-Job Summary` | Cross-Job Summary (one workflow's many jobs, grouped by symptom cluster) |
+| `Task: Cross-Run Pattern Analysis` | Cross-Run Pattern Analysis (one workflow across multiple runs) |
+| `Task: Daily Status Board` | Daily Cross-Workflow Status Board (top-of-issue rollup across ALL workflows) |
 | `Task: PR CI Status Check` | PR CI Status Check |
 | `Task: PR Code Review` | PR Code Review |
+| `Task: PR Correlation` | PR Correlation |
 
 ### Agent capabilities
 
-- **CI failures**: Download logs via GitHub API, identify failed tests at the **test file + function** level, compare with recent runs, detect regressions, find suspicious commits via `git log`/`git show`/`git blame`, analyze [aiter](https://github.com/ROCm/aiter) changes via GitHub API when relevant
+- **CI failures**: Download logs via GitHub API, identify failed tests at the **test file + function** level, compare with recent **completed** runs, detect regressions, propose hypothesised commits with confidence labels, search for in-flight fix PRs to avoid duplication
 - **PR reviews**: Read full source files in workspace, find callers of modified functions, verify AMD/ROCm parity, check test coverage
 - **Isolation**: Each agent gets its own worktree — parallel agents (up to 2 in agent mode) and concurrent tasks cannot interfere with each other
+
+### CI report methodology principles
+
+The CI Monitor / Cross-Job Summary / Cross-Run Pattern Analysis / Daily Status Board tasks all follow the same evidence-based principles defined in CLAUDE.md's Ground Rules:
+
+- **Symptom clustering, not root cause assertion**: failures are grouped into named **Failure Clusters** (e.g. "GPU memory access fault during model warmup"). The bot does NOT claim a cluster has been "caused by commit X" without verified evidence. Causal claims live in a separate **Hypothesised Causes** section with explicit confidence labels.
+- **Confidence labels REQUIRED** for every causal claim: `FACT` / `HIGH` / `MEDIUM` / `LOW` / `SPECULATION` (default `LOW`).
+- **Disconfirming evidence surfaced**: every hypothesis lists facts that *weaken* it, not just supporting evidence.
+- **Bot does NOT assign Priority**: only states factual `Status` (e.g. "5 days persistent across 6 jobs in 3 workflows"). Engineers decide priority. The legacy `Priority: Critical/High/Medium/Low` field has been removed.
+- **In-flight fix lookup REQUIRED**: before recommending any fix, the bot searches sglang's open PRs for matching keywords. Existing PRs are linked instead of duplicated.
+- **Only completed runs count in trends**: in-progress / queued runs are excluded or labelled `[IN-FLIGHT]`. Drawing "trend dropped" / "regression candidate" conclusions from in-flight runs is forbidden.
+- **Recommendations are triage steps, not directives**: bot output uses "Suggested triage: bisect A..B; if commit X is implicated, try reverting on a branch", NOT "Revert commit X".
+- **Test-file granularity preserved**: every cluster table lists `(workflow, job, test_file, test_function)` — never collapsed to job-only level.
 
 ### Fallback to API mode
 
@@ -299,6 +317,37 @@ python scripts/monitor_ci.py --output stdout --hours-back 24
 | `--bot-repo` | none | Bot repo for posting issues (required for `daily-issue`) |
 | `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token for API access |
 
+When `--output daily-issue` is used and at least one workflow had new failures, `monitor_ci.py` automatically invokes `build_daily_status_board.build_and_publish_board()` at the end to refresh the cross-workflow status board comment. Set the env var `BUILD_DAILY_BOARD=false` to disable this auto-trigger (e.g. for one-off debug runs).
+
+### Daily Status Board
+
+Aggregates failures from all monitored workflows in today's daily issue into a single rolling top-of-issue comment.
+
+```bash
+# Agent mode (typical use — auto-triggered by monitor_ci.py)
+python scripts/build_daily_status_board.py \
+    --bot-repo bingxche/sglang-ci-bot --use-agent
+
+# API mode fallback
+python scripts/build_daily_status_board.py \
+    --bot-repo bingxche/sglang-ci-bot --no-use-agent
+
+# Rebuild the board for a specific date (e.g. yesterday)
+python scripts/build_daily_status_board.py \
+    --bot-repo bingxche/sglang-ci-bot --date 2026-04-18 --use-agent
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bot-repo` | required | Bot repo where the daily issue lives |
+| `--date` | today (UTC) | Daily issue date `YYYY-MM-DD` to rebuild for |
+| `--use-agent` | true (env `USE_AGENT`) | Use Claude Code agent; falls back to API if missing |
+| `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token |
+
+The board comment is identified by the HTML marker `<!-- ci-monitor-daily-status-board -->`. On each invocation the script PATCHes the existing board comment in place rather than appending a new one. If no daily issue exists yet for the date, or if no per-workflow comments have been posted, the script logs and exits cleanly without creating an empty board.
+
+Methodology and output format live in `agent/CLAUDE.md` under `## Daily Cross-Workflow Status Board`. The Python script is a data-only harness.
+
 ### PR Review
 
 ```bash
@@ -361,8 +410,13 @@ sglang-ci-bot/
   agent/
     CLAUDE.md               Single source of truth for ALL AI behavior:
                               - Task dispatch routing
-                              - Ground rules (read-only workspace, evidence-based, etc.)
-                              - CI Monitor methodology + output format
+                              - Ground rules (evidence-based, confidence labels, no priority,
+                                  in-flight fix lookup, completed-runs-only)
+                              - CI Monitor methodology + output format (per-job, with Failure
+                                  Cluster + Facts + Hypothesised Causes with confidence)
+                              - Cross-Job Summary (one workflow's many jobs, grouped by cluster)
+                              - Cross-Run Pattern Analysis (one workflow across runs)
+                              - Daily Cross-Workflow Status Board (top-of-issue rollup)
                               - PR CI Status Check methodology + output format
                               - PR Code Review methodology + output format
                               - AITER analysis instructions (GitHub API)
@@ -377,7 +431,18 @@ sglang-ci-bot/
                               - load_prompt_template() — reads CLAUDE.md API templates
                               - Worktree management: create/remove/agent_worktree()
                               - Claude Code CLI wrapper: claude_code_analyze()
-    monitor_ci.py           CI failure monitor (one-shot, cron-triggered)
+    monitor_ci.py           CI failure monitor (one-shot, cron-triggered);
+                              after processing all workflows, auto-invokes
+                              build_daily_status_board.build_and_publish_board()
+                              when total_reports > 0 (gated by BUILD_DAILY_BOARD env)
+    build_daily_status_board.py
+                            Cross-workflow daily status board generator.
+                              Reads per-workflow comments posted by monitor_ci.py,
+                              re-parses per-job analyses via
+                              parse_job_analyses_from_comment(), spawns the agent
+                              with Task: Daily Status Board, PATCHes a single
+                              rolling comment marked
+                              <!-- ci-monitor-daily-status-board -->.
     analyze_url.py          On-demand analysis of a run/job URL
     check_ci_for_pr.py      PR CI status checker
     review_pr.py            PR code review
@@ -409,6 +474,8 @@ sglang-ci-bot/
 | `LLM_GATEWAY_KEY` | API mode | AMD LLM Gateway subscription key |
 | `LLM_GATEWAY_URL` | API mode | AMD LLM Gateway endpoint |
 | `USE_AGENT` | All scripts | Set to `true` to enable agent mode (same as `--use-agent`) |
+| `BUILD_DAILY_BOARD` | `monitor_ci.py` | Set to `false` to skip the auto-trigger of `build_daily_status_board.py` after `monitor_ci` finishes (default: enabled) |
+| `DAILY_BOARD_TIMEOUT_SECS` | `build_daily_status_board.py` | Agent timeout for the cross-workflow synthesis (default: `1200` = 20 min) |
 | `AGENT_WORKSPACE` | Agent mode | Base directory for sglang clone (default: `/workspace`) |
 | `ANTHROPIC_API_KEY` | Agent mode | Set to `dummy` (Claude Code uses gateway, not direct API) |
 | `ANTHROPIC_BASE_URL` | Agent mode | LLM Gateway endpoint for Claude Code |
