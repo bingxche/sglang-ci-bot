@@ -217,6 +217,7 @@ def extract_processed_ids_from_comments(
 _JOB_TABLE_ROW_RE = re.compile(
     r"\| \[`(.+?)`\]\((.+?)\) \| (.+?) \| (.+?) \|"
 )
+_JOB_URL_SUFFIX_RE = re.compile(r"/job/\d+$")
 _DETAILS_BLOCK_RE = re.compile(
     r"<details>\s*<summary><b>(.+?)</b> — failed step\(s\): (.+?)</summary>"
     r"\s*\n(.*?)\n</details>",
@@ -300,8 +301,9 @@ def parse_job_analyses_from_comment(body: str) -> list[dict]:
     details_blocks = {m.group(1): m.group(3).strip() for m in _DETAILS_BLOCK_RE.finditer(body)}
 
     analyses: list[dict] = []
-    for i, (job_name, run_url, failed_steps_str, started_at) in enumerate(table_rows):
+    for i, (job_name, table_url, failed_steps_str, started_at) in enumerate(table_rows):
         job_id = job_ids[i] if i < len(job_ids) else 0
+        run_url = _JOB_URL_SUFFIX_RE.sub("", table_url)
         failed_steps = (
             [s.strip() for s in failed_steps_str.split(",")]
             if failed_steps_str.strip() != "N/A" else []
@@ -339,6 +341,37 @@ def find_daily_issue(token: str, bot_repo: str, date_str: str) -> int | None:
     return None
 
 
+DAILY_BOARD_PLACEHOLDER_START = "<!-- ci-monitor-daily-status-board:start -->"
+DAILY_BOARD_PLACEHOLDER_END = "<!-- ci-monitor-daily-status-board:end -->"
+
+
+def _initial_issue_body(date_str: str) -> str:
+    """Render the initial daily-issue body, with a board placeholder block.
+
+    The placeholder is delimited by HTML markers so that
+    ``build_daily_status_board.py`` can PATCH the rendered status board
+    in place without disturbing the rest of the body. This is what
+    lets the daily report be pinned at the very top of the issue
+    (as opposed to being posted as a comment that always lands below
+    earlier per-workflow comments).
+    """
+    wf_list = "\n".join(f"- `{w}`" for w in MONITORED_WORKFLOWS)
+    return (
+        f"{DAILY_BOARD_PLACEHOLDER_START}\n"
+        f"_The daily cross-workflow status board will appear here once the "
+        f"first scan completes (typically within 30 minutes of the first run "
+        f"finishing)._\n"
+        f"{DAILY_BOARD_PLACEHOLDER_END}\n\n"
+        f"---\n\n"
+        f"## CI Monitor — {date_str}\n\n"
+        f"**Repo**: [{REPO}](https://github.com/{REPO})\n\n"
+        f"**Monitored Workflows**:\n"
+        f"{wf_list}\n\n"
+        f"*Per-workflow failure reports are appended as comments below; "
+        f"the cross-workflow daily status board is rendered above this section.*\n"
+    )
+
+
 def find_or_create_daily_issue(
     token: str, bot_repo: str, date_str: str
 ) -> tuple[int, bool]:
@@ -348,16 +381,7 @@ def find_or_create_daily_issue(
         return existing, False
 
     title = f"[CI Monitor] Daily Report - {date_str}"
-    wf_list = "\n".join(f"- `{w}`" for w in MONITORED_WORKFLOWS)
-    body = f"""## CI Monitor — {date_str}
-
-**Repo**: [{REPO}](https://github.com/{REPO})
-
-**Monitored Workflows**:
-{wf_list}
-
-*Failure reports are appended as comments below.*
-"""
+    body = _initial_issue_body(date_str)
     issue = create_github_issue(
         token, title, body, labels=["ci-monitor"], repo=bot_repo
     )
@@ -368,6 +392,94 @@ def find_or_create_daily_issue(
 # Comment rendering
 # ---------------------------------------------------------------------------
 
+_FIRST_HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
+
+# Anchors that mark the START of the canonical report body for each
+# generated artefact. Used by ``_extract_report`` to discard LLM
+# preamble and intermediate drafts and keep only the final version,
+# even when the model writes its report multiple times in the same
+# turn (a real production failure mode — see issue 41 comment 4277196502
+# which contained 12 copies of `**Counts**:` in one cross-summary).
+_CROSS_SUMMARY_ANCHOR_RE = re.compile(r"^\*\*Counts\*\*:\s", re.MULTILINE)
+_PER_JOB_ANCHOR_RE = re.compile(r"^###\s+Commit Info\b", re.MULTILINE)
+_DAILY_BOARD_ANCHOR_RE = re.compile(r"^#\s+CI Daily Health\b", re.MULTILINE)
+
+
+def _strip_llm_preamble(text: str) -> str:
+    """Drop any LLM "thinking aloud" prose before the first markdown heading.
+
+    Used as a *fallback* by ``_extract_report`` when no anchor is found.
+    Claude Code occasionally streams reasoning text (e.g. "Now I have
+    all the evidence, let me write the report.") before the actual
+    report. Stripping anything before the first ``^#{1,6}\\s`` heading
+    removes that noise.
+
+    NOTE: This function does NOT recognise ``**Counts**:`` (bold marker,
+    not a heading) as a valid start of report. For outputs that start
+    with ``**Counts**:`` rather than a ``#`` heading, prefer
+    ``_extract_report`` with ``_CROSS_SUMMARY_ANCHOR_RE`` so the
+    Counts line + table aren't accidentally trimmed when a later
+    ``### Cluster:`` heading is found first.
+
+    Returns the input untouched when no heading is present so very
+    short outputs are preserved.
+    """
+    if not text:
+        return text
+    body = text.lstrip()
+    m = _FIRST_HEADING_RE.search(body)
+    if m and m.start() > 0:
+        return body[m.start():]
+    return body
+
+
+def _keep_last_section(text: str, anchor_re: re.Pattern) -> str:
+    """Trim text to start at the LAST occurrence of ``anchor_re``.
+
+    Discards every byte before the final anchor match — that captures
+    BOTH (a) LLM "thinking aloud" preamble and (b) intermediate drafts
+    that the model emitted before re-writing the report cleanly. The
+    final draft is always the last one, so keeping from the last anchor
+    to end-of-text yields exactly the canonical report (including
+    everything that follows the anchor: tables, cluster details,
+    suggested triage order, …).
+
+    Returns text unchanged if the anchor is absent — callers should
+    use ``_extract_report`` to combine this with a heading-based
+    fallback for malformed outputs.
+    """
+    if not text:
+        return text
+    matches = list(anchor_re.finditer(text))
+    if not matches:
+        return text
+    return text[matches[-1].start():]
+
+
+def _extract_report(text: str, anchor_re: re.Pattern) -> str:
+    """Extract the canonical report body from raw LLM output.
+
+    The combined recipe used at every render site:
+
+      1. If the anchor is present anywhere in *text*, trim to the LAST
+         occurrence. Handles both the well-behaved single-pass case
+         (anchor preceded by a small preamble) and the multi-draft
+         pathological case (anchor appearing 12+ times — see
+         ``_CROSS_SUMMARY_ANCHOR_RE`` docstring above).
+      2. If the anchor is absent (LLM didn't follow the required
+         format), fall back to ``_strip_llm_preamble`` which drops
+         everything before the first ``#`` heading.
+
+    This ordering is crucial: applying ``_strip_llm_preamble`` first
+    can lose the ``**Counts**:`` line (it's not a heading) and trim
+    past the first ``### Cluster:`` heading instead, dropping the
+    Summary table.
+    """
+    if anchor_re.search(text):
+        return _keep_last_section(text, anchor_re)
+    return _strip_llm_preamble(text)
+
+
 def _render_per_job_block(ja: dict) -> str:
     """Render a single <details> block for one job analysis."""
     job_id = ja.get("job_id", 0)
@@ -376,7 +488,8 @@ def _render_per_job_block(ja: dict) -> str:
         f"{run_url.rstrip('/')}/job/{job_id}" if run_url and job_id else ""
     )
 
-    analysis_text = (ja.get("analysis") or "").strip()
+    raw_analysis = (ja.get("analysis") or "").strip()
+    analysis_text = _extract_report(raw_analysis, _PER_JOB_ANCHOR_RE)
     stub_marker = (
         not analysis_text
         or len(analysis_text) < 200
@@ -443,8 +556,15 @@ def render_workflow_comment_parts(
     job_ids_csv = ",".join(str(ja["job_id"]) for ja in job_analyses)
     metadata_ids = f"<!-- processed_job_ids: {job_ids_csv} -->"
 
+    def _job_link(ja: dict) -> str:
+        run_url = (ja.get("run_url") or "").rstrip("/")
+        job_id = ja.get("job_id") or 0
+        if run_url and job_id:
+            return f"{run_url}/job/{job_id}"
+        return run_url
+
     job_table_rows = "\n".join(
-        f"| [`{ja['job_name']}`]({ja['run_url']}) "
+        f"| [`{ja['job_name']}`]({_job_link(ja)}) "
         f"| {', '.join(ja['failed_steps']) or 'N/A'} "
         f"| {ja.get('started_at', 'N/A')[:16] if ja.get('started_at') else 'N/A'} |"
         for ja in job_analyses
@@ -488,9 +608,10 @@ def render_workflow_comment_parts(
 {commits_line}"""
 
     if cross_summary:
+        extracted = _extract_report(cross_summary, _CROSS_SUMMARY_ANCHOR_RE)
         cleaned = re.sub(
             r"^#{1,3}\s+.*(?:Summary|Overview).*$", "",
-            cross_summary, flags=re.MULTILINE,
+            extracted, flags=re.MULTILINE,
         ).strip()
         part1_header += f"### Summary\n\n{cleaned}\n\n---\n\n"
 
@@ -708,9 +829,15 @@ def _render_cross_run_summary(
         f"**Last scanned (UTC)**: {now}\n\n"
     )
     if agent_text:
+        # Cross-Run Pattern Analysis output has no fixed anchor (starts
+        # with a free-form "headline sentence" per CLAUDE.md), so use
+        # _strip_llm_preamble directly. If the LLM ever drafts the report
+        # multiple times here too, we'd need an anchor; for now, only the
+        # plain preamble strip applies.
+        stripped = _strip_llm_preamble(agent_text)
         cleaned = re.sub(
             r"^#{1,3}\s+.*(?:Summary|Overview|Cross-Run).*$", "",
-            agent_text, flags=re.MULTILINE,
+            stripped, flags=re.MULTILINE,
         ).strip()
         body += f"### Agent assessment\n\n{cleaned}\n\n---\n\n"
     body += pattern_block

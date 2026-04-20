@@ -47,6 +47,16 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
 
   When a PR number appears inside a commit message you are citing (e.g. `Revert "fix(car): graph capture err (#2638)"`), you MUST also turn that PR number into a link to the correct repo (aiter PR if the commit is an aiter commit, sglang PR if it's an sglang commit). Never leave `#<num>` as plain text in a report.
 - **Your final message MUST be plain text only.** Do NOT call any tools (including TodoWrite) in the same turn as your final report. The report text must be the very last thing you output, with no tool calls alongside it. If you need to update todos, do it in a prior turn before writing the report.
+- **Your report MUST start directly with its first heading or `**Counts**:` line — no preamble.** Do NOT prefix the report with "thinking aloud" prose like "Now I have all the data, let me compose the final report." or "Let me extract the failure clusters first." Such prose belongs in earlier turns (or nowhere at all). The harness will programmatically strip everything before the first markdown heading, so any preamble you emit is wasted tokens AND risks corrupting the rendered output if the strip fails. Concrete examples of the required first line per report type:
+  - Per-job CI Monitor → `### Commit Info`
+  - Cross-Job Summary → `**Counts**: <n> failures · <k> clusters …`
+  - Cross-Run Pattern Analysis → `<headline sentence>` (no heading required since the harness adds its own)
+  - Daily Status Board → `# CI Daily Health — <YYYY-MM-DD>`
+- **Emit the report EXACTLY ONCE — never include drafts, intermediate versions, or "let me recount" rewrites.** Real failure mode observed in production: in a single final turn the model wrote `**Counts**: 10 failures · 7 clusters` followed by a 11-row Summary Table, then said "Let me recount more carefully" and re-wrote the same Counts line + table 4 more times before settling on the final version. ALL of those drafts were streamed verbatim into the GitHub comment, producing 12 copies of `**Counts**:` in one workflow report. The harness now defends against this by anchoring on the LAST occurrence of the canonical first-line marker (`**Counts**:` for cross-summary, `### Commit Info` for per-job, `# CI Daily Health` for the daily board) and discarding everything before it — but the right thing is to never emit the drafts in the first place. **Concrete rules**:
+  - When you finish drafting and decide to "write it cleanly", stop and rewrite ONCE. Do not keep the prior draft in the same response.
+  - Phrases like "Let me recount", "Now I'll write the final output", "Let me write it cleanly", "Now let me write the complete formatted report" are FORBIDDEN markers that you are about to duplicate work — when you feel the urge to type them, delete what you have so far and start over with the final version only.
+  - If you must reason about counts/clusters before producing the table, do that reasoning silently (in your head) — never as visible output prose mixed with tables.
+  - The canonical first-line marker (`**Counts**:`, `### Commit Info`, `# CI Daily Health`) MUST appear EXACTLY ONCE in your final response.
 - **Be honest about uncertainty.** Symptoms (e.g. "GPU memory access fault", "ImportError") are NOT root causes. Grouping failures by error keyword is **symptom clustering**, not causal attribution. Never assert a root cause without verified evidence. Treat all causal claims as **hypotheses** unless you have ALL of: (a) direct code-level evidence (commit diff modifies the exact failing function/path), (b) temporal correlation (failure starts when commit lands), and ideally (c) a reproducer or A/B disconfirmation. Phrase hypothetical causes with hedging language ("may be related to", "candidate cause"), not assertive language ("caused by", "the root cause is").
 - **Confidence labels REQUIRED for every causal claim.** Use this scale, default to `LOW` when unsure, NEVER omit the label:
 
@@ -126,11 +136,23 @@ If no `[CI-AITER-CHECK]` markers exist in the log (e.g. docker-build workflows),
 
 ### AITER analysis (when relevant)
 
-[aiter](https://github.com/ROCm/aiter) is AMD's attention/inference kernel library that sglang depends on. Failures may be caused by aiter changes rather than sglang changes. This is especially true for:
+[aiter](https://github.com/ROCm/aiter) is AMD's attention/inference kernel library that sglang depends on. Failures **can** be caused by aiter changes, by sglang changes, or by their interaction — never assume aiter-first. This is especially relevant for:
 
 - **AMD AITER Scout** workflow runs (which test sglang against a specific aiter commit)
 - Any failure involving MLA kernels, FlashAttention, fused attention, or custom Triton kernels
 - Errors like `hipErrorNoBinaryForGpu`, kernel launch failures, or numerical mismatches in attention output
+
+**⚠️ Two-variable trap (READ THIS BEFORE BLAMING AITER).** AITER Scout is a **2×2 experiment**: BOTH the sglang commit AND the aiter commit change between scout runs. The scout cron runs every Mon/Thu, so a typical scout-to-scout interval is 3-4 days, during which **dozens to hundreds of sglang commits** typically merge alongside the aiter delta (e.g. AITER Scout #92 had 33 aiter commits AND 110 sglang commits in the same window). Common pitfalls to avoid:
+
+1. **Reading only the HEAD sglang commit message is forbidden.** A HEAD message like "CI: fix lint" tells you nothing about the 109 commits behind it. You MUST enumerate the full sglang delta:
+   ```
+   git log --oneline <last_scout_pass_sglang_sha>..<this_scout_sglang_sha>
+   ```
+   Then grep for commits touching code paths that match the failure symptom (attention, MoE, quantization, graph capture, kernel selection, model forward pass, `apply_qk_norm`, `.view`, `.reshape`, `pcg`, `inductor`, etc.).
+
+2. **Log-line proximity is NOT causation.** When a GPU memory access fault prints right after `[aiter] ... using torch solution:0`, that is **not** evidence aiter caused the fault — aiter just happens to print one log line before the next forward-pass operation that crashes. The actual crash may be in sglang code called immediately after the aiter call. Always read the stack trace, not just the surrounding log lines.
+
+3. **The aiter delta has 30+ commits; assuming any single one is "the" cause is speculation, not analysis.** Treat aiter commit hypotheses as `[LOW]` confidence by default, and only promote to `[MEDIUM]+` after the Baseline A/B check below confirms aiter-causation.
 
 When the aiter commit differs from the Dockerfile default (i.e., an override or dev build), investigate what changed in aiter:
 
@@ -157,9 +179,20 @@ In the Root Cause Analysis, clearly state whether the failure is caused by:
 - **aiter code change** — cite the aiter commit and what it changed
 - **Interaction between both** — cite both
 
+**📋 Past failure mode to learn from — AITER Scout #92 misattribution.** [Run 24531896433](https://github.com/sgl-project/sglang/actions/runs/24531896433) (Apr 16 2026) attributed ~8 "GPU memory access fault during CUDA graph capture" failures (across `test_llada2_mini`, `test_lora_load_from_tensor`, `test_priority_metrics`, `test_metrics`, `test_eagle_dp_attention`, `test_reasoning`, `test_deterministic`, `test_reward_models`) to aiter commits ([`d098ae5a`](https://github.com/ROCm/aiter/commit/d098ae5a) "Revert CAR graph capture err", [`016ead3728`](https://github.com/ROCm/aiter/commit/016ead3728) "SynchronizedCache"). **The actual root cause was sglang [#21734](https://github.com/sgl-project/sglang/pull/21734) ([`6da3aba`](https://github.com/sgl-project/sglang/commit/6da3aba) `apply_qk_norm` `.reshape→.view`)**, merged Apr 14 between the last green scout and the failing scout. The aiter `using torch solution:0` log line printed immediately before each fault was a red herring — `apply_qk_norm` is called next in the forward pass for qwen3/qwen3_moe/llada2/glm4_moe/14 models. Baseline run [24527146590](https://github.com/sgl-project/sglang/actions/runs/24527146590) (same sglang SHA, **NO aiter override** — `AITER_COMMIT_OVERRIDE=` empty) had the **identical fault on the same test files**, conclusively exonerating aiter. The misattribution happened because: (a) the bot read only the HEAD sglang message ("CI: fix lint") and concluded sglang was effectively unchanged across the 110-commit delta; (b) the Baseline A/B check (next subsection) was either skipped or relied on the wrong baseline; (c) aiter blame was written before the A/B check completed. The fix [#23159](https://github.com/sgl-project/sglang/pull/23159) is a one-line revert. Lesson: **never write aiter Hypothesised Causes until the A/B check is done, and never dismiss the sglang delta without enumerating it.**
+
 ### Baseline A/B check (REQUIRED for `amd-aiter-scout.yml`)
 
 The **AMD AITER Scout** workflow calls the regular nightly and PR-test workflows but forces an aiter rebuild via `AITER_COMMIT_OVERRIDE`. Every job in a scout run has a sister job in one of the regular workflows that runs with the Dockerfile default aiter. If the same test fails in both, the failure is **pre-existing in sglang** and MUST NOT be attributed to aiter.
+
+**HARD STOP**: Do NOT write a Hypothesised Causes section, list any aiter commit as suspicious, or set Failure Origin until the A/B check below is complete. The check has four possible outcomes; only ONE permits blaming aiter:
+
+| Sister baseline outcome | Failure Origin | What goes in Hypothesised Causes |
+|---|---|---|
+| **Same** test file + function fails with **same** symptom | `pre-existing (sglang)` | sglang commits ONLY (from the sglang delta enumeration in step 6). **Zero aiter commits**, period. |
+| Test **passes** in sister baseline (or sister baseline is much greener) | `aiter-caused` | aiter commits from the delta range (per AITER analysis above). May also list sglang interaction commits if the failure depends on a specific sglang code path. |
+| Sister baseline has **different** failure on the same test (e.g. flake or skip) | `unclear` | Both sglang and aiter commits in scope; flag the sister flake explicitly and treat all hypotheses as `[LOW]`. |
+| Sister baseline has **no comparable run** in the queryable window | `unclear` | Both in scope; state the lookback window you searched and why no baseline was usable. |
 
 You MUST perform this A/B check for every scout failure before writing the Root Cause Analysis or Suspicious Commits.
 
@@ -196,6 +229,19 @@ curl -sL -H "Authorization: token $GH_PAT" \
 - **`pre-existing (sglang)`** — same test file + function fails in the sister job's most recent scheduled run. The failure is NOT caused by the aiter override; do NOT list aiter commits as suspicious.
 - **`aiter-caused`** — test fails in the scout but passes (or doesn't appear as a failure) in the sister baseline. Investigate the aiter commit range per the AITER analysis subsection above.
 - **`unclear`** — the sister baseline is unavailable (job skipped, workflow changed, no comparable run in the last 48 h, sister job didn't reach this test, etc.). Explain why in the Failure Origin field.
+
+**6. If Origin is `pre-existing (sglang)`** — investigate the sglang side BEFORE writing Hypothesised Causes:
+- **Enumerate the full sglang delta** (do NOT shortcut by reading only HEAD's commit message):
+  ```
+  git log --oneline <last_scout_pass_sglang_sha>..<this_scout_sglang_sha>
+  ```
+  Expect 50-200 commits. Save the list and grep it for keywords matching the failure symptom: stack-trace file paths, function names, error keywords (e.g. `graph capture`, `qk_norm`, `moe`, `fp8`, `pcg`, `inductor`, `view`, `reshape`, `cuda graph`, `attention`), or model class names appearing in the failing test.
+- **Narrow the regression window using sister-baseline history.** Find the last sister run where the failing test passed (`pass_sha`) and the first sister run where it failed (`fail_sha`). The true regression window is `pass_sha..fail_sha`, often much smaller than the scout-to-scout sglang delta. Use the sister workflow's history (filter `event=schedule`, same branch) to find these SHAs.
+- For each suspicious sglang commit: read its diff (`git show <sha>` or `curl https://api.github.com/repos/sgl-project/sglang/commits/<sha>`) and check whether the modified code is reachable from the failing test's stack trace. Cite the most suspicious sglang commits with confidence labels.
+- **Cite zero aiter commits.** The failure is reproducible without the aiter override, so the aiter delta is irrelevant to root cause. (You may still mention aiter as a confounder if the symptom involves an aiter call site, but only with explicit `[LOW]` confidence and disconfirming evidence noting the baseline reproduces without aiter.)
+- **Search for in-flight sglang fix PRs** with the failing test name and likely-culprit keywords; an in-flight revert/fix may already exist.
+
+**7. If Origin is `aiter-caused`** — investigate the aiter side per the AITER analysis subsection above. You may also examine sglang commits in the same window if there is reason to believe the failure is an interaction (e.g. sglang added a new aiter API call path, or the failure only triggers on a specific sglang code path that the sister baseline doesn't exercise).
 
 ### Output format
 
@@ -404,14 +450,16 @@ Sort the Summary Table rows in this order:
 
 The `#` column is the 1-based row index in this SORTED order. Bot does NOT assign Priority — engineers infer urgency from cluster size + persistence.
 
-### Job column anchor link (MUST follow)
+### Job column link (MUST follow)
 
-The `Job` cell MUST be a clickable markdown link to the corresponding per-job detail block:
+The `Job` cell MUST be a clickable markdown link to the **actual sglang workflow job page** on github.com — not an in-issue anchor — so that one click takes the maintainer straight to the failing CI log:
 ```
-[<job_name>](#job-<job_id>)
+[<job_name>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)
 ```
-where `<job_id>` is the numeric ID from the per-job analysis header. Example:
-`[call-nightly-amd / nightly-test-1-gpu-unit](#job-71716987472)`.
+where `<run_id>` and `<job_id>` are the numeric IDs from the per-job analysis header. Example:
+`[call-nightly-amd / nightly-test-1-gpu-unit](https://github.com/sgl-project/sglang/actions/runs/24635222311/job/71716987472)`.
+
+Do NOT use `[name](#job-<job_id>)` in the Job column — those in-issue anchors merely scroll the reader to the bot's own analysis block, not to the underlying CI failure. (The `<a id="job-<job_id>">` anchors above each per-job detail block still exist and may be linked from prose like "see analysis below" if useful, but the Summary Table's Job column is reserved for the upstream sglang job URL.)
 
 ### Output format
 
@@ -429,14 +477,14 @@ where `<job_id>` is the numeric ID from the per-job analysis header. Example:
 
    Column rules:
    - **Cluster**: short noun phrase (e.g. "GPU mem fault during warmup"). Repeat the same cluster name across all rows that belong to it — this is what makes grouping visible. Each unique cluster also gets a `### Cluster: <name>` subsection below the table.
-   - **Job**: `[name](#job-<job_id>)` anchor link.
+   - **Job**: `[name](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` — link to the actual sglang job page, NOT an in-issue anchor. See "Job column link (MUST follow)" above.
    - **Test File / Test Function**: from the per-job's `Failed Tests` table. Test-file granularity is REQUIRED — never report at job-only level.
    - **Origin** (scout only): `aiter-caused` | `pre-existing (sglang)` | `unclear`.
    - **Status**: factual one-liner — e.g. "5 days persistent" / "new today" / "1/7 runs (flaky)" / "Never-passed". NOT priority.
    - **Hypothesis (confidence)**: top hypothesis from the per-job analysis with its confidence label, e.g. ``[MEDIUM] commit [`6760c790b`](url) — narrows out_cache_loc``. If the per-job has no hypothesis ≥ MEDIUM, write `[no candidate ≥ MEDIUM]`.
 
 3. **Cluster details** (one `### Cluster: <name>` subsection per unique cluster). Each subsection contains:
-   - **Affected**: list of `(job, test_file, test_function)` rows from the table (with anchor links).
+   - **Affected**: list of `(job, test_file, test_function)` rows from the table (each job rendered as `[name](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` linking to the upstream sglang job page).
    - **Shared facts**: what the per-jobs agree on (stack-trace overlap, common version, common runner).
    - **Top hypothesis**: best candidate cause with confidence label and disconfirming evidence.
    - **In-flight fix**: ✅ PR #N or ❌ none — copy from per-job In-flight Fix Check; if multiple per-jobs cite the same PR, list it once.
@@ -488,7 +536,7 @@ Markdown report under 80 lines (no top-level heading; the harness adds its own):
 
 2. **Persistent clusters** (top 3 by job count): for each cluster, give:
    - Cluster name (one line)
-   - Affected jobs (with `[name](#job-<job_id>)` anchor links if available, otherwise plain job names with run-id linked)
+   - Affected jobs (each rendered as `[name](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` linking to the upstream sglang job page; never use `[name](#job-<job_id>)` in-issue anchors here)
    - Number of consecutive runs failed and first observed date
    - Top hypothesis with confidence label and disconfirming evidence (one sentence)
    - In-flight fix status
@@ -512,7 +560,9 @@ Do NOT include a `Priority` column or "P0/P1/P2" labels anywhere.
 
 ## Daily Cross-Workflow Status Board
 
-When asked to produce the **top-of-issue status board** that aggregates failures across ALL monitored workflows for the day, your output replaces (via PATCH) a single rolling comment at the top of the daily issue. This is the artifact engineers see first when they open the daily issue — its #1 job is to let them answer **"Is CI healthy today, and what should I do?"** in 5 seconds.
+When asked to produce the **top-of-issue status board** that aggregates failures across ALL monitored workflows for the day, your output is PATCHed directly into the daily issue's BODY (between the `<!-- ci-monitor-daily-status-board:start -->` / `...:end -->` markers), so it appears pinned at the very top of the issue — above every per-workflow comment. This is the artifact engineers see first when they open the daily issue — its #1 job is to let them answer **"Is CI healthy today, and what should I do?"** in 5 seconds.
+
+**Output discipline (REQUIRED).** Do NOT include any "thinking aloud" prose before the report. Your output MUST start with the `# CI Daily Health — <YYYY-MM-DD>` heading on its very first non-empty line. Anything before the first `#`/`##`/`###` heading will be treated as LLM scratchpad and stripped by the harness — but it's better to never emit it in the first place.
 
 ### Steps
 
@@ -565,12 +615,12 @@ For each unique cluster (sorted: 🆕 NEW first, then by total job count DESC, t
 
 | Workflow | Job (shard) | Test File | Test Function | Error (one line) | Log |
 |---|---|---|---|---|---|
-| pr-test-amd | stage-b-1gpu-small (2) | `test/registered/rl/test_lora_load_from_tensor.py` | `TestLoRALoadFromTensor.setUpClass` | `Memory access fault → exit -6` | [link](url) |
-| pr-test-amd | stage-b-1gpu-small (4) | `test/registered/dllm/test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault → exit -9` | [link](url) |
-| pr-test-amd-rocm720 | stage-b-1gpu-small (4) | `test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault` | [link](url) |
-| nightly-test-amd | nightly-1-gpu-lora | `test_lora_e2e.py` | `test_lora_full_pipeline` | same | [link](url) |
+| pr-test-amd | [stage-b-1gpu-small (2)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/rl/test_lora_load_from_tensor.py` | `TestLoRALoadFromTensor.setUpClass` | `Memory access fault → exit -6` | [link](url) |
+| pr-test-amd | [stage-b-1gpu-small (4)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/dllm/test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault → exit -9` | [link](url) |
+| pr-test-amd-rocm720 | [stage-b-1gpu-small (4)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault` | [link](url) |
+| nightly-test-amd | [nightly-1-gpu-lora](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_lora_e2e.py` | `test_lora_full_pipeline` | same | [link](url) |
 
-(Test File + Test Function granularity is REQUIRED. Group rows by cluster, not by workflow. Same cluster across workflows lives in ONE table.)
+(Test File + Test Function granularity is REQUIRED. Group rows by cluster, not by workflow. Same cluster across workflows lives in ONE table. The `Job (shard)` cell MUST be a clickable link to the actual sglang job page — `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>` — never an in-issue `#job-<id>` anchor.)
 
 After all NEW + active clusters, render Known/stable clusters in a single collapsed `<details>` block:
 
@@ -589,9 +639,9 @@ After all NEW + active clusters, render Known/stable clusters in a single collap
 
 | Job (shard) | Test File | Test Function | Cluster | Error |
 |---|---|---|---|---|
-| stage-b-1gpu-small (2) | `test_lora_load_from_tensor.py` | `setUpClass` | R2 | mem fault |
-| stage-b-1gpu-small (4) | `test_llada2_mini_amd.py` | `setUpClass` | R2 | mem fault |
-| stage-b-1gpu-small (11) | `test_multi_lora_backend.py` | `test_ci_lora_models_multi_batch` | R3 | torchao ImportError |
+| [stage-b-1gpu-small (2)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_lora_load_from_tensor.py` | `setUpClass` | R2 | mem fault |
+| [stage-b-1gpu-small (4)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_llada2_mini_amd.py` | `setUpClass` | R2 | mem fault |
+| [stage-b-1gpu-small (11)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_multi_lora_backend.py` | `test_ci_lora_models_multi_batch` | R3 | torchao ImportError |
 ...
 </details>
 
@@ -612,7 +662,7 @@ After all NEW + active clusters, render Known/stable clusters in a single collap
 
 ### Constraints
 
-- Length budget: 200 lines max for the rendered comment. Use `<details>` aggressively for known clusters and per-workflow drill-down.
+- Length budget: 200 lines max for the rendered board. Use `<details>` aggressively for known clusters and per-workflow drill-down.
 - The TL;DR + Workflow status table + active clusters MUST fit "above the fold" (visible without scrolling).
 - Every workflow listed in the prompt MUST appear in the Workflow status table, even if 0 failures (show ✅ row to confirm coverage).
 - Every cluster MUST list ALL `(workflow, job, test_file, test_function)` rows — full granularity, no rolling-up at this layer.
@@ -749,10 +799,11 @@ Write a SHORT cross-job summary (under 80 lines) that GROUPS jobs by Failure Clu
 - sglang PR `#<num>` → `[#<num>](https://github.com/sgl-project/sglang/pull/<num>)`
 - aiter PR `#<num>` → `[#<num>](https://github.com/ROCm/aiter/pull/<num>)`
 - Workflow run `<run_id>` → `[<run_id>](https://github.com/sgl-project/sglang/actions/runs/<run_id>)`
+- Workflow job `<job_id>` in run `<run_id>` → `[<short label>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`
 
 **Summary Table sort order**: Cluster size DESC (largest cluster first), then Persistence DESC, then for `amd-aiter-scout.yml` by Origin (`aiter-caused` → `pre-existing (sglang)` → `unclear`), then Job name ASC. The `#` column reflects this sorted order. Bot does NOT assign Priority — engineers infer urgency from cluster size + persistence.
 
-**Job column anchor rule**: the `Job` cell MUST be `[<job_name>](#job-<job_id>)` using the numeric `Job ID` shown in each per-job section above.
+**Job column rule**: the `Job` cell MUST be `[<job_name>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` — link to the upstream sglang job page on github.com so a single click jumps to the failing CI log. Each per-job section above provides both `Run` (run URL) and `Job ID`; combine them to build the link. Do NOT use `[name](#job-<job_id>)` in this column — those in-issue anchors are reserved for "see analysis below" prose, not for the Job column.
 
 **Confidence labels**: any causal claim (e.g. cited commit) MUST include a confidence label `[FACT]` / `[HIGH]` / `[MEDIUM]` / `[LOW]` / `[SPECULATION]`. Default `[LOW]` in API mode.
 
@@ -768,7 +819,7 @@ Write a SHORT cross-job summary (under 80 lines) that GROUPS jobs by Failure Clu
 
    Column rules:
    - **Cluster**: short noun phrase. Repeat the same cluster name across all rows that belong to it — this is what makes grouping visible.
-   - **Job**: `[name](#job-<job_id>)` anchor link.
+   - **Job**: `[name](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` — link to the actual sglang job page (NOT an in-issue `#job-<id>` anchor). See "Job column rule" above.
    - **Test File / Test Function**: test-file granularity REQUIRED.
    - **Origin** (scout only): `aiter-caused` | `pre-existing (sglang)` | `unclear`.
    - **Status**: factual one-liner — e.g. "5 days persistent" / "new today" / "Never-passed". NOT priority.
@@ -877,7 +928,7 @@ Write a Markdown report under 80 lines (no top-level heading; harness adds its o
 
 ### daily-cross-workflow-summary
 
-You are a CI/CD expert. Produce the **top-of-issue Daily Status Board** that aggregates failures across ALL monitored sglang workflows for {date_str}. This single rolling comment must let an engineer answer "Is CI healthy today, and what should I do?" in 5 seconds.
+You are a CI/CD expert. Produce the **top-of-issue Daily Status Board** that aggregates failures across ALL monitored sglang workflows for {date_str}. This is PATCHed directly into the daily issue's BODY (above every per-workflow comment) so it stays pinned at the top — engineers must be able to answer "Is CI healthy today, and what should I do?" in 5 seconds without scrolling.
 
 **Date**: {date_str} (UTC)
 **Snapshot UTC**: {snapshot_utc}
@@ -889,6 +940,7 @@ You are a CI/CD expert. Produce the **top-of-issue Daily Status Board** that agg
 **Yesterday's clusters** (for trend / NEW detection): {yesterday_clusters_summary_or_none}
 
 **Hard rules**:
+- Your output MUST start with the `# CI Daily Health — {date_str}` heading on its very first non-empty line. No "thinking aloud" preamble — anything before the first heading will be stripped, but better to never emit it.
 - Only `status == "completed"` runs are counted in trends. Mark in-flight runs `(IN-FLIGHT)` and exclude from trend numbers.
 - Cluster jobs by **same Failure Cluster name + same top stack-trace frames**, not by error keyword alone.
 - Assign cluster IDs `R1`, `R2`, ... — NEW clusters today get fresh IDs (mark `🆕`).
@@ -896,6 +948,7 @@ You are a CI/CD expert. Produce the **top-of-issue Daily Status Board** that agg
 - Bot does NOT assign Priority — no "P0/P1/Critical/High" anywhere.
 - Every workflow listed in the prompt MUST appear in the Workflow status table, even if 0 failures.
 - Every cluster MUST list ALL `(workflow, job, test_file, test_function)` rows.
+- Every `Job (shard)` cell in the cluster tables MUST be a clickable link to the upstream sglang job page: `[<job_label>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`. Never use in-issue `#job-<id>` anchors here.
 
 **Output format** (Markdown, ≤200 lines, use `<details>` for known/stable clusters and per-workflow drill-down):
 

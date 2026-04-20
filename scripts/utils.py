@@ -179,6 +179,30 @@ def update_comment(token: str, repo: str, comment_id: int, body: str) -> dict:
     return resp.json()
 
 
+def get_issue(token: str, repo: str, issue_number: int) -> dict:
+    """Fetch an issue's full payload (title, body, labels, ...)."""
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+    resp = requests.get(url, headers=gh_headers(token))
+    resp.raise_for_status()
+    return resp.json()
+
+
+def update_issue_body(
+    token: str, repo: str, issue_number: int, body: str,
+) -> dict:
+    """Replace an issue's body via the REST API.
+
+    Used by the daily status board to PATCH the board content into the
+    daily issue body (so it appears pinned at the very top of the
+    issue), instead of posting a separate comment that would land
+    below the per-workflow comments.
+    """
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+    resp = requests.patch(url, headers=gh_headers(token), json={"body": body})
+    resp.raise_for_status()
+    return resp.json()
+
+
 def delete_comment(token: str, repo: str, comment_id: int) -> None:
     """Delete a comment on an issue or PR. Silently no-op on 404."""
     url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
