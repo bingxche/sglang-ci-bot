@@ -12,7 +12,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 
 | Feature | Script | Trigger | What it does |
 |---------|--------|---------|--------------|
-| Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` every 15min | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the daily-board placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 7, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `build_daily_status_board.build_and_publish_board()` to refresh the cross-workflow board pinned in the issue body. |
+| Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` every 30min | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the daily-board placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 7, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `build_daily_status_board.build_and_publish_board()` to refresh the cross-workflow board pinned in the issue body. |
 | Daily Status Board | `build_daily_status_board.py` | Auto-invoked by each `monitor_ci.py` matrix job that produced new failures (gated by `BUILD_DAILY_BOARD` env, default enabled); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling status board **pinned in the daily issue's body** (above all per-workflow comments) between `<!-- ci-monitor-daily-status-board:start -->` / `<!-- ci-monitor-daily-status-board:end -->` placeholder markers. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes the issue body in place, replacing only the content between the placeholders. Legacy board *comments* from before this move (carrying the older `<!-- ci-monitor-daily-status-board -->` marker without `:start`/`:end`) are auto-deleted by `_cleanup_legacy_board_comments`. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
@@ -44,10 +44,10 @@ AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "
 
 There are **three independent loops** running concurrently. Each is triggered differently and handles a different responsibility. They share state only via GitHub (issues, comments, reactions) — never via local disk.
 
-### Loop 1 — CI monitoring (every 15 minutes)
+### Loop 1 — CI monitoring (every 30 minutes)
 
 ```
-runner-1 entrypoint.sh (sleep 900) ─┐
+runner-1 entrypoint.sh (sleep 1800) ─┐
                                     ▼
               POST .../actions/workflows/ci-monitor.yml/dispatches
                                     │
@@ -301,7 +301,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 
 ### Deploy self-hosted runners
 
-`runner/setup.sh` spawns 10 runner containers. Runner-1 runs a comment watcher daemon + a CI monitor dispatch loop (dispatches `ci-monitor.yml` every 15 minutes via `workflow_dispatch`). Runners 2-10 are plain job executors.
+`runner/setup.sh` spawns 10 runner containers. Runner-1 runs a comment watcher daemon + a CI monitor dispatch loop (dispatches `ci-monitor.yml` every 30 minutes via `workflow_dispatch`). Runners 2-10 are plain job executors.
 
 ```bash
 bash runner/setup.sh \
@@ -405,7 +405,7 @@ The comment watcher uses **reaction-based idempotency**: before dispatching, it 
 
 The CI monitor uses **comment metadata deduplication**: each workflow comment embeds `<!-- processed_job_ids: 111,222,333 -->`. Each run reads these IDs before analyzing, preventing duplicate analysis.
 
-When re-rendering an existing per-workflow comment (e.g. on the next 15-minute cron tick after a previous tick added new analyses), the bot needs to recover the previously-analysed jobs to merge them with the new batch. **Recovery is strict and self-contained per `<details>` block**: every per-job block emitted by `_render_per_job_block()` carries its `job_id`, `run_url`, and `started_at` as HTML attributes on the `<details>` tag itself:
+When re-rendering an existing per-workflow comment (e.g. on the next 30-minute cron tick after a previous tick added new analyses), the bot needs to recover the previously-analysed jobs to merge them with the new batch. **Recovery is strict and self-contained per `<details>` block**: every per-job block emitted by `_render_per_job_block()` carries its `job_id`, `run_url`, and `started_at` as HTML attributes on the `<details>` tag itself:
 
 ```html
 <details data-job-id="71234567"
@@ -656,7 +656,7 @@ sglang-ci-bot/
   .github/workflows/
     ci-monitor.yml          CI monitor — workflow_dispatch only (no cron in the
                               workflow itself). Runner-1's entrypoint.sh
-                              dispatches it every 15 minutes via API.
+                              dispatches it every 30 minutes via API.
                               Layout: prepare job (resolve workflow list +
                               ensure_daily_issue.py) → monitor matrix job
                               (max-parallel 7, one entry per workflow file
@@ -671,7 +671,7 @@ sglang-ci-bot/
     setup.sh                Multi-runner deployment (default 10 containers)
     entrypoint.sh           Container entrypoint (register + daemons + bot repo
                               clone). Runner-1 only: starts watch_comments.py
-                              --daemon AND a 15-minute loop that POSTs to
+                              --daemon AND a 30-minute loop that POSTs to
                               ci-monitor.yml/dispatches.
   .state/                   Persisted state files (gitignored)
   .secrets/                 Local secret files (gitignored): claude.env, llm_gateway_key, gh_pat
@@ -733,9 +733,9 @@ Edit `BOT_LOGIN` in `scripts/watch_comments.py`.
 
 Comment watcher daemon: `--poll-interval` in `scripts/watch_comments.py` (default: 30s, deployed as 15s via `setup.sh`).
 
-CI monitor dispatch: `entrypoint.sh` dispatches `ci-monitor.yml` via `workflow_dispatch` every 15 minutes (`sleep 900` loop).
+CI monitor dispatch: `entrypoint.sh` dispatches `ci-monitor.yml` via `workflow_dispatch` every 30 minutes (`sleep 1800` loop).
 
 ### Schedules
 
-- `ci-monitor.yml`: triggered by runner-1 every 15 minutes via `workflow_dispatch`
+- `ci-monitor.yml`: triggered by runner-1 every 30 minutes via `workflow_dispatch`
 - `comment-watcher.yml`: `'*/5 * * * *'` (every 5 minutes)

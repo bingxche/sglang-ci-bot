@@ -62,10 +62,10 @@ if [ "${ENABLE_WATCHER:-}" = "true" ]; then
         --poll-interval "${POLL_INTERVAL:-15}" \
         --bot-repo "${REPO_PATH}" &
 
-    echo "Starting CI monitor trigger (every 15 minutes)..."
+    echo "Starting CI monitor trigger (every 30 minutes)..."
     (
         while true; do
-            sleep 900
+            sleep 1800
             curl -fsSL -X POST \
                 -H "Authorization: token ${GH_PAT}" \
                 -H "Accept: application/vnd.github+json" \
