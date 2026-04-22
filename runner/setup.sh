@@ -35,7 +35,6 @@ MIN_DISK_MB=3000
 LOCAL_TAG="sglang-ci-bot-runner:latest"
 RUNNER_COUNT=10
 POLL_INTERVAL=15
-CLAUDE_CONFIG_DIR=""
 CLAUDE_ENV_FILE=""
 USE_AGENT=false
 
@@ -50,7 +49,6 @@ while [[ $# -gt 0 ]]; do
         --image)           IMAGE="$2"; shift 2 ;;
         --count)           RUNNER_COUNT="$2"; shift 2 ;;
         --build)           FORCE_BUILD=true; shift ;;
-        --claude-config)   CLAUDE_CONFIG_DIR="$2"; shift 2 ;;
         --claude-env)      CLAUDE_ENV_FILE="$2"; shift 2 ;;
         --use-agent)       USE_AGENT=true; shift ;;
         *)                 echo "Unknown option: $1"; exit 1 ;;
