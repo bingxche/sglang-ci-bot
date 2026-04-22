@@ -17,7 +17,8 @@ body as an HTML comment:
 Each cron run reads this metadata before analyzing, ensuring no job is
 analyzed twice.
 
-Runs as a one-shot process triggered by GitHub Actions cron (every 30min).
+Runs as a one-shot process triggered by GitHub Actions workflow_dispatch
+(every 15min from runner-1's entrypoint.sh dispatch loop).
 """
 
 import argparse

@@ -690,8 +690,8 @@ sglang-ci-bot/
 | `USE_AGENT` | All scripts | Set to `false` / `0` / `no` to **disable** agent mode (default: enabled). Same effect as passing `--no-use-agent`. |
 | `BUILD_DAILY_BOARD` | `monitor_ci.py` | Set to `false` to skip the auto-trigger of `build_daily_status_board.py` after `monitor_ci` finishes (default: enabled) |
 | `AGENT_PARALLEL` | `monitor_ci.py` | Max number of Claude Code agents per matrix job, processing failed jobs in parallel (default: `3`, capped to ≥1). Set in `ci-monitor.yml` env block. |
-| `AGENT_TIMEOUT_SECS` | `monitor_ci.py` per-job analysis | Per-job agent timeout (default: `1500` = 25 min in `ci-monitor.yml`). |
-| `AGENT_MAX_TURNS` | Agent mode (per-job + daily board) | Max conversation turns the agent may use (default: `150` in `ci-monitor.yml`; `200` in `build_daily_status_board.py` script default if env unset). |
+| `AGENT_TIMEOUT_SECS` | `monitor_ci.py` per-job analysis | Per-job agent timeout (default: `1500` = 25 min in `ci-monitor.yml`; code fallback `1800` when env unset). |
+| `AGENT_MAX_TURNS` | Agent mode (per-job + daily board) | Max conversation turns the agent may use (default: `150` in `ci-monitor.yml`; code fallback `1000` for per-job in `utils.py`, `200` in `build_daily_status_board.py` when env unset). |
 | `DAILY_BOARD_TIMEOUT_SECS` | `build_daily_status_board.py` | Agent timeout for the cross-workflow synthesis (default: `1200` = 20 min) |
 | `AGENT_WORKSPACE` | Agent mode | Base directory for sglang clone (default: `/workspace`) |
 | `ANTHROPIC_API_KEY` | Agent mode | Set to `dummy` (Claude Code uses gateway, not direct API) |
