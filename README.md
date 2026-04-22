@@ -369,6 +369,70 @@ The bot code is cloned by `entrypoint.sh` to `/tmp/bot`. The sglang repo (`/work
 
 ---
 
+## Disaster recovery / migration to a new host
+
+The bot is fully containerized and stateless — all persistent state lives on GitHub (issues, comments, reactions). Migrating to a new host requires only Docker and the credentials listed below.
+
+### What to bring
+
+| Item | Where to find it |
+|------|-----------------|
+| bingxche's GitHub PAT | GitHub > Settings > Developer settings > Personal access tokens |
+| amd-bot's GitHub PAT | Same, under the amd-bot account |
+| `.secrets/claude.env` | Copy from the old host (`sglang-ci-bot/.secrets/claude.env`) |
+| LLM Gateway key | Inside `claude.env` (`Ocp-Apim-Subscription-Key` value) |
+
+GitHub Actions repo secrets (`GH_PAT`, `LLM_GATEWAY_KEY`, `LLM_GATEWAY_URL`) and variables (`USE_AGENT`) are stored on GitHub — no migration needed.
+
+### Step-by-step
+
+```bash
+# 1. Install Docker (skip if already installed)
+curl -fsSL https://get.docker.com | sh
+
+# 2. Clone the bot repo
+git clone https://github.com/bingxche/sglang-ci-bot.git
+cd sglang-ci-bot
+
+# 3. Copy secrets from old host (or recreate manually)
+mkdir -p .secrets
+scp old-host:/path/to/sglang-ci-bot/.secrets/claude.env .secrets/claude.env
+
+# 4. Deploy (pulls pre-built image, no build needed)
+bash runner/setup.sh \
+  --pat <BINGXCHE_PAT> \
+  --bot-pat <AMD_BOT_PAT> \
+  --llm-gateway-key <LLM_GATEWAY_KEY> \
+  --claude-env .secrets/claude.env \
+  --use-agent \
+  --image bingxche/sglang-ci-bot-runner:latest
+
+# 5. Verify
+docker ps | grep amd-ci-bot-runner    # 10 containers running
+docker logs -f amd-ci-bot-runner-1    # watcher + CI monitor active
+```
+
+### Failover verification
+
+1. **Check containers are running**:
+   ```bash
+   docker ps | grep amd-ci-bot-runner
+   ```
+   All 10 containers should show `Up` status.
+
+2. **Check runner logs**:
+   ```bash
+   # Runner-1: should show watcher daemon + CI monitor started
+   docker logs --tail 50 amd-ci-bot-runner-1
+
+   # Any runner: should show "Listening for Jobs"
+   docker logs --tail 20 amd-ci-bot-runner-2
+   ```
+
+3. **Verify runners accept GitHub Actions jobs**: go to the repo's [Actions tab](https://github.com/bingxche/sglang-ci-bot/actions), manually trigger any workflow (e.g. `Analyze CI`), and confirm a runner picks it up.
+
+---
+
 ## Monitored workflows
 
 Configured in `MONITORED_WORKFLOWS` in `monitor_ci.py`:
