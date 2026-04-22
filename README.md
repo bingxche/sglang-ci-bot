@@ -79,8 +79,11 @@ runner-1 entrypoint.sh (sleep 900) ─┐
                                     ▼
                   monitor_ci.run_oneshot() per workflow:
                   1. ensure_sglang_repo() — clone or fast-forward /workspace/sglang
-                  2. get_workflow_runs() — non-success completed + in-progress
-                                            in lookback window (default 24h)
+                  2. get_workflow_runs(event="schedule") — non-success completed
+                                            + in-progress runs in lookback
+                                            window (default 24h). Manually-
+                                            dispatched / PR-triggered runs are
+                                            excluded by design.
                   3. for each run, get_failed_jobs() — drop gates, dedup vs
                      <!-- processed_job_ids: ... --> in existing comment
                   4. for each surviving failed job (up to AGENT_PARALLEL=3
@@ -376,11 +379,15 @@ nightly-test-amd-rocm720.yml
 release-docker-amd-nightly.yml
 release-docker-amd-rocm720-nightly.yml
 amd-aiter-scout.yml
-pr-test-amd.yml              (schedule-only: every 6h)
-pr-test-amd-rocm720.yml      (schedule-only: daily)
+pr-test-amd.yml
+pr-test-amd-rocm720.yml
 ```
 
-Workflows in `SCHEDULE_ONLY_WORKFLOWS` are filtered to only analyze `schedule`-triggered runs (not PR-triggered runs). Each workflow report includes the sglang commit (`head_sha`) in the header, and the agent extracts the aiter commit from `[CI-AITER-CHECK]` log markers.
+**All monitored workflows are filtered to `event=schedule` only.** Manually-dispatched (`workflow_dispatch`) runs and PR-triggered runs are intentionally excluded so the daily report is not polluted by ad-hoc / debug runs. If you need on-demand analysis of a specific manual run, use the `analyze-ci.yml` workflow (Actions tab → "Analyze CI" → paste the run/job URL).
+
+This is enforced in `monitor_ci.run_oneshot()` by passing `event="schedule"` unconditionally to `monitor_workflow()`. The `SCHEDULE_ONLY_WORKFLOWS` constant equals `set(MONITORED_WORKFLOWS)` and exists only as a label for the cross-run-summary code path (which is also skipped automatically when fewer than 2 runs are present in the lookback window).
+
+Each workflow report includes the sglang commit (`head_sha`) in the header, and the agent extracts the aiter commit from `[CI-AITER-CHECK]` log markers.
 
 ---
 
@@ -397,6 +404,21 @@ Workflows in `SCHEDULE_ONLY_WORKFLOWS` are filtered to only analyze `schedule`-t
 The comment watcher uses **reaction-based idempotency**: before dispatching, it checks if amd-bot has already added a `rocket` reaction to the comment. Both daemon and cron watcher share this mechanism, so running both simultaneously is safe.
 
 The CI monitor uses **comment metadata deduplication**: each workflow comment embeds `<!-- processed_job_ids: 111,222,333 -->`. Each run reads these IDs before analyzing, preventing duplicate analysis.
+
+When re-rendering an existing per-workflow comment (e.g. on the next 15-minute cron tick after a previous tick added new analyses), the bot needs to recover the previously-analysed jobs to merge them with the new batch. **Recovery is strict and self-contained per `<details>` block**: every per-job block emitted by `_render_per_job_block()` carries its `job_id`, `run_url`, and `started_at` as HTML attributes on the `<details>` tag itself:
+
+```html
+<details data-job-id="71234567"
+         data-run-url="https://github.com/sgl-project/sglang/actions/runs/24500001234"
+         data-started-at="2026-04-21T03:15:42Z">
+<summary><b>job-name</b> — failed step(s): pytest</summary>
+
+(per-job analysis text, may contain arbitrary nested markdown tables)
+
+</details>
+```
+
+`parse_job_analyses_from_comment()` only matches blocks that have all three `data-*` attributes — it never scans loose markdown table rows or any other heuristic. This is a deliberate hard boundary: the older parser used a generic 4-column table-row regex that over-matched cluster summary tables, hypothesis tables, and failed-test tables embedded inside the agent-generated analysis text, producing fake job entries with `job_id=0` that snowballed across cron cycles into 800+ comment parts and >1500 spam comments per day (see issue #41 / #42 postmortem). The strict attribute-based parser eliminates this class of bug entirely. Legacy comments without the `data-job-id` attribute are intentionally ignored by the recovery path — the next cron run simply re-renders today's analyses in the new format; the `processed_job_ids` marker continues to dedup so no job is re-analysed.
 
 Gate/finish jobs (e.g. `pr-test-amd-finish`, `wait-for-stage-b`) are automatically detected and skipped by the CI monitor. Only actual upstream failed jobs are analyzed, preventing redundant monolithic analyses under gate job names.
 

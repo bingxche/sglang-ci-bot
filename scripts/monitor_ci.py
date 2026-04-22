@@ -64,10 +64,12 @@ MONITORED_WORKFLOWS = [
     "pr-test-amd-rocm720.yml",
 ]
 
-SCHEDULE_ONLY_WORKFLOWS = {
-    "pr-test-amd.yml",
-    "pr-test-amd-rocm720.yml",
-}
+# All monitored workflows are analyzed only when triggered by ``schedule``.
+# Manually-dispatched (``workflow_dispatch``) and PR-triggered runs are
+# intentionally excluded so the daily report is not polluted by ad-hoc /
+# debug runs. Use ``analyze-ci.yml`` (Actions tab → "Analyze CI") if you
+# need on-demand analysis of a specific manual run.
+SCHEDULE_ONLY_WORKFLOWS = set(MONITORED_WORKFLOWS)
 
 SUCCESS_CONCLUSIONS = {"success"}
 
@@ -214,13 +216,18 @@ def extract_processed_ids_from_comments(
     return all_ids
 
 
-_JOB_TABLE_ROW_RE = re.compile(
-    r"\| \[`(.+?)`\]\((.+?)\) \| (.+?) \| (.+?) \|"
-)
-_JOB_URL_SUFFIX_RE = re.compile(r"/job/\d+$")
+# Strict per-job details block — every recoverable block MUST be emitted by
+# ``_render_per_job_block`` and carries the job_id / run_url / started_at as
+# HTML attributes on the <details> tag. We deliberately do NOT scan loose
+# markdown table rows (the previous heuristic over-matched 4-column tables
+# inside agent-generated analysis text — cluster summaries, hypothesis
+# tables, failed-test lists — and produced fake job entries with job_id=0
+# that snowballed into 800+ comment parts; see issue 42 postmortem).
 _DETAILS_BLOCK_RE = re.compile(
-    r"<details>\s*<summary><b>(.+?)</b> — failed step\(s\): (.+?)</summary>"
-    r"\s*\n(.*?)\n</details>",
+    r'<details\s+data-job-id="(\d+)"\s+data-run-url="([^"]*)"\s+'
+    r'data-started-at="([^"]*)">\s*'
+    r'<summary><b>(.+?)</b> — failed step\(s\): (.+?)</summary>'
+    r'\s*\n(.*?)\n</details>',
     re.DOTALL,
 )
 
@@ -286,38 +293,44 @@ def find_workflow_comment_parts(
 def parse_job_analyses_from_comment(body: str) -> list[dict]:
     """Reconstruct job_analyses list from one or more concatenated comment bodies.
 
-    Parses the processed_job_ids metadata, job table rows, and <details>
-    blocks to recover the structured data needed for merging with new analyses.
-    Callers with multi-part comments should concatenate their bodies before
-    invoking this helper.
+    Strictly iterates ``<details data-job-id="...">`` blocks emitted by
+    ``_render_per_job_block``. Each block is self-contained: ``job_id``,
+    ``run_url`` and ``started_at`` come from HTML attributes on the
+    ``<details>`` tag itself (not from a sibling table row), and the
+    ``analysis`` text is the inner content. Blocks without the
+    ``data-job-id`` attribute (legacy comments emitted before the strict
+    format) are intentionally ignored — they are not recoverable, but
+    ``extract_processed_ids_from_comments`` continues to dedup against
+    their ``processed_job_ids`` marker so no job is re-analyzed; the next
+    cron run simply re-renders today's analyses in the new format.
+
+    Callers with multi-part comments should concatenate their bodies
+    before invoking this helper.
     """
-    ids_match = _PROCESSED_IDS_RE.search(body)
-    job_ids = (
-        [int(x) for x in ids_match.group(1).split(",") if x]
-        if ids_match else []
-    )
-
-    table_rows = _JOB_TABLE_ROW_RE.findall(body)
-    details_blocks = {m.group(1): m.group(3).strip() for m in _DETAILS_BLOCK_RE.finditer(body)}
-
     analyses: list[dict] = []
-    for i, (job_name, table_url, failed_steps_str, started_at) in enumerate(table_rows):
-        job_id = job_ids[i] if i < len(job_ids) else 0
-        run_url = _JOB_URL_SUFFIX_RE.sub("", table_url)
+    seen_ids: set[int] = set()
+    for m in _DETAILS_BLOCK_RE.finditer(body):
+        job_id_str, run_url, started_at, job_name, failed_steps_str, analysis = m.groups()
+        try:
+            job_id = int(job_id_str)
+        except ValueError:
+            continue
+        if job_id == 0 or job_id in seen_ids:
+            continue
+        seen_ids.add(job_id)
         failed_steps = (
             [s.strip() for s in failed_steps_str.split(",")]
-            if failed_steps_str.strip() != "N/A" else []
+            if failed_steps_str.strip() and failed_steps_str.strip() != "N/A"
+            else []
         )
-        started = started_at.strip() if started_at.strip() != "N/A" else None
-        analysis_text = details_blocks.get(job_name, "")
-
+        started = started_at.strip() or None
         analyses.append({
-            "run_url": run_url,
-            "job_name": job_name,
+            "run_url": run_url.strip(),
+            "job_name": job_name.strip(),
             "job_id": job_id,
             "started_at": started,
             "failed_steps": failed_steps,
-            "analysis": analysis_text,
+            "analysis": analysis.strip(),
         })
 
     return analyses
@@ -516,9 +529,12 @@ def _render_per_job_block(ja: dict) -> str:
         summary_suffix = ""
         details_body = analysis_text
 
+    started_at = ja.get("started_at") or ""
     return (
         f"\n<a id=\"job-{job_id}\"></a>\n"
-        f"<details>\n"
+        f"<details data-job-id=\"{job_id}\" "
+        f"data-run-url=\"{run_url}\" "
+        f"data-started-at=\"{started_at}\">\n"
         f"<summary><b>{ja['job_name']}</b> — failed step(s): "
         f"{', '.join(ja['failed_steps']) or 'N/A'}{summary_suffix}</summary>\n\n"
         f"{details_body}\n\n"
@@ -1335,7 +1351,6 @@ def run_oneshot(
             gh_ids = extract_processed_ids_from_comments(gh_comments, wf) if gh_comments else set()
             processed_job_ids = local_ids | gh_ids
 
-            wf_event = "schedule" if wf in SCHEDULE_ONLY_WORKFLOWS else None
             new_analyses, new_ids, pending = monitor_workflow(
                 token, wf,
                 hours_back=hours_back,
@@ -1344,7 +1359,7 @@ def run_oneshot(
                 branch=branch,
                 use_agent=use_agent,
                 agent_repo_path=agent_repo_path,
-                event=wf_event,
+                event="schedule",
             )
 
             if not new_analyses:
