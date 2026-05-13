@@ -318,7 +318,10 @@ def _interruptible_sleep(seconds: int):
     """Sleep that can be interrupted by SIGTERM/SIGINT."""
     end = time.monotonic() + seconds
     while not _shutdown and time.monotonic() < end:
-        time.sleep(min(1, end - time.monotonic()))
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1, remaining))
 
 
 def main():
