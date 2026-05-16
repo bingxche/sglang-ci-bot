@@ -40,6 +40,8 @@ COMMANDS = {
     "ci-status": "Check and summarize CI status for this PR",
     "help": "Show available commands",
 }
+COMMENT_PAGE_SIZE = 100
+MAX_COMMENT_PAGES = 3
 
 STATE_FILE = Path(__file__).parent.parent / ".state" / "last_check.json"
 
@@ -68,13 +70,19 @@ def save_state(state: dict):
 def get_recent_comments(token: str, since: str | None = None) -> list[dict]:
     """Get recent issue/PR comments from the repo."""
     url = f"https://api.github.com/repos/{REPO}/issues/comments"
-    params = {"sort": "created", "direction": "desc", "per_page": 50}
+    params = {"sort": "created", "direction": "desc", "per_page": COMMENT_PAGE_SIZE}
     if since:
         params["since"] = since
 
-    resp = requests.get(url, headers=gh_headers(token), params=params)
-    resp.raise_for_status()
-    return resp.json()
+    comments = []
+    for page in range(1, MAX_COMMENT_PAGES + 1):
+        resp = requests.get(url, headers=gh_headers(token), params={**params, "page": page})
+        resp.raise_for_status()
+        page_comments = resp.json()
+        comments.extend(page_comments)
+        if len(page_comments) < COMMENT_PAGE_SIZE:
+            break
+    return comments
 
 
 def parse_command(comment_body: str, trigger: str = BOT_TRIGGER) -> dict | None:
