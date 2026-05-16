@@ -32,7 +32,8 @@ REPO = f"{REPO_OWNER}/{REPO_NAME}"
 BOT_LOGIN = "amd-bot"
 BOT_TRIGGER = f"@{BOT_LOGIN}"
 # To add a new user: append their GitHub username here AND update README.md
-AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd", "HaiShaw", "1am9trash", "sogalin", "Kangyan-Zhou", "Fridge003", "bowenbao", "ColinZ22", "fxmarty-amd"]
+AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd", "HaiShaw", "1am9trash", "sogalin", "Kangyan-Zhou", "Fridge003", "BowenBao", "ColinZ22", "fxmarty-amd"]
+AUTHORIZED_USER_LOGINS = {user.lower() for user in AUTHORIZED_USERS}
 COMMANDS = {
     "review": "Perform a full code review of this PR",
     "review-focus": "Review with focus on specific areas (provide after the command)",
@@ -206,7 +207,7 @@ def process_comments(token: str, bot_repo: str, since: str | None = None):
             continue
 
         author = comment["user"]["login"]
-        if author not in AUTHORIZED_USERS:
+        if author.lower() not in AUTHORIZED_USER_LOGINS:
             continue
 
         parsed = parse_command(comment["body"])
