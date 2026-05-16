@@ -46,10 +46,16 @@ trap cleanup EXIT SIGTERM SIGINT
 
 # Clone/update bot repo once (shared by watcher)
 if [ "${ENABLE_WATCHER:-}" = "true" ]; then
-    if [ -d /tmp/bot ]; then
-        git -C /tmp/bot pull --ff-only 2>/dev/null || true
+    BOT_REPO_URL="https://${GH_PAT}@github.com/${REPO_PATH}.git"
+    if [ -d /tmp/bot/.git ]; then
+        echo "Syncing bot repo to origin/main..."
+        git -C /tmp/bot remote set-url origin "${BOT_REPO_URL}"
+        git -C /tmp/bot fetch --prune origin main
+        git -C /tmp/bot reset --hard origin/main
+        git -C /tmp/bot clean -fd
     else
-        git clone "https://${GH_PAT}@github.com/${REPO_PATH}.git" /tmp/bot
+        rm -rf /tmp/bot
+        git clone --branch main "${BOT_REPO_URL}" /tmp/bot
     fi
     pip install -q -r /tmp/bot/requirements.txt 2>/dev/null
 fi
