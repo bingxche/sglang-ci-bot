@@ -416,6 +416,7 @@ def _check_ci_with_agent(pr_number: int, repo_path) -> str:
         prompt=prompt,
         work_dir=repo_path,
         timeout_secs=1200,
+        output_must_contain="## CI Status for PR",
     )
 
 

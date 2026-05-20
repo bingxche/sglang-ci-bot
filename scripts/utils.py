@@ -1009,12 +1009,19 @@ def _deploy_claude_md(target_dir: Path | None = None):
     _agent_log.warning("agent/CLAUDE.md not found, skipping deployment")
 
 
-def _recover_text_from_session_log(work_dir: Path) -> str | None:
+def _recover_text_from_session_log(
+    work_dir: Path, must_contain: str | None = None
+) -> str | None:
     """Extract the last assistant text from Claude Code session logs.
 
     When ``claude -p --output-format text`` exits 0 but returns empty
     stdout (e.g. because the final turn contained a tool call alongside
     the text), the actual report may still be in the session ``.jsonl``.
+
+    If *must_contain* is set, only assistant messages whose text contains
+    that substring are considered.  Used to salvage the canonical report
+    when the agent writes it and then overwrites it with a short follow-up
+    reply such as "already delivered above".
 
     Returns the recovered text, or ``None`` if nothing useful is found.
     """
@@ -1055,7 +1062,10 @@ def _recover_text_from_session_log(work_dir: Path) -> str | None:
                     continue
                 for block in content:
                     if block.get("type") == "text" and block.get("text", "").strip():
-                        last_text = block["text"].strip()
+                        text = block["text"].strip()
+                        if must_contain and must_contain not in text:
+                            continue
+                        last_text = text
     except Exception as exc:
         _agent_log.warning("Session log recovery failed: %s", exc)
         return None
@@ -1073,12 +1083,19 @@ def claude_code_analyze(
     context_files: dict[str, str] | None = None,
     max_turns: int = 1000,
     timeout_secs: int = 1800,
+    output_must_contain: str | None = None,
 ) -> str:
     """Run Claude Code CLI in non-interactive print mode.
 
     Writes *context_files* into a ``.ci-context/`` subdirectory of
     *work_dir* so the agent can read them, runs ``claude -p``, and
     returns the text output.
+
+    If *output_must_contain* is set and the agent's final stdout does
+    not contain that substring, scan the session log for the last
+    assistant message that does — this catches the failure mode where
+    the agent writes the canonical report and then overwrites it with
+    a short reply like "already delivered above".
 
     Raises ``RuntimeError`` on failure so callers can fall back to
     the single-shot API approach.
@@ -1120,7 +1137,19 @@ def claude_code_analyze(
             result.returncode, len(result.stdout or ""), len(result.stderr or ""),
         )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
+            text = result.stdout.strip()
+            if output_must_contain and output_must_contain not in text:
+                salvaged = _recover_text_from_session_log(
+                    work_dir, must_contain=output_must_contain
+                )
+                if salvaged:
+                    _agent_log.info(
+                        "Final stdout missing sentinel %r; salvaged %d-char "
+                        "earlier message from session log",
+                        output_must_contain, len(salvaged),
+                    )
+                    return salvaged
+            return text
 
         if result.returncode == 0:
             recovered = _recover_text_from_session_log(work_dir)
