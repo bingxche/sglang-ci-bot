@@ -1148,7 +1148,8 @@ def claude_code_analyze(
             )
             return recovered + (
                 f"\n\n---\n*Note: agent timed out after {timeout_secs}s; "
-                f"showing the last assistant response captured before the kill.*\n"
+                f"showing the last assistant response captured before the kill. "
+                f"Re-run the bot command to retry.*\n"
             )
         raise RuntimeError(f"Claude Code timed out after {timeout_secs}s")
     except FileNotFoundError:

@@ -351,6 +351,21 @@ For each failed job: download the log, identify the specific **test file(s) and 
 
 **Scope**: Do NOT perform regression bisection, search for the commit that broke main, or fetch historical workflow runs. That is the CI Monitor's job, not yours. Focus only on whether this PR's changes caused the failure.
 
+### Log fetching strategy (REQUIRED)
+
+GitHub Actions job logs can be several MB each. Streaming pipelines like `curl … | grep … | tail` blow past Claude Code's 2 min foreground timeout on large logs and get pushed to background polling — observed to burn 6+ min of pure wait time in a single run, which is what makes the 600 s PR CI status check time out. Always do this instead:
+
+1. **Download all failed-job logs once into `/tmp/pr<N>_logs/<job_id>.log`** with a single bash loop, before any per-log analysis:
+   ```
+   mkdir -p /tmp/pr<N>_logs && for j in <job_id_1> <job_id_2> …; do
+     curl -sL -H "Authorization: token $GH_PAT" \
+       "https://api.github.com/repos/sgl-project/sglang/actions/jobs/$j/logs" \
+       -o /tmp/pr<N>_logs/$j.log
+   done
+   ```
+2. **Run every subsequent `grep` / `sed` / `awk` against the local files.** Never re-`curl` the same log to inspect a different keyword.
+3. **Never split log downloads into multiple separate `curl` commands** (one per job, or one per grep). They each hit the foreground timeout independently and force redundant background-task polling.
+
 ### AMD vs Other CI classification
 
 Separate failed jobs into two groups:

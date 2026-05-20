@@ -415,7 +415,7 @@ def _check_ci_with_agent(pr_number: int, repo_path) -> str:
     return claude_code_analyze(
         prompt=prompt,
         work_dir=repo_path,
-        timeout_secs=600,
+        timeout_secs=1200,
     )
 
 
