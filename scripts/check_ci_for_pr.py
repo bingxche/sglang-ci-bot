@@ -10,6 +10,7 @@ to scan in 5 seconds.
 import argparse
 import json
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -26,6 +27,7 @@ from utils import (
     download_job_logs,
     ensure_sglang_repo,
     extract_error_lines,
+    get_file_content_at_ref,
     get_pr_changed_files,
     get_pr_diff,
     get_run_jobs,
@@ -400,6 +402,221 @@ def _format_grouped_tables(
 
 
 # ---------------------------------------------------------------------------
+# Untested-change detection (AMD coverage gap)
+# ---------------------------------------------------------------------------
+
+_AMD_REGISTER_RE = re.compile(r"register_amd_ci\s*\(([^)]*)\)", re.DOTALL)
+_SUITE_KW_RE = re.compile(r"""suite\s*=\s*["']([^"']+)["']""")
+_NIGHTLY_KW_RE = re.compile(r"nightly\s*=\s*True")
+_STAGE_RE = re.compile(r"stage-([abc])")
+
+
+def _extract_amd_pr_suite(content: str) -> str | None:
+    """Return the per-commit AMD suite a test registers to, or None.
+
+    Skips nightly-only registrations (``nightly=True``) since those never run
+    on PR CI, and files that don't register an AMD suite at all.
+    """
+    m = _AMD_REGISTER_RE.search(content)
+    if not m:
+        return None
+    args = m.group(1)
+    if _NIGHTLY_KW_RE.search(args):
+        return None
+    sm = _SUITE_KW_RE.search(args)
+    return sm.group(1) if sm else None
+
+
+def _stage_label(suite: str) -> str:
+    """Human stage label from a suite name, e.g. ``"stage B"`` (or ``""``)."""
+    m = _STAGE_RE.search(suite)
+    return f"stage {m.group(1).upper()}" if m else ""
+
+
+def _job_matches_suite(job_name: str, suite: str) -> bool:
+    """Match an Actions job name to a suite (exact, or ``suite (matrix...)``)."""
+    return job_name == suite or job_name.startswith(suite + " ")
+
+
+def _collect_amd_runs(token: str, head_sha: str) -> list[dict]:
+    """Latest AMD workflow run per workflow name for this SHA."""
+    latest_by_wf: dict[str, dict] = {}
+    for run in get_workflow_runs_for_sha(token, head_sha):
+        name = run.get("name", "")
+        if "amd" not in name.lower():
+            continue
+        existing = latest_by_wf.get(name)
+        if existing is None or run["id"] > existing["id"]:
+            latest_by_wf[name] = run
+    return list(latest_by_wf.values())
+
+
+def _collect_amd_jobs(token: str, runs: list[dict]) -> list[dict]:
+    """All jobs across the given AMD workflow runs."""
+    jobs: list[dict] = []
+    for run in runs:
+        jobs.extend(get_run_jobs(token, run["id"]))
+    return jobs
+
+
+def _suite_run_state(jobs: list[dict], suite: str) -> tuple[str, str]:
+    """Classify whether ``suite``'s AMD job(s) actually executed.
+
+    Returns ``(state, reason)`` where state is ``"executed"``, ``"pending"``,
+    or ``"not_run"``. A matrix suite counts as executed if any shard executed.
+    """
+    matched = [j for j in jobs if _job_matches_suite(j.get("name", ""), suite)]
+    if not matched:
+        return "not_run", "not reached"
+    executed = pending = False
+    conclusions: set[str] = set()
+    for j in matched:
+        status = j.get("status")
+        conclusion = j.get("conclusion")
+        if conclusion:
+            conclusions.add(conclusion)
+        if conclusion in ("success", "failure", "timed_out"):
+            executed = True
+        elif conclusion is None or status in (
+            "in_progress", "queued", "waiting", "requested", "pending",
+        ):
+            pending = True
+    if executed:
+        return "executed", ""
+    if pending:
+        return "pending", "still running / queued"
+    if "cancelled" in conclusions:
+        return "not_run", "cancelled"
+    if "skipped" in conclusions:
+        return "not_run", "skipped"
+    return "not_run", "did not complete"
+
+
+def detect_untested_amd_changes(
+    token: str,
+    pr_number: int,
+    changed_files: list[dict],
+    head_sha: str,
+) -> list[dict]:
+    """Find changed AMD test files whose covering AMD job did not run.
+
+    Deterministic signal: a changed ``test/**`` file declares its suite via
+    ``register_amd_ci(suite=...)``; that suite maps to an AMD CI job, and we
+    check whether it executed for this commit. Nightly-only tests are skipped
+    (they never run on PR CI). If AMD CI was never triggered at all, every
+    relevant suite is reported as ``not_triggered`` (the most dangerous case).
+    """
+    mapped: list[tuple[str, str]] = []
+    for f in changed_files:
+        filename = f.get("filename", "")
+        if (
+            f.get("status") == "removed"
+            or not filename.startswith("test/")
+            or not filename.endswith(".py")
+        ):
+            continue
+        content = get_file_content_at_ref(token, filename, head_sha)
+        if not content:
+            continue
+        suite = _extract_amd_pr_suite(content)
+        if suite:
+            mapped.append((filename, suite))
+    if not mapped:
+        return []
+
+    amd_runs = _collect_amd_runs(token, head_sha)
+    jobs = _collect_amd_jobs(token, amd_runs) if amd_runs else []
+    any_amd_failure = any(
+        j.get("conclusion") in ("failure", "timed_out") for j in jobs
+    )
+
+    entries: list[dict] = []
+    for filename, suite in mapped:
+        if not amd_runs:
+            state, reason = "not_triggered", "AMD CI was not triggered for this commit"
+        else:
+            state, reason = _suite_run_state(jobs, suite)
+            if state == "not_run" and reason == "skipped" and any_amd_failure:
+                reason = "blocked by an earlier stage"
+        if state == "executed":
+            continue
+        entries.append({
+            "test_file": filename,
+            "suite": suite,
+            "stage": _stage_label(suite),
+            "state": state,
+            "reason": reason,
+        })
+    return entries
+
+
+def _format_untested_warning(entries: list[dict]) -> str:
+    """Render a short, scannable banner for changes not tested on AMD.
+
+    One headline (what + action) plus one short bullet per file. All entries
+    are homogeneous: either every relevant suite is ``not_triggered`` (AMD CI
+    never ran) or none are.
+    """
+    if not entries:
+        return ""
+    not_triggered = any(e["state"] == "not_triggered" for e in entries)
+
+    if not_triggered:
+        lines = [
+            "> [!CAUTION]",
+            "> **AMD CI did not run for this PR — these changes are untested on "
+            "AMD. Trigger / re-run AMD CI before merging.**",
+        ]
+    else:
+        lines = [
+            "> [!WARNING]",
+            "> **A code path changed by this PR was not tested on AMD — re-run "
+            'AMD CI before merging.** A green / "Unlikely related" status below '
+            "does **not** mean it's verified.",
+        ]
+
+    for e in entries:
+        loc = f", {e['stage']}" if e["stage"] else ""
+        if e["state"] == "not_triggered":
+            note = "did not run"
+        elif e["state"] == "pending":
+            note = "not finished yet"
+        else:
+            note = f"did not run ({e['reason']})"
+        lines.append(f"> - `{e['test_file']}` → `{e['suite']}`{loc}: {note}")
+
+    return "\n".join(lines) + "\n\n"
+
+
+def _compute_untested_block(token: str, pr_number: int) -> str:
+    """Best-effort deterministic 'untested change' banner (used in both modes)."""
+    try:
+        head_sha = get_pr_head_sha(token, pr_number)
+        changed = get_pr_changed_files(token, pr_number)
+        entries = detect_untested_amd_changes(token, pr_number, changed, head_sha)
+        if entries:
+            print(f"  Untested AMD change(s): {len(entries)}")
+        return _format_untested_warning(entries)
+    except Exception as exc:
+        print(f"  WARNING: untested-change detection failed ({exc})")
+        return ""
+
+
+def _inject_untested_block(report: str, block: str) -> str:
+    """Insert the untested-change banner just under the report title."""
+    if not block:
+        return report
+    marker = "## CI Status for PR"
+    idx = report.find(marker)
+    if idx == -1:
+        return block + report
+    nl = report.find("\n", idx)
+    if nl == -1:
+        return report + "\n\n" + block
+    return report[: nl + 1] + "\n" + block + report[nl + 1:]
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -438,7 +655,11 @@ def check_ci_for_pr(
             try:
                 print(f"Checking CI for PR #{pr_number} (agent mode, worktree)...")
                 with agent_worktree(f"ci-status-pr{pr_number}") as wt_path:
-                    body = requester_line + _check_ci_with_agent(pr_number, wt_path)
+                    report = _check_ci_with_agent(pr_number, wt_path)
+                    report = _inject_untested_block(
+                        report, _compute_untested_block(token, pr_number)
+                    )
+                    body = requester_line + report
                     body += "\n---\n*Generated by amd-bot using Claude Code CLI*\n"
 
                     if post_comment_flag:
@@ -454,6 +675,18 @@ def check_ci_for_pr(
 
     head_sha = get_pr_head_sha(token, pr_number)
     print(f"  Head SHA: {head_sha[:12]}")
+
+    coverage_changed_files = get_pr_changed_files(token, pr_number)
+    untested_block = ""
+    try:
+        untested = detect_untested_amd_changes(
+            token, pr_number, coverage_changed_files, head_sha
+        )
+        untested_block = _format_untested_warning(untested)
+        if untested:
+            print(f"  Untested AMD change(s): {len(untested)}")
+    except Exception as exc:
+        print(f"  WARNING: untested-change detection failed ({exc})")
 
     status = collect_workflow_status(token, head_sha)
     passed_names = status["passed_names"]
@@ -471,6 +704,7 @@ def check_ci_for_pr(
         pending_note = f" ({len(pending_names)} still pending)" if pending_names else ""
         body = (
             f"{requester_line}## CI Status for PR #{pr_number}\n\n"
+            f"{untested_block}"
             f"All {len(passed_names)} workflow(s) passed!{pending_note}\n"
             f"\n---\n*Generated by amd-bot using Claude API*\n"
         )
@@ -498,7 +732,6 @@ def check_ci_for_pr(
                 job_futures[fut] = wf
 
             diff_future = executor.submit(get_pr_diff, token, pr_number)
-            files_future = executor.submit(get_pr_changed_files, token, pr_number)
 
             for fut in as_completed(job_futures):
                 wf = job_futures[fut]
@@ -512,7 +745,7 @@ def check_ci_for_pr(
                     all_job_data.append(ja)
 
             pr_diff = diff_future.result()
-            changed_files = files_future.result()
+            changed_files = coverage_changed_files
 
         print(
             f"\n  PR diff: {len(pr_diff):,} chars, "
@@ -543,6 +776,7 @@ def check_ci_for_pr(
 
         # Phase 3: build header + verdict summary + grouped tables
         body = f"{requester_line}## CI Status for PR #{pr_number}\n\n"
+        body += untested_block
 
         corr_by_job: dict[str, dict] = {}
         for c in correlation:

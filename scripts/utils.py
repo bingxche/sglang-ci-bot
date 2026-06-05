@@ -307,6 +307,17 @@ def get_pr_changed_files(token: str, pr_number: int) -> list[dict]:
     return all_files
 
 
+def get_file_content_at_ref(token: str, path: str, ref: str) -> str | None:
+    """Fetch raw file content at a specific git ref. Returns None if missing."""
+    url = f"https://api.github.com/repos/{REPO}/contents/{path}"
+    headers = gh_headers(token)
+    headers["Accept"] = "application/vnd.github.raw"
+    resp = requests.get(url, headers=headers, params={"ref": ref})
+    if resp.status_code == 200:
+        return resp.text
+    return None
+
+
 def extract_error_lines(
     raw_log: str,
     job_steps_api: list[dict],

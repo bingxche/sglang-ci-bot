@@ -16,7 +16,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 | Daily Status Board | `build_daily_status_board.py` | Auto-invoked by each `monitor_ci.py` matrix job that produced new failures (gated by `BUILD_DAILY_BOARD` env, default enabled); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling status board **pinned in the daily issue's body** (above all per-workflow comments) between `<!-- ci-monitor-daily-status-board:start -->` / `<!-- ci-monitor-daily-status-board:end -->` placeholder markers. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes the issue body in place, replacing only the content between the placeholders. Legacy board *comments* from before this move (carrying the older `<!-- ci-monitor-daily-status-board -->` marker without `:start`/`:end`) are auto-deleted by `_cleanup_legacy_board_comments`. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
-| CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, analyzes failures, determines if failures are PR-related |
+| CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, analyzes failures, determines if failures are PR-related, and warns when the AMD test covering a changed code path did not run (skipped/cancelled) |
 | Comment Watcher | `watch_comments.py` | Daemon (15s poll) + Cron (5min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches workflows |
 
 ### Supported commands
@@ -624,6 +624,13 @@ python scripts/check_ci_for_pr.py 1234 --no-post --no-use-agent
 | `pr_number` | required | PR number |
 | `--no-post` | false | Print to stdout |
 | `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to force API fallback |
+
+**Untested-change check (AMD coverage gap).** Beyond classifying failures, the checker flags when an AMD test that covers this PR's changes never actually ran — the trap where AMD looks green only because the relevant test never executed. A changed `test/**` file declares its suite via `register_amd_ci(suite=...)` (nightly-only registrations are ignored); that suite maps to an AMD CI job (its `stage-a/b/c` is the stage). A banner is rendered at the **top** of the report whenever:
+
+- **AMD CI was not triggered at all** for the commit → a `> [!CAUTION]` block (most dangerous: the change is completely untested on AMD; trigger / re-run AMD CI), or
+- **a relevant suite did not run** (cancelled, skipped, or blocked by an earlier stage failure) or is still pending → a `> [!WARNING]` block naming the test, its AMD job, and stage.
+
+The banner states that a passing / "Unlikely related" status does **not** mean the change is verified and tells the author to **re-run AMD CI** (no `/rerun-*` slash command is suggested — AMD tests can't be dispatched that way). This deterministic banner is computed in Python and injected at the top in **both** agent and API modes, so it appears regardless of agent behavior; in agent mode the agent additionally traces changed **source** files to their covering registered tests. (`ci-status-check.yml` defaults to agent mode — `USE_AGENT` defaults to `true`.)
 
 ### On-Demand Analysis
 

@@ -351,6 +351,19 @@ For each failed job: download the log, identify the specific **test file(s) and 
 
 **Scope**: Do NOT perform regression bisection, search for the commit that broke main, or fetch historical workflow runs. That is the CI Monitor's job, not yours. Focus only on whether this PR's changes caused the failure.
 
+### Untested-change check (REQUIRED — surface AMD coverage gaps)
+
+A "no failures" / "Unlikely related" verdict is **misleading** if the AMD tests that actually exercise this PR's changes never ran (skipped, cancelled, blocked by an earlier stage, or never triggered). This is the trap that lets a broken disaggregation/PD change merge while AMD shows green. Always run this check and surface the result at the **top** of the report.
+
+A deterministic banner is **auto-prepended** for changed **test** files (`test/**` declaring `register_amd_ci(suite=...)`), so you do **not** need to repeat those. Your job is to extend the same coverage reasoning to changed **source** files:
+
+1. **Map changed source files to the AMD suite(s) that cover them.** For each changed source file (e.g. `python/sglang/srt/disaggregation/**`), grep `test/registered/**` for tests that import/exercise the changed module, then read those tests' `register_amd_ci(suite=...)` (skip `nightly=True` — those never run on PR CI). The suite name *is* the AMD CI job name; `stage-a/b/c` in it is the stage.
+2. **Check whether each mapped suite ran for this commit:** if any matrix shard concluded `success`/`failure` it ran (covered); if all matching AMD jobs are `cancelled`/`skipped`/missing it did **not** run; if still `in_progress`/`queued` it is pending.
+3. **Surface gaps at the top of the report:**
+   - **AMD CI not triggered at all** (no AMD run for the commit) → most dangerous. Emit a `> [!CAUTION]` block: AMD CI was not triggered, the change is completely untested on AMD, and the author must trigger / re-run AMD CI.
+   - **A relevant suite did not run / was blocked by an earlier stage** → emit a `> [!WARNING]` block naming the test and its AMD job + stage (e.g. "should run in `stage-c-...` (stage C) but was not reached because an earlier stage failed"), state that a passing / "Unlikely related" status does **not** mean the change is verified, and tell the author to **re-run AMD CI** before merging.
+   - Do **not** name any `/rerun-*` slash command — AMD tests cannot be dispatched that way; just say "re-run AMD CI".
+
 ### Log fetching strategy (REQUIRED)
 
 GitHub Actions job logs can be several MB each. Streaming pipelines like `curl … | grep … | tail` blow past Claude Code's 2 min foreground timeout on large logs and get pushed to background polling — observed to burn 6+ min of pure wait time in a single run, which is what makes the 600 s PR CI status check time out. Always do this instead:
@@ -388,6 +401,14 @@ Always show AMD CI first. If a group has zero failures, omit that group's table 
 
 PR: [title](pr_url)
 Changed files: `file1.py` (+X/-Y), `file2.py` (+X/-Y)
+
+> [!CAUTION]                          ← AMD CI did not run at all (most dangerous)
+> **AMD CI did not run for this PR — these changes are untested on AMD. Trigger / re-run AMD CI before merging.**
+> - `test/.../test_x.py` → `stage-c-...-amd`, stage C: did not run
+
+> [!WARNING]                          ← a PR-relevant AMD suite did not run / was blocked
+> **A code path changed by this PR was not tested on AMD — re-run AMD CI before merging.** A green / "Unlikely related" status below does **not** mean it's verified.
+> - `test/.../test_x.py` → `stage-c-...-amd`, stage C: did not run (blocked by an earlier stage)
 
 **AMD: X failures (Y likely related) | Others: X failures (Y related)**
 
