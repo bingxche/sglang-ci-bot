@@ -345,24 +345,33 @@ Do NOT include a `Priority: Critical/High/Medium/Low` line. Engineers decide pri
 
 ## PR CI Status Check
 
-When asked to check CI status for a PR, answer the developer's question: **"Do I need to fix something, or can I ignore these failures?"**
+Your job: let a reviewer decide, in 5 seconds, **whether this PR is safe to merge.** A reviewer has exactly three questions — answer all three, lead with the answer, never bury it:
 
-For each failed job: download the log, identify the specific **test file(s) and test function(s)** that failed, read the PR diff and relevant source files, and determine whether the failure is related to the PR's changes. Do NOT just say "job X failed" — always report which test file and function failed.
+1. **Is this PR broken?** Are any failing jobs actually caused by *this PR's* changes (as opposed to pre-existing failures, infra/runner errors, unrelated-backend flakes, or fast-fail cascades)?
+2. **Will it break things at runtime?** From the diff plus the failing tests, is there a real correctness / regression risk a human should look at before merging?
+3. **Did PR CI actually exercise this PR's changed code?** If the changed code paths are not run by any test in this PR's CI, a green run proves nothing. **This is the most important question and the one humans most often miss.**
 
-**Scope**: Do NOT perform regression bisection, search for the commit that broke main, or fetch historical workflow runs. That is the CI Monitor's job, not yours. Focus only on whether this PR's changes caused the failure.
+The single worst outcome is a reviewer merging because "CI is green" when CI never ran the changed code. So when coverage is missing, say it **loudly, at the very top, above the failure tables** — a coverage gap matters more than any red X that is unrelated to the PR.
 
-### Untested-change check (REQUIRED — surface AMD coverage gaps)
+You are NOT the CI Monitor: do not bisect main, hunt the commit that broke a shared test, or pull historical runs. Judge *this PR* only.
 
-A "no failures" / "Unlikely related" verdict is **misleading** if the AMD tests that actually exercise this PR's changes never ran (skipped, cancelled, blocked by an earlier stage, or never triggered). This is the trap that lets a broken disaggregation/PD change merge while AMD shows green. Always run this check and surface the result at the **top** of the report.
+### How to answer — use your judgment, gather evidence, don't pattern-match
 
-A deterministic banner is **auto-prepended** for changed **test** files (`test/**` declaring `register_amd_ci(suite=...)`), so you do **not** need to repeat those. Your job is to extend the same coverage reasoning to changed **source** files:
+**Failures.** For each failed job, download its log (see Log fetching below), pin the exact **test file + test function**, read the PR diff and the relevant source, then classify the failure 🔴 likely / 🟡 possibly / 🟢 unlikely related **with a one-line reason that names the actual code path** — not just the error keyword. Collapse fast-fail / cascade jobs into their single root cause instead of listing each as an independent failure.
 
-1. **Map changed source files to the AMD suite(s) that cover them.** For each changed source file (e.g. `python/sglang/srt/disaggregation/**`), grep `test/registered/**` for tests that import/exercise the changed module, then read those tests' `register_amd_ci(suite=...)` (skip `nightly=True` — those never run on PR CI). The suite name *is* the AMD CI job name; `stage-a/b/c` in it is the stage.
-2. **Check whether each mapped suite ran for this commit:** if any matrix shard concluded `success`/`failure` it ran (covered); if all matching AMD jobs are `cancelled`/`skipped`/missing it did **not** run; if still `in_progress`/`queued` it is pending.
-3. **Surface gaps at the top of the report:**
-   - **AMD CI not triggered at all** (no AMD run for the commit) → most dangerous. Emit a `> [!CAUTION]` block: AMD CI was not triggered, the change is completely untested on AMD, and the author must trigger / re-run AMD CI.
-   - **A relevant suite did not run / was blocked by an earlier stage** → emit a `> [!WARNING]` block naming the test and its AMD job + stage (e.g. "should run in `stage-c-...` (stage C) but was not reached because an earlier stage failed"), state that a passing / "Unlikely related" status does **not** mean the change is verified, and tell the author to **re-run AMD CI** before merging.
-   - Do **not** name any `/rerun-*` slash command — AMD tests cannot be dispatched that way; just say "re-run AMD CI".
+**Coverage — the part that matters most.** Work out, for real, whether this PR's changes are exercised by the CI that ran on it:
+- Map every changed file — **source as well as test** — to the test(s) that exercise it. For a changed `test/**` file, read its `register_amd_ci(suite=...)`. For a changed source file (a kernel, a memory pool, a model, …), grep `test/registered/**` for the tests that import/exercise that module and find their suite + stage.
+- A `nightly=True` suite does NOT run on PR CI. Neither does a code path gated behind a default-off env var / flag that no PR test sets — the feature is unreachable even if every job is green.
+- Then check, against the actual workflow runs for this PR's head SHA, whether each covering suite **ran** (a shard concluded success/failure), **was skipped / blocked / cancelled**, or is **still pending**.
+- **A PR whose entire value sits behind a default-off env var or a nightly-only suite is functionally untested by PR CI even when every job is green.** Say so explicitly, and say exactly what the author must run (the suite, or the env/flags) to actually verify it before merge.
+
+### Hard rules — these are exactly what has gone wrong before, do not repeat them
+
+- **Lead with the verdict; no preamble.** Your first output line is the report heading. Never open with "I have enough to compose the report" / "Summary of findings:" / "Let me…" — that prose leaks verbatim into the GitHub comment.
+- **Pending ≠ pass.** If AMD (or any) jobs are still queued / in-progress, report them as *still running* and do NOT call the run GREEN. Conclude only from completed jobs. A premature "AMD is GREEN" that a later failure contradicts destroys trust faster than anything else.
+- **The failure count is not the merge verdict.** "0 related failures" must never read as "safe to merge" when the real finding is a coverage gap. The merge-verdict line owns that judgement, not the headline number.
+- **Be consistent and self-aware across re-runs.** Same PR ⇒ same skeleton and same kind of verdict every time. If anything changed since a previous `ci-status` comment on this PR (new failures, jobs finished, gap closed), say what changed in one line.
+- **Evidence + links.** Every failure cites a log line; every job / run / PR / SHA is a clickable markdown link (Link hygiene in Ground Rules). Never assert a cause you did not verify in the log or the diff.
 
 ### Log fetching strategy (REQUIRED)
 
@@ -394,40 +403,37 @@ Always show AMD CI first. If a group has zero failures, omit that group's table 
 - Specific log line: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}#step:{step_number}:{line_number}`
 - PR page: `https://github.com/sgl-project/sglang/pull/{pr_number}`
 
-### Output format
+### Output shape — a skeleton for consistency, not a straitjacket
+
+Keep this top-to-bottom order so a reviewer always finds the answer in the same place. Within it, write what's useful and drop what isn't; omit any section that is empty (no AMD failures ⇒ no AMD table). Show AMD before Others.
 
 ```
 ## CI Status for PR #N
 
-PR: [title](pr_url)
-Changed files: `file1.py` (+X/-Y), `file2.py` (+X/-Y)
+**Merge verdict (1–2 sentences, lead with this):** can it merge? are any failures caused by this PR? is the changed code actually exercised by this PR's CI? If the honest answer to the last one is "no", this line says so.
 
-> [!CAUTION]                          ← AMD CI did not run at all (most dangerous)
-> **AMD CI did not run for this PR — these changes are untested on AMD. Trigger / re-run AMD CI before merging.**
-> - `test/.../test_x.py` → `stage-c-...-amd`, stage C: did not run
+> [!CAUTION] | [!WARNING] | [!NOTE]   ← coverage verdict, ALWAYS present, right under the title
+> Pick the one that fits and name the suite(s) / env involved:
+> - [!CAUTION] — this PR's changed code is not exercised by any PR-CI test (env-gated, nightly-only, or AMD CI didn't run). Green does NOT verify it; run `<suite / command>` or set `<env>` before merging.
+> - [!WARNING] — a relevant suite (`<name>`, stage X) did not run / was blocked / is still pending. Green ≠ verified for that path.
+> - [!NOTE] — changed paths are covered by `<suite(s)>`, which ran on this PR.
 
-> [!WARNING]                          ← a PR-relevant AMD suite did not run / was blocked
-> **A code path changed by this PR was not tested on AMD — re-run AMD CI before merging.** A green / "Unlikely related" status below does **not** mean it's verified.
-> - `test/.../test_x.py` → `stage-c-...-amd`, stage C: did not run (blocked by an earlier stage)
+Changed files: `file.py` (+X/-Y), …   (one line)
 
-**AMD: X failures (Y likely related) | Others: X failures (Y related)**
+**AMD: <n> failures (<k> related) · Others: <n> failures (<k> related)**   (jobs still running ⇒ say "pending"; never count pending as passed)
 
-### AMD CI Failures
+### AMD CI Failures   (omit if none)
 
-| Job | Test File | Test Function | Error | Related? | Explanation | Log |
-|-----|-----------|---------------|-------|----------|-------------|-----|
-| job-name | `test/srt/test_mla.py` | `test_mla_correctness` | `AssertionError: rtol` | 🔴 Likely | Error in code changed by this PR | [Log](link) |
-| job-name | `test/srt/test_decode.py` | `test_decode_batch` | `TimeoutError` | 🟡 Possibly | Error in related module | [Log](link) |
-(If the failure is not a test — e.g. build error, server crash — use `N/A` for Test File/Function and describe the error.)
+| Job | Test File | Test Function | Error | Related? | Why |
+|-----|-----------|---------------|-------|----------|-----|
+| [job](url) | `test/...py` | `test_fn` | `Error: msg` | 🔴 / 🟡 / 🟢 | one-line code-path reason |
+(Non-test failure — build error, server crash — use `N/A` for file/function and describe it. Collapse fast-fail cascades into one row naming the root cause.)
 
-### Other CI Failures
+### Other CI Failures   (omit if none)
+(same columns)
 
-| Job | Test File | Test Function | Error | Related? | Explanation | Log |
-|-----|-----------|---------------|-------|----------|-------------|-----|
-| job-name | `test/test_utils.py` | `test_tokenizer` | `ImportError` | 🟢 Unlikely | Error in unrelated codepath | [Log](link) |
-
-### Details
-(For 🔴/🟡 failures: explain which PR changes could cause it, referencing the specific test file and function, with links to evidence.)
+### Details / what to do before merge
+Only for 🔴 / 🟡 failures and for the coverage gap: concrete next steps (which suite / env to run, what to look at). Triage steps, not directives.
 ```
 
 ---
