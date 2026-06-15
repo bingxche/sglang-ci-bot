@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Build the Daily Status Board content pinned in the CI monitor issue body.
+"""Build the Daily Cross-Workflow Summary pinned in the CI monitor issue body.
 
 Aggregates per-job analyses from ALL monitored workflows into a single
-cross-workflow status board, written DIRECTLY into the daily issue's
+**Daily Cross-Workflow Summary**, written DIRECTLY into the daily issue's
 body (not as a comment) so it appears pinned at the very top of the
-issue — above every per-workflow comment.
+issue — above every per-workflow comment. It answers, in 5 seconds,
+"Is CI healthy today, and what should I do?".
 
-The board lives between two placeholder markers in the issue body:
+The summary lives between two placeholder markers in the issue body:
 
-    <!-- ci-monitor-daily-status-board:start -->
-    ...rendered board...
-    <!-- ci-monitor-daily-status-board:end -->
+    <!-- daily-cross-workflow-summary:start -->
+    ...rendered summary...
+    <!-- daily-cross-workflow-summary:end -->
 
 (``ensure_daily_issue.py`` / ``monitor_ci.find_or_create_daily_issue``
 seed the placeholder block when the issue is first created.)
@@ -21,20 +22,21 @@ On each invocation:
     or ``monitor_ci.py``).
   - Read every per-workflow comment posted by ``monitor_ci.py`` and
     reconstruct the per-job analyses via ``parse_job_analyses_from_comment``.
-  - Best-effort fetch yesterday's board (from yesterday's issue body, or
-    the legacy board comment for issues that pre-date the body-pinning
+  - Best-effort fetch yesterday's summary (from yesterday's issue body, or
+    the legacy summary comment for issues that pre-date the body-pinning
     move) for trend / NEW-cluster detection.
-  - Run the agent (``Task: Daily Status Board``) which reads the
+  - Run the agent (``Task: Daily Cross-Workflow Summary``) which reads the
     methodology in ``agent/CLAUDE.md`` and produces a Markdown report.
   - PATCH the issue body, replacing the content between the placeholder
-    markers. If the markers are missing (legacy issue), seed a fresh
-    body and preserve the legacy content as a tail section.
-  - Delete any legacy daily-board comments left behind by the pre-body
-    code path so the board doesn't appear twice.
+    markers (matching the legacy ``ci-monitor-daily-status-board`` markers
+    too, so older issues migrate in place). If the markers are missing,
+    seed a fresh body and preserve the legacy content as a tail section.
+  - Delete any legacy summary comments left behind by the pre-body code
+    path so the summary doesn't appear twice.
 
 Output methodology (cluster IDs, confidence labels, no-priority rule,
 in-flight-fix lookup, completed-runs-only filter) lives entirely in
-``agent/CLAUDE.md`` under ``## Daily Cross-Workflow Status Board``.
+``agent/CLAUDE.md`` under ``## Daily Cross-Workflow Summary``.
 This script is a data-only harness.
 """
 
@@ -50,10 +52,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from monitor_ci import (
-    DAILY_BOARD_PLACEHOLDER_END,
-    DAILY_BOARD_PLACEHOLDER_START,
+    DAILY_SUMMARY_PLACEHOLDER_END,
+    DAILY_SUMMARY_PLACEHOLDER_START,
     MONITORED_WORKFLOWS,
-    _DAILY_BOARD_ANCHOR_RE,
+    _DAILY_SUMMARY_ANCHOR_RE,
     _extract_report,
     _initial_issue_body,
     find_daily_issue,
@@ -74,16 +76,24 @@ from utils import (
     update_issue_body,
 )
 
-log = logging.getLogger("daily-status-board")
+log = logging.getLogger("daily-summary")
 
-DAILY_BOARD_MARKER = "<!-- ci-monitor-daily-status-board -->"
-DEFAULT_BOARD_TIMEOUT = 1200
+# Marker written at the top of the in-body summary content. Old daily issues
+# (pre body-pinning) carried the summary as a *comment* with the legacy
+# marker below; that legacy value is matched for cleanup / yesterday-lookup.
+SUMMARY_CONTENT_MARKER = "<!-- daily-cross-workflow-summary -->"
+LEGACY_SUMMARY_COMMENT_MARKER = "<!-- ci-monitor-daily-status-board -->"
+
+DEFAULT_SUMMARY_TIMEOUT = 1200
 DEFAULT_AGENT_MAX_TURNS = 200
 
-_BOARD_BLOCK_RE = re.compile(
-    re.escape(DAILY_BOARD_PLACEHOLDER_START)
-    + r".*?"
-    + re.escape(DAILY_BOARD_PLACEHOLDER_END),
+# Matches the placeholder block under BOTH the new and the legacy marker
+# pair, so daily issues created before this rename migrate in place on the
+# next update (we always re-write the new markers).
+_SUMMARY_BLOCK_RE = re.compile(
+    r"<!-- (?:daily-cross-workflow-summary|ci-monitor-daily-status-board):start -->"
+    r".*?"
+    r"<!-- (?:daily-cross-workflow-summary|ci-monitor-daily-status-board):end -->",
     re.DOTALL,
 )
 
@@ -117,33 +127,34 @@ def collect_workflow_analyses(
     return by_workflow
 
 
-def find_board_comment(comments: list[dict]) -> dict | None:
-    """Find a legacy daily status board comment by its HTML marker.
+def find_legacy_summary_comment(comments: list[dict]) -> dict | None:
+    """Find a legacy Daily Summary *comment* by its HTML marker.
 
-    Kept only for backwards compatibility and yesterday-board lookup.
-    The current code path writes the board into the issue body
-    (see ``publish_board``), not as a comment.
+    Kept only for backwards compatibility and yesterday-summary lookup.
+    The current code path writes the summary into the issue body
+    (see ``publish_summary``), not as a comment.
     """
     for c in reversed(comments):
-        if DAILY_BOARD_MARKER in c.get("body", ""):
+        if LEGACY_SUMMARY_COMMENT_MARKER in c.get("body", ""):
             return c
     return None
 
 
-def extract_board_from_body(body: str) -> str | None:
-    """Pull the rendered board content out of the issue body.
+def extract_summary_from_body(body: str) -> str | None:
+    """Pull the rendered summary content out of the issue body.
 
     Returns the text between the start/end placeholders (inclusive of
     inner content but excluding the markers themselves). Returns
     ``None`` if the markers are missing or the block is still the
     initial placeholder copy.
     """
-    m = _BOARD_BLOCK_RE.search(body or "")
+    m = _SUMMARY_BLOCK_RE.search(body or "")
     if not m:
         return None
     inner = m.group(0)
-    inner = inner[len(DAILY_BOARD_PLACEHOLDER_START):]
-    inner = inner[: -len(DAILY_BOARD_PLACEHOLDER_END)]
+    # Strip whichever start/end marker pair matched.
+    inner = re.sub(r"^<!-- (?:daily-cross-workflow-summary|ci-monitor-daily-status-board):start -->", "", inner)
+    inner = re.sub(r"<!-- (?:daily-cross-workflow-summary|ci-monitor-daily-status-board):end -->$", "", inner)
     return inner.strip() or None
 
 
@@ -190,15 +201,15 @@ def build_workflows_block(wf_analyses: dict[str, list[dict]]) -> str:
     return "\n".join(lines)
 
 
-def fetch_yesterday_board(
+def fetch_yesterday_summary(
     token: str, bot_repo: str, today_str: str,
 ) -> str | None:
-    """Best-effort fetch of yesterday's status board for trend / NEW detection.
+    """Best-effort fetch of yesterday's summary for trend / NEW detection.
 
     Looks first in the issue body (current location) and falls back to
-    the legacy board comment for issues created before the body-pinning
-    change. Returns the rendered board text or ``None`` if nothing
-    usable is found. Errors are swallowed so today's board build never
+    the legacy summary comment for issues created before the body-pinning
+    change. Returns the rendered summary text or ``None`` if nothing
+    usable is found. Errors are swallowed so today's summary build never
     fails because of yesterday lookup.
     """
     try:
@@ -211,19 +222,19 @@ def fetch_yesterday_board(
             return None
         try:
             y_meta = get_issue(token, bot_repo, y_issue)
-            board_inner = extract_board_from_body(y_meta.get("body", ""))
-            if board_inner:
-                return board_inner
+            summary_inner = extract_summary_from_body(y_meta.get("body", ""))
+            if summary_inner:
+                return summary_inner
         except Exception as exc:
             log.warning("Could not fetch yesterday issue body (%s)", exc)
         y_comments = get_issue_comments(token, bot_repo, y_issue)
-        y_board = find_board_comment(y_comments)
-        if not y_board:
-            log.info("No board content in yesterday's issue #%d", y_issue)
+        y_summary = find_legacy_summary_comment(y_comments)
+        if not y_summary:
+            log.info("No summary content in yesterday's issue #%d", y_issue)
             return None
-        return y_board.get("body", "")
+        return y_summary.get("body", "")
     except Exception as exc:
-        log.warning("Failed to fetch yesterday's board (%s); continuing without", exc)
+        log.warning("Failed to fetch yesterday's summary (%s); continuing without", exc)
         return None
 
 
@@ -238,19 +249,19 @@ def build_agent_prompt(
     monitored_workflows: list[str],
     has_yesterday_context: bool,
 ) -> str:
-    """Compose the data-only prompt for ``Task: Daily Status Board``.
+    """Compose the data-only prompt for ``Task: Daily Cross-Workflow Summary``.
 
     Methodology and output format live in ``agent/CLAUDE.md``. This prompt
     only routes the task and points to the context files written into
     ``.ci-context/`` by ``claude_code_analyze``.
     """
     yesterday_line = (
-        "Yesterday's board: .ci-context/yesterday-board.md (for NEW vs carry-over detection)\n"
+        "Yesterday's summary: .ci-context/yesterday-summary.md (for NEW vs carry-over detection)\n"
         if has_yesterday_context
-        else "Yesterday's board: not available (treat all clusters as carry-over baseline)\n"
+        else "Yesterday's summary: not available (treat all clusters as carry-over baseline)\n"
     )
     return (
-        f"Task: Daily Status Board\n"
+        f"Task: Daily Cross-Workflow Summary\n"
         f"Date: {date_str}\n"
         f"Snapshot UTC: {snapshot_utc}\n"
         f"Issue: #{issue_num}\n"
@@ -270,7 +281,7 @@ def run_agent(
     issue_num: int,
     monitored_workflows: list[str],
 ) -> str | None:
-    """Invoke the Claude Code agent in the sglang repo to produce the board."""
+    """Invoke the Claude Code agent in the sglang repo to produce the summary."""
     if not claude_code_available():
         log.info("Claude Code CLI unavailable; agent mode skipped")
         return None
@@ -284,7 +295,7 @@ def run_agent(
         "per-workflow-analyses.md": workflows_block,
     }
     if yesterday_block:
-        context_files["yesterday-board.md"] = yesterday_block
+        context_files["yesterday-summary.md"] = yesterday_block
 
     prompt = build_agent_prompt(
         date_str, snapshot_utc, issue_num,
@@ -300,7 +311,7 @@ def run_agent(
                 os.environ.get("AGENT_MAX_TURNS", str(DEFAULT_AGENT_MAX_TURNS))
             ),
             timeout_secs=int(
-                os.environ.get("DAILY_BOARD_TIMEOUT_SECS", str(DEFAULT_BOARD_TIMEOUT))
+                os.environ.get("DAILY_SUMMARY_TIMEOUT_SECS", str(DEFAULT_SUMMARY_TIMEOUT))
             ),
         )
     except Exception as exc:
@@ -327,7 +338,7 @@ def run_api_fallback(
         issue_number=issue_num,
         workflows_block=workflows_block,
         yesterday_clusters_summary_or_none=(
-            yesterday_block if yesterday_block else "(no prior board available)"
+            yesterday_block if yesterday_block else "(no prior summary available)"
         ),
     )
 
@@ -350,10 +361,10 @@ def run_api_fallback(
 
 
 # ---------------------------------------------------------------------------
-# Comment publishing
+# Publishing
 # ---------------------------------------------------------------------------
 
-def render_board_body(snapshot_utc: str, agent_text: str, used_agent: bool) -> str:
+def render_summary_body(snapshot_utc: str, agent_text: str, used_agent: bool) -> str:
     """Wrap the agent output with the marker + footer.
 
     Defends against two LLM output failure modes:
@@ -361,42 +372,41 @@ def render_board_body(snapshot_utc: str, agent_text: str, used_agent: bool) -> s
     1. *Preamble*: scratchpad prose ("Now I have all the data, let me
        compose the final report.") emitted before the first heading.
        Stripped via ``_strip_llm_preamble``.
-    2. *Multiple drafts*: the model writing the entire ``# CI Daily
-       Health …`` report several times in a row, drafting → critiquing
-       → re-writing — with every draft retained in stdout. Discarded
-       via ``_keep_last_section`` keyed on the ``# CI Daily Health``
-       anchor, leaving only the last (final) draft.
+    2. *Multiple drafts*: the model writing the entire
+       ``# Daily Cross-Workflow Summary …`` report several times in a row,
+       drafting → critiquing → re-writing — with every draft retained in
+       stdout. Discarded via ``_keep_last_section`` keyed on the
+       ``# Daily Cross-Workflow Summary`` anchor, leaving only the last draft.
     """
     method = "Claude Code CLI" if used_agent else "Claude API"
     body = agent_text.strip()
-    if body.startswith(DAILY_BOARD_MARKER):
-        body = body[len(DAILY_BOARD_MARKER):].lstrip()
-    body = _extract_report(body, _DAILY_BOARD_ANCHOR_RE)
+    if body.startswith(SUMMARY_CONTENT_MARKER):
+        body = body[len(SUMMARY_CONTENT_MARKER):].lstrip()
+    body = _extract_report(body, _DAILY_SUMMARY_ANCHOR_RE)
     return (
-        f"{DAILY_BOARD_MARKER}\n"
+        f"{SUMMARY_CONTENT_MARKER}\n"
         f"{body}\n"
         f"\n---\n"
         f"*Generated by amd-bot using {method} (last updated: {snapshot_utc})*\n"
     )
 
 
-def publish_board(
+def publish_summary(
     token: str,
     bot_repo: str,
     issue_num: int,
     body: str,
     date_str: str,
 ) -> int:
-    """Replace the daily board placeholder block in the issue body.
+    """Replace the Daily Cross-Workflow Summary placeholder block in the body.
 
-    Reads the current issue body, swaps the content between
-    ``DAILY_BOARD_PLACEHOLDER_START`` / ``..._END`` markers with the
-    freshly rendered board, and PATCHes the issue. Returns the
-    issue number on success.
+    Reads the current issue body, swaps the content between the summary
+    placeholder markers (new or legacy) with the freshly rendered summary,
+    and PATCHes the issue. Returns the issue number on success.
 
     Falls back to seeding a fresh body using ``_initial_issue_body``
     if the placeholder markers are missing (e.g. an issue created
-    before this change shipped) so the board still ends up at the top.
+    before this change shipped) so the summary still ends up at the top.
     """
     try:
         issue = get_issue(token, bot_repo, issue_num)
@@ -407,21 +417,21 @@ def publish_board(
     current = issue.get("body", "") or ""
 
     block = (
-        f"{DAILY_BOARD_PLACEHOLDER_START}\n"
+        f"{DAILY_SUMMARY_PLACEHOLDER_START}\n"
         f"{body.strip()}\n"
-        f"{DAILY_BOARD_PLACEHOLDER_END}"
+        f"{DAILY_SUMMARY_PLACEHOLDER_END}"
     )
 
-    if _BOARD_BLOCK_RE.search(current):
-        new_body = _BOARD_BLOCK_RE.sub(block, current, count=1)
+    if _SUMMARY_BLOCK_RE.search(current):
+        new_body = _SUMMARY_BLOCK_RE.sub(lambda _m: block, current, count=1)
     else:
         log.info(
-            "Issue #%d has no board placeholder; seeding fresh body and "
+            "Issue #%d has no summary placeholder; seeding fresh body and "
             "preserving existing content as a tail section",
             issue_num,
         )
         seeded = _initial_issue_body(date_str)
-        new_body = _BOARD_BLOCK_RE.sub(block, seeded, count=1)
+        new_body = _SUMMARY_BLOCK_RE.sub(lambda _m: block, seeded, count=1)
         if current.strip():
             new_body = (
                 new_body.rstrip()
@@ -434,38 +444,37 @@ def publish_board(
     body_changed = new_body != current
     if body_changed:
         update_issue_body(token, bot_repo, issue_num, new_body)
-        log.info("Updated daily board (issue body) for issue #%d", issue_num)
+        log.info("Updated Daily Cross-Workflow Summary (issue body) for issue #%d", issue_num)
     else:
-        log.info("Daily board content unchanged for issue #%d; skipping PATCH",
+        log.info("Daily Cross-Workflow Summary unchanged for issue #%d; skipping PATCH",
                  issue_num)
 
-    _cleanup_legacy_board_comments(token, bot_repo, issue_num)
+    _cleanup_legacy_summary_comments(token, bot_repo, issue_num)
     return issue_num
 
 
-def _cleanup_legacy_board_comments(
+def _cleanup_legacy_summary_comments(
     token: str, bot_repo: str, issue_num: int,
 ) -> None:
-    """Delete any legacy board comments that pre-date the body-pinning move.
+    """Delete any legacy summary comments that pre-date the body-pinning move.
 
-    Issues created before the daily board moved into the issue body have
-    a comment with the ``DAILY_BOARD_MARKER`` that would otherwise show
-    stale data alongside the new in-body board. Best-effort cleanup —
-    failures are logged but never raised, so a flaky DELETE call cannot
-    break the daily build.
+    Issues created before the daily summary moved into the issue body have
+    a comment with the legacy marker that would otherwise show stale data
+    alongside the new in-body summary. Best-effort cleanup — failures are
+    logged but never raised, so a flaky DELETE call cannot break the build.
     """
     try:
         comments = get_issue_comments(token, bot_repo, issue_num)
     except Exception as exc:
-        log.warning("Could not list comments for legacy-board cleanup (%s)", exc)
+        log.warning("Could not list comments for legacy-summary cleanup (%s)", exc)
         return
-    legacy = [c for c in comments if DAILY_BOARD_MARKER in c.get("body", "")]
+    legacy = [c for c in comments if LEGACY_SUMMARY_COMMENT_MARKER in c.get("body", "")]
     for c in legacy:
         try:
             delete_comment(token, bot_repo, c["id"])
-            log.info("Deleted legacy board comment #%d", c["id"])
+            log.info("Deleted legacy summary comment #%d", c["id"])
         except Exception as exc:
-            log.warning("Failed to delete legacy board comment #%d (%s)",
+            log.warning("Failed to delete legacy summary comment #%d (%s)",
                         c["id"], exc)
 
 
@@ -473,16 +482,16 @@ def _cleanup_legacy_board_comments(
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def build_and_publish_board(
+def build_and_publish_summary(
     token: str,
     bot_repo: str,
     use_agent: bool = True,
     date_str: str | None = None,
 ) -> int | None:
-    """Build today's daily status board and PATCH it into the issue body.
+    """Build today's Daily Cross-Workflow Summary and PATCH it into the body.
 
-    The rendered board is written between the
-    ``<!-- ci-monitor-daily-status-board:start -->`` /
+    The rendered summary is written between the
+    ``<!-- daily-cross-workflow-summary:start -->`` /
     ``...:end -->`` markers in the daily issue's body, so it appears
     pinned at the very top of the issue (above all per-workflow
     comments).
@@ -498,11 +507,11 @@ def build_and_publish_board(
 
     issue_num = find_daily_issue(token, bot_repo, date_str)
     if not issue_num:
-        log.info("No daily issue for %s yet; skipping board build", date_str)
+        log.info("No daily issue for %s yet; skipping summary build", date_str)
         return None
 
     log.info(
-        "Building daily status board for issue #%d (%s, snapshot %s)",
+        "Building Daily Cross-Workflow Summary for issue #%d (%s, snapshot %s)",
         issue_num, date_str, snapshot_utc,
     )
 
@@ -514,11 +523,11 @@ def build_and_publish_board(
         total, len(workflows_with_failures), len(MONITORED_WORKFLOWS),
     )
     if total == 0:
-        log.info("No per-workflow failures yet; skipping board build")
+        log.info("No per-workflow failures yet; skipping summary build")
         return None
 
     workflows_block = build_workflows_block(wf_analyses)
-    yesterday_block = fetch_yesterday_board(token, bot_repo, date_str)
+    yesterday_block = fetch_yesterday_summary(token, bot_repo, date_str)
 
     agent_text: str | None = None
     used_agent = False
@@ -531,21 +540,21 @@ def build_and_publish_board(
         used_agent = bool(agent_text)
 
     if not agent_text:
-        log.info("Falling back to API mode for board synthesis")
+        log.info("Falling back to API mode for summary synthesis")
         agent_text = run_api_fallback(
             workflows_block, yesterday_block,
             date_str, snapshot_utc, issue_num,
         )
 
     if not agent_text:
-        log.error("Both agent and API failed; cannot publish board")
+        log.error("Both agent and API failed; cannot publish summary")
         return None
 
-    body = render_board_body(snapshot_utc, agent_text, used_agent)
+    body = render_summary_body(snapshot_utc, agent_text, used_agent)
     try:
-        return publish_board(token, bot_repo, issue_num, body, date_str)
+        return publish_summary(token, bot_repo, issue_num, body, date_str)
     except Exception as exc:
-        log.error("Failed to publish board to issue body (%s)", exc)
+        log.error("Failed to publish summary to issue body (%s)", exc)
         traceback.print_exc()
         return None
 
@@ -557,7 +566,7 @@ def build_and_publish_board(
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Build the daily cross-workflow status board "
+            "Build the Daily Cross-Workflow Summary "
             "(written into the issue body so it stays pinned at the top)"
         ),
     )
@@ -602,15 +611,15 @@ def main() -> int:
         )
         return 1
 
-    issue_id = build_and_publish_board(
+    issue_id = build_and_publish_summary(
         args.github_token, args.bot_repo,
         use_agent=args.use_agent,
         date_str=args.date,
     )
     if issue_id is None:
-        log.info("Daily status board not updated (see logs above)")
+        log.info("Daily Cross-Workflow Summary not updated (see logs above)")
         return 0
-    log.info("Daily status board pinned in issue #%d body", issue_id)
+    log.info("Daily Cross-Workflow Summary pinned in issue #%d body", issue_id)
     return 0
 
 

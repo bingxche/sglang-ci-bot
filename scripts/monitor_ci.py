@@ -355,34 +355,34 @@ def find_daily_issue(token: str, bot_repo: str, date_str: str) -> int | None:
     return None
 
 
-DAILY_BOARD_PLACEHOLDER_START = "<!-- ci-monitor-daily-status-board:start -->"
-DAILY_BOARD_PLACEHOLDER_END = "<!-- ci-monitor-daily-status-board:end -->"
+DAILY_SUMMARY_PLACEHOLDER_START = "<!-- daily-cross-workflow-summary:start -->"
+DAILY_SUMMARY_PLACEHOLDER_END = "<!-- daily-cross-workflow-summary:end -->"
 
 
 def _initial_issue_body(date_str: str) -> str:
-    """Render the initial daily-issue body, with a board placeholder block.
+    """Render the initial daily-issue body, with a summary placeholder block.
 
     The placeholder is delimited by HTML markers so that
-    ``build_daily_status_board.py`` can PATCH the rendered status board
-    in place without disturbing the rest of the body. This is what
-    lets the daily report be pinned at the very top of the issue
-    (as opposed to being posted as a comment that always lands below
+    ``daily_cross_workflow_summary.py`` can PATCH the rendered Daily
+    Cross-Workflow Summary in place without disturbing the rest of the
+    body. This is what lets the summary be pinned at the very top of the
+    issue (as opposed to being posted as a comment that always lands below
     earlier per-workflow comments).
     """
     wf_list = "\n".join(f"- `{w}`" for w in MONITORED_WORKFLOWS)
     return (
-        f"{DAILY_BOARD_PLACEHOLDER_START}\n"
-        f"_The daily cross-workflow status board will appear here once the "
+        f"{DAILY_SUMMARY_PLACEHOLDER_START}\n"
+        f"_The Daily Cross-Workflow Summary will appear here once the "
         f"first scan completes (typically within 30 minutes of the first run "
         f"finishing)._\n"
-        f"{DAILY_BOARD_PLACEHOLDER_END}\n\n"
+        f"{DAILY_SUMMARY_PLACEHOLDER_END}\n\n"
         f"---\n\n"
         f"## CI Monitor — {date_str}\n\n"
         f"**Repo**: [{REPO}](https://github.com/{REPO})\n\n"
         f"**Monitored Workflows**:\n"
         f"{wf_list}\n\n"
         f"*Per-workflow failure reports are appended as comments below; "
-        f"the cross-workflow daily status board is rendered above this section.*\n"
+        f"the Daily Cross-Workflow Summary is rendered above this section.*\n"
     )
 
 
@@ -416,7 +416,7 @@ _FIRST_HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
 # which contained 12 copies of `**Counts**:` in one cross-summary).
 _CROSS_SUMMARY_ANCHOR_RE = re.compile(r"^\*\*Counts\*\*:\s", re.MULTILINE)
 _PER_JOB_ANCHOR_RE = re.compile(r"^###\s+Commit Info\b", re.MULTILINE)
-_DAILY_BOARD_ANCHOR_RE = re.compile(r"^#\s+CI Daily Health\b", re.MULTILINE)
+_DAILY_SUMMARY_ANCHOR_RE = re.compile(r"^#\s+Daily Cross-Workflow Summary\b", re.MULTILINE)
 
 
 def _strip_llm_preamble(text: str) -> str:
@@ -1402,17 +1402,19 @@ def run_oneshot(
         output == "daily-issue"
         and bot_repo
         and total_reports > 0
-        and os.environ.get("BUILD_DAILY_BOARD", "true").lower() not in ("false", "0", "no")
+        and os.environ.get("BUILD_DAILY_SUMMARY",
+                            os.environ.get("BUILD_DAILY_BOARD", "true")).lower()
+        not in ("false", "0", "no")
     ):
         try:
-            from build_daily_status_board import build_and_publish_board
+            from daily_cross_workflow_summary import build_and_publish_summary
             log.info(
-                "Building daily cross-workflow status board (%d workflow(s) updated)",
+                "Building Daily Cross-Workflow Summary (%d workflow(s) updated)",
                 total_reports,
             )
-            build_and_publish_board(token, bot_repo, use_agent=use_agent)
+            build_and_publish_summary(token, bot_repo, use_agent=use_agent)
         except Exception as exc:
-            log.warning("Daily status board build failed: %s", exc)
+            log.warning("Daily Cross-Workflow Summary build failed: %s", exc)
             traceback.print_exc()
 
     gh_out = os.environ.get("GITHUB_OUTPUT")

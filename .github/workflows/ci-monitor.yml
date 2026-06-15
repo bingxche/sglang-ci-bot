@@ -146,3 +146,32 @@ jobs:
         with:
           path: .state/
           key: ci-monitor-state-${{ steps.cachekey.outputs.key }}-${{ github.run_id }}
+
+  finalize:
+    needs: monitor
+    if: always()
+    runs-on: [self-hosted, amd-internal]
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Update upstream Failure Trackers
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
+          LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
+          TRACKER_AGENT_MAX_TURNS: '80'
+          TRACKER_AGENT_TIMEOUT_SECS: '900'
+        run: |
+          USE_AGENT="${{ github.event.inputs.use_agent || 'true' }}"
+          ARGS="--bot-repo ${{ github.repository }}"
+          if [ "$USE_AGENT" != "true" ]; then
+            ARGS="$ARGS --no-use-agent"
+          fi
+          python scripts/failure_tracker.py $ARGS

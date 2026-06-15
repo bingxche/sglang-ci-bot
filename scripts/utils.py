@@ -192,7 +192,7 @@ def update_issue_body(
 ) -> dict:
     """Replace an issue's body via the REST API.
 
-    Used by the daily status board to PATCH the board content into the
+    Used by the Daily Cross-Workflow Summary to PATCH the summary content into the
     daily issue body (so it appears pinned at the very top of the
     issue), instead of posting a separate comment that would land
     below the per-workflow comments.
@@ -608,7 +608,7 @@ def analyze_job_with_agent(
 
     event_line = f"Event filter: {event_filter}\n" if event_filter else ""
     prompt = (
-        f"Task: CI Monitor\n"
+        f"Task: Job Failure Analysis\n"
         f"Job: {job_name}\n"
         f"Run: {run_url}\n"
         f"Job ID: {job_id}\n"
