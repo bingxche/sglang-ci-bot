@@ -40,6 +40,7 @@ env:
     nightly-test-amd-rocm720.yml
     release-docker-amd-nightly.yml
     release-docker-amd-rocm720-nightly.yml
+    nightly-amd-mi355x-disagg.yml
     amd-aiter-scout.yml
     pr-test-amd.yml
     pr-test-amd-rocm720.yml
@@ -90,7 +91,7 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 7
+      max-parallel: 8
       matrix:
         workflow: ${{ fromJSON(needs.prepare.outputs.workflows) }}
 

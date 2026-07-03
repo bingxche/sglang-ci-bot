@@ -12,7 +12,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 
 | Feature | Script | Trigger | What it does |
 |---------|--------|---------|--------------|
-| Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` every 30min | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 7, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
+| Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` every 30min | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 8, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
 | Daily Cross-Workflow Summary | `daily_cross_workflow_summary.py` | Auto-invoked by each `monitor_ci.py` matrix job that produced new failures (gated by `BUILD_DAILY_SUMMARY` env, default enabled); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling **Daily Cross-Workflow Summary** **pinned in the daily issue's body** (above all per-workflow comments) between `<!-- daily-cross-workflow-summary:start -->` / `<!-- daily-cross-workflow-summary:end -->` placeholder markers. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes the issue body in place, replacing only the content between the placeholders (matching the legacy `ci-monitor-daily-status-board` markers too, so older issues migrate in place). Legacy summary *comments* from before this move are auto-deleted by `_cleanup_legacy_summary_comments`. |
 | Failure Trackers (per workflow) | `failure_tracker.py` | A `finalize` job in `ci-monitor.yml` (`needs: monitor`), once per 30-min tick after the whole matrix completes | Maintains **one long-lived issue per tracked workflow on the upstream `sgl-project/sglang` repo** (`[Failure Tracker] <workflow>`), each a persistent fact record of every test failure that workflow has shown — one unified, transparent place to see every AMD CI failure and how long it has been red. **Content** (which tests failed, error, cluster, regression status) is found by a small, dedicated agent task (`Task: Failure Tracker Data`) reading the SAME per-job analyses the daily report is built from — kept consistent with the daily report, and decoupled from the giant Daily Cross-Workflow Summary prose (the earlier "append JSON to the summary output" approach was observed to silently drop the block). A deterministic fallback parses the per-job `### Failed Tests` tables if the agent is unavailable. **State** (each failure's `first_seen` date, duration, dedup-by-test) is owned by deterministic Python — a hidden JSON blob in the issue body, NEVER recomputed — so a test red for months keeps an accurate "Broken since" date independent of the daily report's short lookback or GitHub's log retention. Config-driven via `TRACKED_WORKFLOWS`: add a workflow → it gets its own ledger issue. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
@@ -64,13 +64,13 @@ runner-1 entrypoint.sh (sleep 1800) ─┐
                   │     placeholder seeded in body)   │
                   └─────────────────┬─────────────────┘
                                     │
-                                    ▼ matrix fan-out (max-parallel 7)
-        ┌──────────┬──────────┬─────┴────┬──────────┬──────────┬──────────┐
-        ▼          ▼          ▼          ▼          ▼          ▼          ▼
-  nightly-test  nightly-720  release-   release-   amd-aiter  pr-test    pr-test-720
-  -amd.yml     .yml         docker-    docker-    -scout.yml -amd.yml   .yml
-                            amd-       amd-720-                (sched-   (sched-
-                            nightly    nightly                 only)     only)
+                                    ▼ matrix fan-out (max-parallel 8)
+        ┌──────────┬──────────┬─────┴────┬──────────┬──────────┬──────────┬──────────┐
+        ▼          ▼          ▼          ▼          ▼          ▼          ▼          ▼
+  nightly-test  nightly-720  release-   release-   mi355x     amd-aiter  pr-test    pr-test-720
+  -amd.yml     .yml         docker-    docker-    disagg.yml  -scout.yml -amd.yml   .yml
+                            amd-       amd-720-                           (sched-   (sched-
+                            nightly    nightly                            only)     only)
 
    each matrix job runs:  python scripts/monitor_ci.py --workflows <one>
                                       AGENT_PARALLEL=3
@@ -115,7 +115,7 @@ runner-1 entrypoint.sh (sleep 1800) ─┐
                      before this body-pinning move
 ```
 
-**Why matrix instead of one big loop?** Earlier the monitor processed all 7 workflows sequentially in one job, which often timed out and lost in-flight data. Matrix fan-out caps each job at one workflow, runs them in parallel, and uses the GitHub Actions runner pool elastically. The trade-off: every matrix job that produces failures **independently** rebuilds the Daily Cross-Workflow Summary, so the summary can be rebuilt up to 7 times per dispatch. This is intentional — last writer wins, and since they all read the same per-workflow comments the result is convergent.
+**Why matrix instead of one big loop?** Earlier the monitor processed all workflows sequentially in one job, which often timed out and lost in-flight data. Matrix fan-out caps each job at one workflow, runs them in parallel, and uses the GitHub Actions runner pool elastically. The trade-off: every matrix job that produces failures **independently** rebuilds the Daily Cross-Workflow Summary, so the summary can be rebuilt up to 8 times per dispatch. This is intentional — last writer wins, and since they all read the same per-workflow comments the result is convergent.
 
 **Why a `prepare` step?** Without it, multiple matrix jobs racing `find_or_create_daily_issue()` would create duplicate issues for the same day. `ensure_daily_issue.py` runs once before fan-out so the issue (and its `:start`/`:end` placeholder block) exists by the time the matrix fires.
 
@@ -444,6 +444,7 @@ nightly-test-amd.yml
 nightly-test-amd-rocm720.yml
 release-docker-amd-nightly.yml
 release-docker-amd-rocm720-nightly.yml
+nightly-amd-mi355x-disagg.yml
 amd-aiter-scout.yml
 pr-test-amd.yml
 pr-test-amd-rocm720.yml
@@ -464,7 +465,7 @@ Each workflow report includes the sglang commit (`head_sha`) in the header, and 
 | `pr-review.yml` | Per comment ID | Duplicate dispatches cancelled |
 | `ci-status-check.yml` | Per comment ID | Duplicate dispatches cancelled |
 | `comment-watcher.yml` | Single instance | One watcher at a time |
-| `ci-monitor.yml` | Single instance at workflow level (`group: ci-monitor`); inside each dispatch, `prepare` job runs once → `monitor` matrix (max-parallel 7, one per workflow file) → `finalize` job runs once (`needs: monitor`, `if: always()`) | Only one monitor *dispatch* runs at a time; within it, the prepare step seeds the daily issue once, then up to 7 per-workflow analyses run in parallel (each producing failures independently rebuilds the Daily Cross-Workflow Summary — last writer wins, convergent). After all matrix jobs finish, the single `finalize` job updates the upstream per-workflow Failure Trackers (`failure_tracker.py`) once, seeing the fully-populated daily issue. |
+| `ci-monitor.yml` | Single instance at workflow level (`group: ci-monitor`); inside each dispatch, `prepare` job runs once → `monitor` matrix (max-parallel 8, one per workflow file) → `finalize` job runs once (`needs: monitor`, `if: always()`) | Only one monitor *dispatch* runs at a time; within it, the prepare step seeds the daily issue once, then up to 8 per-workflow analyses run in parallel (each producing failures independently rebuilds the Daily Cross-Workflow Summary — last writer wins, convergent). After all matrix jobs finish, the single `finalize` job updates the upstream per-workflow Failure Trackers (`failure_tracker.py`) once, seeing the fully-populated daily issue. |
 | `analyze-ci.yml` | Per run ID | Independent analyses run concurrently |
 
 The comment watcher uses **reaction-based idempotency**: before dispatching, it checks if amd-bot has already added a `rocket` reaction to the comment. Both daemon and cron watcher share this mechanism, so running both simultaneously is safe.
@@ -600,7 +601,7 @@ Long-lived issues on the upstream `sgl-project/sglang` repo — **one per tracke
 **Why a dedicated `finalize` job instead of generating alongside the Daily Cross-Workflow Summary?** Two reasons learned the hard way:
 
 1. **Reliability.** The Daily Cross-Workflow Summary agent emits ~30 KB of human prose; a trailing machine-readable JSON block appended to it was observed to be silently dropped by the model under output pressure (the tracker then never updated). A small, dedicated agent task whose *only* output is the JSON does not get dropped.
-2. **No races.** The summary is rebuilt by *each* matrix job that had new failures (up to 7 concurrently per tick), each seeing only partial data. The `finalize` job runs once after all 7 finish, so the tracker update is single and complete.
+2. **No races.** The summary is rebuilt by *each* matrix job that had new failures (up to 8 concurrently per tick), each seeing only partial data. The `finalize` job runs once after all 8 finish, so the tracker update is single and complete.
 
 **Content vs state split** (the core design):
 
@@ -790,7 +791,7 @@ sglang-ci-bot/
                               dispatches it every 30 minutes via API.
                               Layout: prepare job (resolve workflow list +
                               ensure_daily_issue.py) → monitor matrix job
-                              (max-parallel 7, one entry per workflow file
+                              (max-parallel 8, one entry per workflow file
                               from MONITORED_WORKFLOWS).
     analyze-ci.yml          On-demand URL analysis (workflow_dispatch)
     ci-status-check.yml     PR CI check (repository_dispatch + workflow_dispatch)
