@@ -30,7 +30,7 @@ Decoupling from the daily report
 ---------------------------------
 
 The tracker is NOT run inline by each per-workflow monitor job (that would
-race: up to 7 summary rebuilds per tick, each seeing partial data). Instead a
+race: up to 8 summary rebuilds per tick, each seeing partial data). Instead a
 single ``finalize`` job in ``ci-monitor.yml`` runs this module ONCE after the
 whole matrix completes, when today's daily issue is fully populated.
 

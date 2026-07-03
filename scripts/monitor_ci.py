@@ -60,6 +60,7 @@ MONITORED_WORKFLOWS = [
     "nightly-test-amd-rocm720.yml",
     "release-docker-amd-nightly.yml",
     "release-docker-amd-rocm720-nightly.yml",
+    "nightly-amd-mi355x-disagg.yml",
     "amd-aiter-scout.yml",
     "pr-test-amd.yml",
     "pr-test-amd-rocm720.yml",
