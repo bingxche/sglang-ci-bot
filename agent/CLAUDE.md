@@ -123,6 +123,36 @@ If a job runs a test suite (pytest, unittest), always report which specific test
 - Job page: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}`
 - Specific log line: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}#step:{step_number}:{line_number}`
 
+### Workflow-specific artifact evidence (REQUIRED for `nightly-amd-mi355x-disagg.yml`)
+
+The MI355X disagg nightly is a multi-node prefill/decode/router benchmark. Its
+GitHub job page log is mostly launcher/control-plane output; the authoritative
+prefill server, decode server, router/bench, and exit-marker logs are uploaded
+as run artifacts named `mi355x-*`. For this workflow, do NOT diagnose from the
+job page log alone.
+
+If the prompt includes `Artifact context: .ci-context/mi355x-artifacts/MANIFEST.md`,
+read that manifest first, then inspect the extracted files it lists:
+
+- `bench.log` — router startup, health waits, smoke request, GSM8K gate, and benchmark harness output.
+- `prefill_*.log` — prefill server process logs.
+- `decode_*.log` — decode server process logs.
+- `server_exit_*` / `bench_exit` — which role exited first and with what code.
+
+Use the job log only as the timeline and artifact upload confirmation. The
+failure classification, Failed Tests / non-test failure row, Facts, and
+Hypothesised Causes must cite evidence from the artifact logs when those logs
+exist. Since artifact files do not have GitHub line anchors, cite them as
+`artifact:<relative_path>` plus the matched timestamp / log fragment; keep the
+job-page link for the outer job reference.
+
+For regression history on `nightly-amd-mi355x-disagg.yml`, apply the same rule
+to comparable historical runs: list that run's `mi355x-*` artifacts, download
+the matching archive(s), extract any `*_logs.tar.gz`, and compare the same
+prefill/decode/router failure signal at the artifact-log level. Do not mark a
+historical run "passed for this failure" merely because its GitHub job page log
+does not contain the server-side error.
+
 ### Commit info extraction (REQUIRED)
 
 Every analysis **must** begin with a `### Commit Info` section. The prompt will supply a `Commit SHA` — use it as the sglang commit.
@@ -824,6 +854,10 @@ These errors were programmatically extracted from the log. Start your analysis f
 ```
 {filtered_log}
 ```
+
+If this log block contains a `## MI355X Run Artifact Logs` section, use those
+artifact logs as the primary failure evidence for the MI355X disagg workflow;
+the GitHub job log alone is not sufficient for that workflow.
 
 Produce a CONCISE report. Be brief — engineers will read this quickly then check the logs themselves. Be honest about uncertainty: this is API mode (no source-code access, no git history), so confidence on causes is bounded by what's visible in the log alone.
 

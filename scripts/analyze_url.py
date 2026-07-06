@@ -244,6 +244,7 @@ def run_analysis(
                         worktrees[job["id"]], workflow_name,
                         head_sha=head_sha,
                         event_filter=run.get("event", ""),
+                        github_token=token,
                     ): job
                     for job in jobs
                 }
@@ -273,7 +274,7 @@ def run_analysis(
             futures = {
                 executor.submit(
                     analyze_job_api, client, token, job, run_url,
-                    head_sha=head_sha,
+                    head_sha=head_sha, workflow_file=workflow_name,
                 ): job
                 for job in jobs
             }
