@@ -94,9 +94,10 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
 When the prompt asks you to analyze a single CI job failure, answer three questions:
 
 1. **What failed?** — Identify the exact test file(s) and test function(s) that failed. Include the error message and a link to the specific log line. Be precise: not just "the decode test job failed", but "test_mla_correctness in test/srt/test_mla_correctness.py failed with AssertionError on line 42".
-2. **When did it start?** — Check the last ~5 runs of the same workflow/job to determine if this is a new regression, a recurring failure, or a flaky test. When querying historical runs via the GitHub API, you MUST filter to get comparable runs:
+2. **When did it start?** — Check the most recent 15 comparable completed scheduled runs of the same workflow/job to determine if this is a new regression, a recurring failure, or a flaky test. When querying historical runs via the GitHub API, you MUST filter to get comparable runs:
    - **`branch`**: filter by the same branch (e.g. `branch=main`). Runs on different branches have different job matrices and are not comparable.
-   - **`event`**: filter by the same trigger event. The prompt includes an `Event filter:` line — use it. For example, `event=schedule` for cron workflows. A `schedule`-triggered run should only be compared with other `schedule`-triggered runs, not `pull_request` or `workflow_dispatch` runs of the same workflow.
+   - **`event`**: filter by the same trigger event. The prompt includes an `Event filter:` line — use it. For this scheduled monitor, use `event=schedule`; a `schedule`-triggered run should only be compared with other `schedule`-triggered runs, not `pull_request` or `workflow_dispatch` runs of the same workflow.
+   - **`status`**: only count completed runs. Exclude queued / in-progress / waiting runs from the 15-run history, or explicitly label them `[IN-FLIGHT]` if mentioned for context.
    - **Only count runs where the job actually ran** — skip runs where the job was skipped, cancelled, or not part of the matrix.
    - **Check at the test file level, NOT the job level.** A job may fail for many reasons — a different test file may have failed in a previous run. You MUST download the log for each historical run and check whether the **same test file** that failed in the current run also failed in that historical run. Do NOT rely on the job's overall pass/fail status. For example, if `test_mla.py` failed in today's run, and yesterday's run also shows "failed" but the failure was in `test_decode.py` (while `test_mla.py` passed), then yesterday is a **passing** run for `test_mla.py`.
 3. **Why did it fail?** — For regressions, narrow down the suspicious commit(s) using the commit range between the last passing run and the first failing run:
@@ -293,7 +294,7 @@ curl -sL -H "Authorization: token $GH_PAT" \
 ### Regression Status
 New regression / Known recurring failure / Never-passed (no green run found) / Flaky test / Infrastructure issue
 
-Recent history of **`<failing_test_file>`** (`<failing_test_function>`) in job `<job_name>` (same branch, same event, **completed runs only**):
+Recent history of **`<failing_test_file>`** (`<failing_test_function>`) in job `<job_name>` (most recent 15 comparable completed scheduled runs: same branch, `event=schedule`, completed runs only):
 | Date | Run | Job | Test File Status | Failed Function | Error |
 |------|-----|-----|------------------|-----------------|-------|
 | Apr 15 | [run](link) | `job_name` | ❌ Failed | `test_mla_correctness` | `AssertionError: rtol` |
@@ -301,7 +302,7 @@ Recent history of **`<failing_test_file>`** (`<failing_test_function>`) in job `
 | Apr 13 | [run](link) | `job_name` | ✅ Passed | — | — |
 (The Job column is for human reference only. The regression verdict is based on Test File Status, NOT the job's overall pass/fail.
  First observed failure date for this test file, last known passing date for this test file.
- If no passing run is found in the queryable window, mark as `Never-passed` and state the lookback range explicitly.
+ If no passing run is found in the 15-run query window, mark as `Never-passed` and state the lookback range explicitly.
  In-progress runs MUST be excluded or labelled `[IN-FLIGHT]`.)
 
 ### Failure Origin (REQUIRED for `amd-aiter-scout.yml`, omit otherwise)
