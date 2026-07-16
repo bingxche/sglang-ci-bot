@@ -1097,6 +1097,7 @@ def monitor_workflow(
                             worktrees[job["id"]], workflow_file,
                             head_sha=sha,
                             event_filter=event or "",
+                            github_token=token,
                         ): job
                         for job, run_url, sha in jobs_to_analyze
                     }
@@ -1120,7 +1121,10 @@ def monitor_workflow(
             client = create_anthropic_client()
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(analyze_job_api, client, token, job, run_url, head_sha=sha): job
+                    executor.submit(
+                        analyze_job_api, client, token, job, run_url,
+                        head_sha=sha, workflow_file=workflow_file,
+                    ): job
                     for job, run_url, sha in jobs_to_analyze
                 }
                 for future in as_completed(futures):

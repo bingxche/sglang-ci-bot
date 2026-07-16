@@ -13,7 +13,9 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
+import zipfile
 from pathlib import Path
 
 import anthropic
@@ -31,6 +33,10 @@ REPO = f"{REPO_OWNER}/{REPO_NAME}"
 CLAUDE_MODEL = "claude-opus-4-8"
 
 STEP_LOG_PREFILTER_THRESHOLD = 150_000
+
+MI355X_DISAGG_WORKFLOW = "nightly-amd-mi355x-disagg.yml"
+MI355X_ARTIFACT_PREFIX = "mi355x-"
+MI355X_ARTIFACT_CONTEXT_MAX_CHARS = 120_000
 
 ERROR_PATTERNS = re.compile(
     r"|".join([
@@ -159,6 +165,215 @@ def download_job_logs(token: str, job_id: int) -> str:
     if resp.status_code == 200:
         return resp.text
     return f"[Failed to fetch logs: HTTP {resp.status_code}]"
+
+
+def _run_id_from_url(run_url: str) -> int | None:
+    m = re.search(r"/actions/runs/(\d+)", run_url)
+    return int(m.group(1)) if m else None
+
+
+def _is_mi355x_disagg_workflow(workflow_file: str) -> bool:
+    return workflow_file.split("/")[-1] == MI355X_DISAGG_WORKFLOW
+
+
+def _safe_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._")
+    return cleaned or "artifact"
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _extract_zip_safely(zip_path: Path, dest_dir: Path) -> list[Path]:
+    """Extract a GitHub artifact zip, skipping unsafe paths."""
+    extracted: list[Path] = []
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.infolist():
+            target = dest_dir / member.filename
+            if not _path_within(target, dest_dir):
+                continue
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted.append(target)
+    return extracted
+
+
+def _extract_tar_safely(tar_path: Path, dest_dir: Path) -> list[Path]:
+    """Extract a log tarball, skipping symlinks and unsafe paths."""
+    extracted: list[Path] = []
+    with tarfile.open(tar_path, "r:*") as tf:
+        for member in tf.getmembers():
+            target = dest_dir / member.name
+            if not _path_within(target, dest_dir):
+                continue
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                continue
+            src = tf.extractfile(member)
+            if src is None:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted.append(target)
+    return extracted
+
+
+def _list_run_artifacts(token: str, run_id: int) -> list[dict]:
+    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/artifacts"
+    artifacts: list[dict] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            url,
+            headers=gh_headers(token),
+            params={"per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        items = resp.json().get("artifacts", [])
+        if not items:
+            break
+        artifacts.extend(items)
+        if len(items) < 100:
+            break
+        page += 1
+    return artifacts
+
+
+def _download_artifact_archive(token: str, artifact: dict, target: Path) -> None:
+    url = artifact["archive_download_url"]
+    with requests.get(
+        url,
+        headers=gh_headers(token),
+        allow_redirects=True,
+        stream=True,
+        timeout=120,
+    ) as resp:
+        resp.raise_for_status()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+
+def prepare_mi355x_artifact_context(
+    token: str | None,
+    run_id: int,
+    work_dir: Path,
+) -> Path | None:
+    """Download and unpack MI355X disagg workflow artifacts for an agent.
+
+    The nightly MI355X disagg workflow uploads the useful server-side evidence
+    as run artifacts, not only as GitHub job logs.  This helper materializes
+    those artifacts under ``.ci-context/mi355x-artifacts`` and writes a manifest
+    that the agent can read before diagnosing the failure.
+    """
+    _log = logging.getLogger("ci-monitor")
+    if not token:
+        _log.warning("No GitHub token available; cannot pre-download MI355X artifacts")
+        return None
+
+    context_dir = work_dir / ".ci-context"
+    artifact_root = context_dir / "mi355x-artifacts"
+    if artifact_root.exists():
+        shutil.rmtree(artifact_root)
+    artifact_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        run_artifacts = _list_run_artifacts(token, run_id)
+    except Exception as exc:
+        _log.warning("Failed to list MI355X artifacts for run %s: %s", run_id, exc)
+        shutil.rmtree(artifact_root, ignore_errors=True)
+        return None
+
+    artifacts = [
+        a for a in run_artifacts
+        if not a.get("expired") and a.get("name", "").startswith(MI355X_ARTIFACT_PREFIX)
+    ]
+    if not artifacts:
+        _log.warning("No MI355X artifacts found for run %s", run_id)
+        shutil.rmtree(artifact_root, ignore_errors=True)
+        return None
+
+    manifest: list[str] = [
+        "# MI355X Disagg Artifact Context",
+        "",
+        f"Workflow run: https://github.com/{REPO}/actions/runs/{run_id}",
+        "",
+        "These files were downloaded from run artifacts before analysis. "
+        "For this workflow, prefill/decode/router evidence usually lives here.",
+        "",
+        "## Downloaded Artifacts",
+        "",
+    ]
+    important_files: list[Path] = []
+
+    for artifact in artifacts:
+        artifact_name = artifact.get("name", "unnamed")
+        artifact_id = artifact.get("id", "unknown")
+        artifact_dir = artifact_root / f"{_safe_name(artifact_name)}-{artifact_id}"
+        archive_dir = artifact_dir / "archive"
+        logs_root = artifact_dir / "logs"
+        zip_path = artifact_dir / "artifact.zip"
+
+        manifest.append(
+            f"- `{artifact_name}` (id `{artifact_id}`, "
+            f"{artifact.get('size_in_bytes', 0):,} bytes)"
+        )
+
+        try:
+            _download_artifact_archive(token, artifact, zip_path)
+            extracted = _extract_zip_safely(zip_path, archive_dir)
+            zip_path.unlink(missing_ok=True)
+        except Exception as exc:
+            manifest.append(f"  - download/extract failed: `{exc}`")
+            _log.warning("Failed to download artifact %s: %s", artifact_name, exc)
+            continue
+
+        rel_archive = archive_dir.relative_to(work_dir)
+        manifest.append(f"  - archive contents: `{rel_archive}`")
+        for p in sorted(extracted):
+            rel = p.relative_to(work_dir)
+            manifest.append(f"    - `{rel}`")
+
+        tarballs = sorted(archive_dir.rglob("*_logs.tar.gz"))
+        for tarball in tarballs:
+            bundle_name = tarball.name.removesuffix(".tar.gz")
+            bundle_dir = logs_root / _safe_name(bundle_name)
+            try:
+                extracted_logs = _extract_tar_safely(tarball, bundle_dir)
+            except Exception as exc:
+                manifest.append(f"  - `{tarball.relative_to(work_dir)}` extract failed: `{exc}`")
+                _log.warning("Failed to extract log bundle %s: %s", tarball, exc)
+                continue
+
+            manifest.append(f"  - extracted log bundle: `{bundle_dir.relative_to(work_dir)}`")
+            important_files.extend(extracted_logs)
+
+    if important_files:
+        manifest.extend(["", "## Important Extracted Files", ""])
+        for p in sorted(important_files)[:300]:
+            manifest.append(f"- `{p.relative_to(work_dir)}`")
+
+    manifest_path = artifact_root / "MANIFEST.md"
+    manifest_path.write_text("\n".join(manifest) + "\n")
+    _log.info(
+        "Prepared MI355X artifact context for run %s: %d artifact(s), %d extracted file(s)",
+        run_id, len(artifacts), len(important_files),
+    )
+    return artifact_root
 
 
 def post_comment(
@@ -531,6 +746,64 @@ def prefilter_large_step_log(
     return filtered
 
 
+def build_artifact_context_excerpt(
+    artifact_root: Path,
+    max_chars: int = MI355X_ARTIFACT_CONTEXT_MAX_CHARS,
+) -> str:
+    """Build a compact text bundle from downloaded artifact logs for API mode."""
+    if not artifact_root.exists():
+        return ""
+
+    parts: list[str] = []
+    manifest = artifact_root / "MANIFEST.md"
+    if manifest.exists():
+        parts.append(f"### {manifest.relative_to(artifact_root.parent.parent)}\n")
+        parts.append(manifest.read_text(errors="replace")[:20_000])
+
+    def priority(path: Path) -> tuple[int, str]:
+        name = path.name.lower()
+        if name == "bench.log":
+            return (0, str(path))
+        if name.startswith("prefill_"):
+            return (1, str(path))
+        if name.startswith("decode_"):
+            return (2, str(path))
+        if name.startswith("server_exit") or name == "bench_exit":
+            return (3, str(path))
+        if name.endswith(".log"):
+            return (4, str(path))
+        return (5, str(path))
+
+    files = [
+        p for p in artifact_root.rglob("*")
+        if p.is_file()
+        and p.name != "MANIFEST.md"
+        and (
+            p.suffix == ".log"
+            or p.name.startswith("server_exit")
+            or p.name == "bench_exit"
+            or p.name.endswith(".json")
+        )
+    ]
+
+    for path in sorted(files, key=priority):
+        if sum(len(p) for p in parts) >= max_chars:
+            parts.append("\n... [artifact context truncated] ...\n")
+            break
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        remaining = max_chars - sum(len(p) for p in parts)
+        if remaining <= 0:
+            break
+        snippet = prefilter_large_step_log(text, max_chars=min(20_000, remaining))
+        rel = path.relative_to(artifact_root.parent.parent)
+        parts.append(f"\n\n### {rel}\n```text\n{snippet}\n```")
+
+    return "".join(parts)[:max_chars]
+
+
 # ---------------------------------------------------------------------------
 # Prompt template loading from CLAUDE.md
 # ---------------------------------------------------------------------------
@@ -588,6 +861,7 @@ def analyze_job_with_agent(
     job: dict, run_url: str, repo_path: Path,
     workflow_file: str = "", head_sha: str = "",
     event_filter: str = "",
+    github_token: str | None = None,
 ) -> dict:
     """Invoke Claude Code agent to fully analyze a CI failure.
 
@@ -606,6 +880,29 @@ def analyze_job_with_agent(
         if s.get("conclusion") not in ("success", "skipped", None)
     }
 
+    artifact_lines = ""
+    if _is_mi355x_disagg_workflow(workflow_file):
+        run_id = _run_id_from_url(run_url)
+        if run_id is not None:
+            artifact_token = (
+                github_token
+                or os.environ.get("GH_PAT")
+                or os.environ.get("BOT_PAT")
+                or os.environ.get("GITHUB_TOKEN")
+            )
+            artifact_root = prepare_mi355x_artifact_context(
+                artifact_token, run_id, repo_path,
+            )
+            manifest = (
+                f"{artifact_root.relative_to(repo_path)}/MANIFEST.md"
+                if artifact_root is not None else "unavailable"
+            )
+            artifact_lines = (
+                f"Artifact API URL: https://api.github.com/repos/{REPO}/actions/runs/{run_id}/artifacts\n"
+                f"Artifact name prefix: {MI355X_ARTIFACT_PREFIX}\n"
+                f"Artifact context: {manifest}\n"
+            )
+
     event_line = f"Event filter: {event_filter}\n" if event_filter else ""
     prompt = (
         f"Task: Job Failure Analysis\n"
@@ -616,6 +913,7 @@ def analyze_job_with_agent(
         f"Workflow file: {workflow_file}\n"
         f"{event_line}"
         f"Log URL: https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs\n"
+        f"{artifact_lines}"
         f"Source: current directory\n"
         f"GitHub API token: $GH_PAT"
     )
@@ -647,12 +945,13 @@ def analyze_job_api(
     job: dict,
     run_url: str,
     head_sha: str = "",
+    workflow_file: str = "",
 ) -> dict:
     """Download logs, extract errors, and run focused API analysis for one job."""
     _log = logging.getLogger("ci-monitor")
     job_name = job["name"]
     job_id = job["id"]
-    run_id = int(run_url.rstrip("/").split("/")[-1])
+    run_id = _run_id_from_url(run_url) or int(run_url.rstrip("/").split("/")[-1])
 
     failed_step_names = {
         s["name"]
@@ -676,6 +975,23 @@ def analyze_job_api(
             "  [%s] Pre-filtered log: %s -> %s chars",
             job_name, f"{len(raw_log):,}", f"{len(filtered_log):,}",
         )
+
+    if _is_mi355x_disagg_workflow(workflow_file):
+        _log.info("  [%s] Downloading MI355X run artifacts...", job_name)
+        with tempfile.TemporaryDirectory(prefix="mi355x-artifacts-") as tmp:
+            artifact_root = prepare_mi355x_artifact_context(token, run_id, Path(tmp))
+            if artifact_root is not None:
+                artifact_excerpt = build_artifact_context_excerpt(artifact_root)
+                if artifact_excerpt:
+                    filtered_log = (
+                        f"{filtered_log}\n\n"
+                        f"## MI355X Run Artifact Logs\n"
+                        f"{artifact_excerpt}"
+                    )
+                    _log.info(
+                        "  [%s] Added %s chars of MI355X artifact context",
+                        job_name, f"{len(artifact_excerpt):,}",
+                    )
 
     _log.info("  [%s] Analyzing...", job_name)
     analysis = focused_job_analysis(
