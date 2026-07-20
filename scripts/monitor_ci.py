@@ -66,12 +66,23 @@ MONITORED_WORKFLOWS = [
     "pr-test-amd-rocm720.yml",
 ]
 
-# All monitored workflows are analyzed only when triggered by ``schedule``.
-# Manually-dispatched (``workflow_dispatch``) and PR-triggered runs are
-# intentionally excluded so the daily report is not polluted by ad-hoc /
-# debug runs. Use ``analyze-ci.yml`` (Actions tab → "Analyze CI") if you
-# need on-demand analysis of a specific manual run.
-SCHEDULE_ONLY_WORKFLOWS = set(MONITORED_WORKFLOWS)
+# Most monitored workflows are analyzed only when triggered by ``schedule``
+# so the daily report is not polluted by ad-hoc / debug runs. AITER Scout is
+# the deliberate exception: both its scheduled and manually-dispatched runs
+# are release-scout signals and belong in the CI monitor.
+UNFILTERED_EVENT_WORKFLOWS = {"amd-aiter-scout.yml"}
+
+# Workflows that publish a cross-run pattern summary. This is independent of
+# event filtering: AITER Scout includes manual runs but still needs history.
+CROSS_RUN_SUMMARY_WORKFLOWS = set(MONITORED_WORKFLOWS)
+
+
+def workflow_event_filter(workflow_file: str) -> str | None:
+    """Return the GitHub Actions event filter for a monitored workflow."""
+    if workflow_file in UNFILTERED_EVENT_WORKFLOWS:
+        return None
+    return "schedule"
+
 
 SUCCESS_CONCLUSIONS = {"success"}
 
@@ -1293,7 +1304,7 @@ def publish_workflow_report(
 
     wf_state["overflow_ids"] = new_overflow_ids
 
-    if workflow_file in SCHEDULE_ONLY_WORKFLOWS:
+    if workflow_file in CROSS_RUN_SUMMARY_WORKFLOWS:
         try:
             maybe_publish_cross_run_summary(
                 token, bot_repo, issue_num, workflow_file,
@@ -1365,7 +1376,7 @@ def run_oneshot(
                 branch=branch,
                 use_agent=use_agent,
                 agent_repo_path=agent_repo_path,
-                event="schedule",
+                event=workflow_event_filter(wf),
             )
 
             if not new_analyses:

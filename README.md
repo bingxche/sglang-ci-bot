@@ -80,11 +80,12 @@ runner-1 entrypoint.sh (sleep 1800) ─┐
                                     ▼
                   monitor_ci.run_oneshot() per workflow:
                   1. ensure_sglang_repo() — clone or fast-forward /workspace/sglang
-                  2. get_workflow_runs(event="schedule") — non-success completed
-                                            + in-progress runs in lookback
-                                            window (default 24h). Manually-
-                                            dispatched / PR-triggered runs are
-                                            excluded by design.
+                  2. get_workflow_runs(event=workflow-specific filter) —
+                                            non-success completed + in-progress
+                                            runs in the lookback window (default
+                                            24h). Most workflows use `schedule`;
+                                            AMD AITER Scout also includes manual
+                                            `workflow_dispatch` runs.
                   3. for each run, get_failed_jobs() — drop gates, dedup vs
                      <!-- processed_job_ids: ... --> in existing comment
                   4. for each surviving failed job (up to AGENT_PARALLEL=3
@@ -455,9 +456,9 @@ pr-test-amd.yml
 pr-test-amd-rocm720.yml
 ```
 
-**All monitored workflows are filtered to `event=schedule` only.** Manually-dispatched (`workflow_dispatch`) runs and PR-triggered runs are intentionally excluded so the daily report is not polluted by ad-hoc / debug runs. If you need on-demand analysis of a specific manual run, use the `analyze-ci.yml` workflow (Actions tab → "Analyze CI" → paste the run/job URL).
+Most monitored workflows are filtered to `event=schedule` only. Manually-dispatched (`workflow_dispatch`) runs and PR-triggered runs are excluded so the daily report is not polluted by ad-hoc / debug runs. If you need on-demand analysis of a specific manual run, use the `analyze-ci.yml` workflow (Actions tab → "Analyze CI" → paste the run/job URL).
 
-This is enforced in `monitor_ci.run_oneshot()` by passing `event="schedule"` unconditionally to `monitor_workflow()`. The `SCHEDULE_ONLY_WORKFLOWS` constant equals `set(MONITORED_WORKFLOWS)` and exists only as a label for the cross-run-summary code path (which is also skipped automatically when fewer than 2 runs are present in the lookback window).
+**AMD AITER Scout is the intentional exception.** `amd-aiter-scout.yml` is queried without an event filter, so both its scheduled and manually-dispatched scout runs enter the daily CI monitor. `workflow_event_filter()` owns this per-workflow policy; `CROSS_RUN_SUMMARY_WORKFLOWS` separately controls cross-run summaries and includes every monitored workflow. Cross-run synthesis is skipped automatically when fewer than 2 runs are present in the lookback window.
 
 Each workflow report includes the sglang commit (`head_sha`) in the header, and the agent extracts the aiter commit from `[CI-AITER-CHECK]` log markers.
 
