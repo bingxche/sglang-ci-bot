@@ -63,10 +63,16 @@ fi
 if [ "${ENABLE_WATCHER:-}" = "true" ]; then
     WATCHER_TOKEN="${BOT_PAT:-$GH_PAT}"
     echo "Starting comment watcher daemon (poll every ${POLL_INTERVAL:-15}s)..."
-    BOT_PAT="${WATCHER_TOKEN}" python3 /tmp/bot/scripts/watch_comments.py \
-        --daemon \
-        --poll-interval "${POLL_INTERVAL:-15}" \
-        --bot-repo "${REPO_PATH}" &
+    (
+        while true; do
+            BOT_PAT="${WATCHER_TOKEN}" python3 /tmp/bot/scripts/watch_comments.py \
+                --daemon \
+                --poll-interval "${POLL_INTERVAL:-15}" \
+                --bot-repo "${REPO_PATH}" || true
+            echo "Comment watcher exited — restarting in 15s"
+            sleep 15
+        done
+    ) &
 
     echo "Starting CI monitor trigger (every 30 minutes)..."
     (
