@@ -31,6 +31,10 @@ Comment on any sglang PR:
 | `@amd-bot ci-status` | Check and analyze CI status |
 | `@amd-bot help` | Show available commands |
 
+`@amd-bot` must start its own line, and quote-reply lines (starting with `>`) are ignored. Mentioning the bot inside a sentence — or quoting someone else's command when you reply to them — therefore does not run anything, which is what previously caused a quoted `@amd-bot ci-status` to be executed a second time.
+
+Hyphenated commands also accept a space instead of the hyphen, so `@amd-bot ci status` and `@amd-bot review focus <areas>` work too. A mention with an unrecognized command (for example `@amd-bot ci`) gets the help comment as a reply instead of being silently dropped.
+
 ### Authorized users
 
 Only users listed in `AUTHORIZED_USERS` in `watch_comments.py` can trigger commands:

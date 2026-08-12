@@ -40,6 +40,7 @@ COMMANDS = {
     "ci-status": "Check and summarize CI status for this PR",
     "help": "Show available commands",
 }
+QUOTED_LINE_RE = re.compile(r"^\s*>.*$", re.MULTILINE)
 COMMENT_PAGE_SIZE = 100
 MAX_COMMENT_PAGES = 3
 # requests blocks forever without this; a black-holed socket then wedges the daemon.
@@ -102,17 +103,35 @@ def get_recent_comments(token: str, since: str | None = None) -> list[dict]:
 
 
 def parse_command(comment_body: str, trigger: str = BOT_TRIGGER) -> dict | None:
-    """Parse a bot command from a comment."""
-    body = comment_body.strip()
-    pattern = re.escape(trigger) + r"\s+(\S+)\s*(.*)"
-    match = re.search(pattern, body, re.IGNORECASE | re.DOTALL)
+    """Parse a bot command from a comment.
+
+    The trigger only counts at the start of an unquoted line. Quote-reply lines
+    and in-prose mentions repeat the trigger without requesting anything, and
+    treating those as commands re-runs whatever the quoted comment asked for.
+    """
+    body = QUOTED_LINE_RE.sub("", comment_body.replace("\r\n", "\n")).strip()
+    escaped = re.escape(trigger)
+    match = re.search(
+        rf"^[ \t]*{escaped}[ \t]+(\S+)[ \t]*(.*)",
+        body,
+        re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    )
     if not match:
-        if trigger.lower() in body.lower():
+        if re.search(rf"^[ \t]*{escaped}[ \t]*$", body, re.IGNORECASE | re.MULTILINE):
             return {"command": "review", "args": ""}
         return None
 
     command = match.group(1).lower().strip()
     args = match.group(2).strip()
+
+    # Accept the space-separated spelling of hyphenated commands ("ci status").
+    if args:
+        parts = args.split(None, 1)
+        candidate = f"{command}-{parts[0].lower()}"
+        if candidate in COMMANDS:
+            command = candidate
+            args = parts[1].strip() if len(parts) > 1 else ""
+
     return {"command": command, "args": args}
 
 
@@ -172,9 +191,12 @@ def dispatch_ci_status(
     log.info("Dispatched CI status check for PR #%d (comment %d)", pr_number, comment_id)
 
 
-def post_help_comment(token: str, pr_number: int):
+def post_help_comment(token: str, pr_number: int, unknown_command: str = ""):
     """Post a help message listing available commands."""
-    help_text = f"## amd-bot Help\n\nAvailable commands (mention `{BOT_TRIGGER}` followed by a command):\n\n"
+    help_text = ""
+    if unknown_command:
+        help_text += f"Unrecognized command `{BOT_TRIGGER} {unknown_command}` — nothing was run.\n\n"
+    help_text += f"## amd-bot Help\n\nAvailable commands (mention `{BOT_TRIGGER}` followed by a command):\n\n"
     for cmd, desc in COMMANDS.items():
         help_text += f"- `{BOT_TRIGGER} {cmd}` - {desc}\n"
     help_text += f"\n### Examples\n"
@@ -284,6 +306,7 @@ def process_comments(token: str, bot_repo: str, since: str | None = None):
             post_help_comment(token, cmd["pr_number"])
         else:
             log.warning("Unknown command: %s", cmd["command"])
+            post_help_comment(token, cmd["pr_number"], unknown_command=cmd["command"])
 
         processed_ids.add(cid)
 
