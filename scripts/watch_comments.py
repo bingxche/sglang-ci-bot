@@ -31,6 +31,9 @@ REPO = f"{REPO_OWNER}/{REPO_NAME}"
 
 BOT_LOGIN = "amd-bot"
 BOT_TRIGGER = f"@{BOT_LOGIN}"
+# Preserve existing @amd-bot commands while recognizing reactions made by
+# the replacement bingxche publisher identity.
+BOT_CLAIM_LOGINS = {BOT_LOGIN, "bingxche"}
 # To add a new user: append their GitHub username here AND update README.md
 AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd", "HaiShaw", "1am9trash", "sogalin", "Kangyan-Zhou", "Fridge003", "BowenBao", "ColinZ22", "fxmarty-amd", "hubertlu-tw", "RolaoDenthu", "Duyi-Wang", "amd-danli103", "akao-amd", "jonahbernard", "At1a8", "chuyeh", "mqhc2020", "chien-an-chen", "yuychang", "jiaryang", "Emmanuel0612"]
 AUTHORIZED_USER_LOGINS = {user.lower() for user in AUTHORIZED_USERS}
@@ -239,7 +242,10 @@ def has_bot_claimed(token: str, comment_id: int, reaction: str = "rocket") -> bo
         log.warning("Could not check reactions: HTTP %d", resp.status_code)
         return False
     for r in resp.json():
-        if r.get("content") == reaction and r.get("user", {}).get("login") == BOT_LOGIN:
+        if (
+            r.get("content") == reaction
+            and r.get("user", {}).get("login") in BOT_CLAIM_LOGINS
+        ):
             return True
     return False
 
