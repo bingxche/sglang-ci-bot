@@ -197,8 +197,6 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
         -v "sglang-runner-toolcache-${i}:/home/runner/actions-runner/_tool" \
         -v "${ENTRYPOINT_PATH}:/entrypoint.sh:ro" \
         "${RUNNER_MOUNT_ARGS[@]}" \
-        -e GH_PAT= \
-        -e BOT_PAT= \
         -e REPO_URL="https://github.com/${REPO}" \
         -e RUNNER_REGISTRATION_TOKEN="${RUNNER_REGISTRATION_TOKEN}" \
         -e RUNNER_NAME="${CONTAINER_NAME}" \

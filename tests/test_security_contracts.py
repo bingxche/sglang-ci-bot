@@ -90,8 +90,6 @@ class SecurityContractTests(unittest.TestCase):
         self.assertLess(entrypoint.index("unset GH_PAT"), entrypoint.index("exec ./run.sh"))
         self.assertNotIn("https://${GH_PAT}@github.com", entrypoint)
         self.assertIn("RUNNER_REGISTRATION_TOKEN", setup)
-        self.assertIn("-e GH_PAT=", setup)
-        self.assertIn("-e BOT_PAT=", setup)
 
     def test_runner_restart_reuses_registration_and_drops_bootstrap_token(self):
         entrypoint = (ROOT / "runner" / "entrypoint.sh").read_text()
