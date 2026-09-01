@@ -17,14 +17,14 @@ source "$VENV_DIR/bin/activate"
 # AMD LLM Gateway config
 export LLM_GATEWAY_URL="${LLM_GATEWAY_URL:-https://llm-api.amd.com/Anthropic}"
 export LLM_GATEWAY_KEY="${LLM_GATEWAY_KEY:-}"
-export GH_PAT="${GH_PAT:-}"
+export SGLANG_PAT="${SGLANG_PAT:-${GH_PAT:-}}"
 
 # Read secrets from files if not in env
 if [ -z "$LLM_GATEWAY_KEY" ] && [ -f "$PROJECT_DIR/.secrets/llm_gateway_key" ]; then
     export LLM_GATEWAY_KEY="$(cat "$PROJECT_DIR/.secrets/llm_gateway_key")"
 fi
-if [ -z "$GH_PAT" ] && [ -f "$PROJECT_DIR/.secrets/gh_pat" ]; then
-    export GH_PAT="$(cat "$PROJECT_DIR/.secrets/gh_pat")"
+if [ -z "$SGLANG_PAT" ] && [ -f "$PROJECT_DIR/.secrets/gh_pat" ]; then
+    export SGLANG_PAT="$(cat "$PROJECT_DIR/.secrets/gh_pat")"
 fi
 
 if [ -z "$LLM_GATEWAY_KEY" ]; then
@@ -33,10 +33,10 @@ if [ -z "$LLM_GATEWAY_KEY" ]; then
     echo "  Or:  export LLM_GATEWAY_KEY='your_key'"
     exit 1
 fi
-if [ -z "$GH_PAT" ]; then
-    echo "ERROR: GH_PAT not set."
+if [ -z "$SGLANG_PAT" ]; then
+    echo "ERROR: SGLANG_PAT not set."
     echo "  Run: echo 'your_token' > $PROJECT_DIR/.secrets/gh_pat"
-    echo "  Or:  export GH_PAT='your_token'"
+    echo "  Or:  export SGLANG_PAT='your_token'"
     exit 1
 fi
 
@@ -57,9 +57,9 @@ case "${1:-help}" in
             exit 1
         fi
         echo "[$(date)] Reviewing PR #$2..."
-        ARGS="$2"
-        [ -n "${3:-}" ] && ARGS="$ARGS --focus \"$3\""
-        eval python "$SCRIPT_DIR/review_pr.py" $ARGS \
+        args=("$2")
+        [ -n "${3:-}" ] && args+=(--focus "$3")
+        python "$SCRIPT_DIR/review_pr.py" "${args[@]}" \
             2>&1 | tee "$LOG_DIR/review_pr${2}_${TIMESTAMP}.log"
         ;;
     ci-status)

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 import requests
 
+from github_auth import sglang_token_from_env, validate_sglang_token
 from utils import (
     CLAUDE_MODEL,
     REPO,
@@ -158,7 +159,7 @@ def review_pr_with_agent(
         f"PR: #{pr_number}",
         f"Repo: sgl-project/sglang",
         f"Source: current directory (checked out to PR branch)",
-        f"GitHub API token: $GH_PAT",
+        f"GitHub API authentication: none (public GET requests only)",
     ]
     if focus_areas:
         lines.append(f"Focus areas: {focus_areas}")
@@ -276,14 +277,20 @@ def main():
         help="Use Claude Code agent (default: enabled, use --no-use-agent to disable)",
     )
     parser.add_argument(
-        "--github-token",
-        default=os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")),
+        "--sglang-token", "--github-token", dest="sglang_token",
+        default=sglang_token_from_env(),
+        help="bingxche token for upstream reads/comments",
     )
 
     args = parser.parse_args()
 
-    if not args.github_token:
-        print("Error: GitHub token required. Set GH_PAT.", file=sys.stderr)
+    if not args.sglang_token:
+        print("Error: upstream token required. Set SGLANG_PAT.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        validate_sglang_token(args.sglang_token)
+    except (ValueError, requests.RequestException) as exc:
+        print(f"Error: invalid SGLANG_PAT: {exc}", file=sys.stderr)
         sys.exit(1)
 
     if not args.use_agent:
@@ -295,7 +302,7 @@ def main():
             sys.exit(1)
 
     review_pr(
-        args.github_token,
+        args.sglang_token,
         args.pr_number,
         focus_areas=args.focus,
         review_context=args.context,

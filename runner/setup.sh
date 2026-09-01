@@ -2,7 +2,7 @@
 # One-command setup for sglang-ci-bot self-hosted GitHub Actions runners.
 #
 # Usage:
-#   bash runner/setup.sh --pat <GH_PAT> [--bot-pat <BOT_PAT>] [--llm-gateway-key <KEY>] [--count N] [--name <runner-prefix>] [--image <dockerhub-image>] [--build]
+#   bash runner/setup.sh --pat <BINGXCHE_PAT> [--llm-gateway-key <KEY>] [--count N] [--name <runner-prefix>] [--image <dockerhub-image>] [--build]
 #
 # Examples:
 #   # First time: build locally, spawn 10 runners (default)
@@ -25,7 +25,6 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 REPO="bingxche/sglang-ci-bot"
 RUNNER_NAME="amd-ci-bot-runner"
 GH_PAT=""
-BOT_PAT=""
 LLM_GATEWAY_KEY=""
 LLM_GATEWAY_URL=""
 RUNNER_VERSION="2.333.0"
@@ -37,11 +36,11 @@ RUNNER_COUNT=10
 POLL_INTERVAL=15
 CLAUDE_ENV_FILE=""
 USE_AGENT=false
+WATCHER_STATE_VOLUME="sglang-ci-bot-watcher-state"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --pat)             GH_PAT="$2"; shift 2 ;;
-        --bot-pat)         BOT_PAT="$2"; shift 2 ;;
         --llm-gateway-key) LLM_GATEWAY_KEY="$2"; shift 2 ;;
         --llm-gateway-url) LLM_GATEWAY_URL="$2"; shift 2 ;;
         --name)            RUNNER_NAME="$2"; shift 2 ;;
@@ -122,6 +121,15 @@ if [ "$FORCE_BUILD" = true ]; then
     echo ""
 fi
 
+echo "==> Preparing persistent watcher state volume..."
+docker volume create "${WATCHER_STATE_VOLUME}" >/dev/null
+docker run --rm \
+    --user root \
+    --entrypoint /bin/sh \
+    -v "${WATCHER_STATE_VOLUME}:/var/lib/sglang-ci-bot" \
+    "${RUN_IMAGE}" \
+    -c 'chown -R runner:runner /var/lib/sglang-ci-bot'
+
 # --- Pre-download runner tarball for offline updates ---
 RUNNER_TARBALL="/tmp/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
 RUNNER_MOUNT_ARGS=()
@@ -146,6 +154,7 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     echo "    Starting ${CONTAINER_NAME}..."
 
     EXTRA_ARGS=()
+    RUNNER_LABELS="self-hosted,amd-internal"
 
     # Claude Code env vars for ALL runners (agent mode)
     if [ "$USE_AGENT" = true ]; then
@@ -158,10 +167,25 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
 
     # Runner-1 specific: comment watcher daemon
     if [ "$i" -eq 1 ]; then
-        EXTRA_ARGS+=(-e ENABLE_WATCHER=true -e POLL_INTERVAL="${POLL_INTERVAL}")
-        if [ -n "$BOT_PAT" ]; then
-            EXTRA_ARGS+=(-e BOT_PAT="${BOT_PAT}")
-        fi
+        RUNNER_LABELS="self-hosted,amd-control"
+        EXTRA_ARGS+=(
+            -e ENABLE_WATCHER=true
+            -e POLL_INTERVAL="${POLL_INTERVAL}"
+            -e SGLANG_PAT="${GH_PAT}"
+            -e WATCHER_STATE_DIR=/var/lib/sglang-ci-bot
+            -v "${WATCHER_STATE_VOLUME}:/var/lib/sglang-ci-bot"
+        )
+    fi
+
+    RUNNER_REGISTRATION_TOKEN=$(curl -fsSL \
+        -X POST \
+        -H "Authorization: token ${GH_PAT}" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${REPO}/actions/runners/registration-token" \
+        | jq -r .token)
+    if [ -z "${RUNNER_REGISTRATION_TOKEN}" ] || [ "${RUNNER_REGISTRATION_TOKEN}" = "null" ]; then
+        echo "ERROR: Failed to mint registration token for ${CONTAINER_NAME}"
+        exit 1
     fi
 
     docker run -d \
@@ -174,9 +198,9 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
         -v "${ENTRYPOINT_PATH}:/entrypoint.sh:ro" \
         "${RUNNER_MOUNT_ARGS[@]}" \
         -e REPO_URL="https://github.com/${REPO}" \
-        -e GH_PAT="${GH_PAT}" \
+        -e RUNNER_REGISTRATION_TOKEN="${RUNNER_REGISTRATION_TOKEN}" \
         -e RUNNER_NAME="${CONTAINER_NAME}" \
-        -e LABELS="self-hosted,amd-internal" \
+        -e LABELS="${RUNNER_LABELS}" \
         "${EXTRA_ARGS[@]}" \
         "${RUN_IMAGE}"
 done
@@ -187,9 +211,13 @@ echo "  ${RUNNER_COUNT} runners deployed successfully!"
 echo "============================================"
 echo "  Containers  : ${RUNNER_NAME}-{1..${RUNNER_COUNT}}"
 echo "  Watcher     : ${RUNNER_NAME}-1 (comment daemon, poll ${POLL_INTERVAL}s)"
-echo "  CI Monitor  : ${RUNNER_NAME}-1 (workflow_dispatch trigger, every 15min)"
+echo "  CI Monitor  : ${RUNNER_NAME}-1 (workflow_dispatch trigger, every 30min)"
 echo "  Repo        : ${REPO}"
-echo "  Labels     : self-hosted, amd-internal"
+echo "  Runner-1    : self-hosted, amd-control (control daemon only)"
+if [ "$RUNNER_COUNT" -gt 1 ]; then
+    echo "  Runners 2-${RUNNER_COUNT}: self-hosted, amd-internal"
+fi
+echo "  Watch state : ${WATCHER_STATE_VOLUME}:/var/lib/sglang-ci-bot"
 echo "  Entrypoint : ${ENTRYPOINT_PATH} (bind-mounted, restart to apply changes)"
 echo ""
 echo "  View logs  : docker logs -f ${RUNNER_NAME}-1"

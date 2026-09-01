@@ -38,7 +38,7 @@ echo "3. Environment variables"
 [ -n "${ANTHROPIC_API_KEY:-}" ]   && pass "ANTHROPIC_API_KEY set"        || fail "ANTHROPIC_API_KEY not set"
 [ -n "${ANTHROPIC_BASE_URL:-}" ]  && pass "ANTHROPIC_BASE_URL set"       || fail "ANTHROPIC_BASE_URL not set"
 [ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ] && pass "ANTHROPIC_CUSTOM_HEADERS set" || fail "ANTHROPIC_CUSTOM_HEADERS not set (inject via --llm-gateway-key at runtime)"
-[ -n "${GH_PAT:-}${BOT_PAT:-}" ] && pass "GitHub token available"       || fail "Neither GH_PAT nor BOT_PAT set"
+[ -z "${GH_PAT:-}${BOT_PAT:-}${SGLANG_PAT:-}${GITHUB_TOKEN:-}" ] && pass "No GitHub token exposed to agent" || fail "GitHub token is exposed to agent"
 
 # 4. /workspace/sglang
 echo "4. sglang repo"
@@ -62,18 +62,13 @@ else
     fail "Skipped (missing claude or env vars)"
 fi
 
-# 6. GitHub API access
-echo "6. GitHub API access"
-TOKEN="${GH_PAT:-${BOT_PAT:-}}"
-if [ -n "$TOKEN" ]; then
-    HTTP=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $TOKEN" https://api.github.com/repos/sgl-project/sglang 2>/dev/null)
-    if [ "$HTTP" = "200" ]; then
-        pass "GitHub API OK (HTTP $HTTP)"
-    else
-        fail "GitHub API returned HTTP $HTTP"
-    fi
+# 6. Public GitHub API access
+echo "6. Public GitHub API access"
+HTTP=$(curl -s -o /dev/null -w "%{http_code}" https://api.github.com/repos/sgl-project/sglang 2>/dev/null)
+if [ "$HTTP" = "200" ]; then
+    pass "Public GitHub API OK (HTTP $HTTP)"
 else
-    fail "Skipped (no token)"
+    fail "Public GitHub API returned HTTP $HTTP"
 fi
 
 echo ""

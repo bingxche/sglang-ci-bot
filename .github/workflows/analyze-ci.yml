@@ -22,19 +22,24 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run analysis
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          SGLANG_PAT: ${{ secrets.GH_PAT }}
+          BOT_REPO_TOKEN: ${{ github.token }}
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
-          USE_AGENT: 'true'
+          USE_AGENT: 'false'
           AGENT_WORKSPACE: /workspace
+          ANALYZE_URL: ${{ github.event.inputs.url }}
+          BOT_REPOSITORY: ${{ github.repository }}
         run: |
           python scripts/analyze_url.py \
-            --url "${{ github.event.inputs.url }}" \
-            --bot-repo "${{ github.repository }}" \
-            --use-agent
+            --url "$ANALYZE_URL" \
+            --bot-repo "$BOT_REPOSITORY" \
+            --no-use-agent

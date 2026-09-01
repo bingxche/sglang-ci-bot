@@ -16,12 +16,20 @@ on:
         required: false
         default: 'false'
         type: boolean
+      comment_id:
+        description: 'Source comment ID (watcher dispatch)'
+        required: false
+        default: ''
+      comment_author:
+        description: 'Source comment author (watcher dispatch)'
+        required: false
+        default: ''
 
   repository_dispatch:
     types: [pr-review]
 
 concurrency:
-  group: pr-review-${{ github.event.client_payload.comment_id || github.event.inputs.pr_number }}
+  group: pr-review-${{ github.event.client_payload.comment_id || github.event.inputs.comment_id || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
@@ -33,44 +41,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Determine PR number
-        id: pr
-        run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
-            echo "focus=${{ github.event.client_payload.focus }}" >> $GITHUB_OUTPUT
-            echo "no_post=false" >> $GITHUB_OUTPUT
-            echo "comment_author=${{ github.event.client_payload.comment_author }}" >> $GITHUB_OUTPUT
-          else
-            echo "number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
-            echo "focus=${{ github.event.inputs.focus }}" >> $GITHUB_OUTPUT
-            echo "no_post=${{ github.event.inputs.no_post }}" >> $GITHUB_OUTPUT
-            echo "comment_author=" >> $GITHUB_OUTPUT
-          fi
-
       - name: Review PR
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          SGLANG_PAT: ${{ secrets.GH_PAT }}
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
-          COMMENT_AUTHOR: ${{ steps.pr.outputs.comment_author }}
-          USE_AGENT: ${{ vars.USE_AGENT || 'false' }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number || github.event.inputs.pr_number }}
+          FOCUS: ${{ github.event.client_payload.focus || github.event.inputs.focus }}
+          NO_POST: ${{ github.event.client_payload.no_post || github.event.inputs.no_post || 'false' }}
+          COMMENT_AUTHOR: ${{ github.event.client_payload.comment_author || github.event.inputs.comment_author }}
+          USE_AGENT: 'false'
           AGENT_WORKSPACE: /workspace
         run: |
-          ARGS="${{ steps.pr.outputs.number }}"
-
-          FOCUS="${{ steps.pr.outputs.focus }}"
+          args=("$PR_NUMBER" --no-use-agent)
           if [ -n "$FOCUS" ]; then
-            ARGS="$ARGS --focus \"$FOCUS\""
+            args+=(--focus "$FOCUS")
           fi
-
-          NO_POST="${{ steps.pr.outputs.no_post }}"
           if [ "$NO_POST" = "true" ]; then
-            ARGS="$ARGS --no-post"
+            args+=(--no-post)
           fi
-
-          eval python scripts/review_pr.py $ARGS
+          python scripts/review_pr.py "${args[@]}"

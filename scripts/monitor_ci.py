@@ -34,6 +34,12 @@ from pathlib import Path
 
 import requests
 
+from github_auth import (
+    bot_repo_token_from_env,
+    require_distinct_tokens,
+    sglang_token_from_env,
+    validate_sglang_token,
+)
 from utils import (
     REPO,
     analyze_job_api,
@@ -924,7 +930,7 @@ def _build_cross_run_prompt(
         f"{flaky_block}\n"
         f"Per-job analyses are available in .ci-context/per-job-analyses.md.\n\n"
         f"Source: current directory\n"
-        f"GitHub API token: $GH_PAT"
+        f"GitHub API authentication: none (public GET requests only)"
     )
 
 
@@ -1321,7 +1327,8 @@ def publish_workflow_report(
 # ---------------------------------------------------------------------------
 
 def run_oneshot(
-    token: str,
+    upstream_token: str,
+    bot_repo_token: str,
     bot_repo: str | None,
     output: str,
     workflows: list[str],
@@ -1350,14 +1357,18 @@ def run_oneshot(
 
     if bot_repo and not daily.get("issue_number"):
         try:
-            daily["issue_number"] = find_daily_issue(token, bot_repo, date_str)
+            daily["issue_number"] = find_daily_issue(
+                bot_repo_token, bot_repo, date_str,
+            )
         except Exception:
             pass
 
     gh_comments: list[dict] = []
     if bot_repo and daily.get("issue_number"):
         try:
-            gh_comments = get_issue_comments(token, bot_repo, daily["issue_number"])
+            gh_comments = get_issue_comments(
+                bot_repo_token, bot_repo, daily["issue_number"],
+            )
         except Exception:
             log.warning("Could not fetch issue comments, using local state only")
 
@@ -1369,7 +1380,7 @@ def run_oneshot(
             processed_job_ids = local_ids | gh_ids
 
             new_analyses, new_ids, pending = monitor_workflow(
-                token, wf,
+                upstream_token, wf,
                 hours_back=hours_back,
                 processed_job_ids=processed_job_ids,
                 job_name_filter=job_name_filter,
@@ -1400,7 +1411,7 @@ def run_oneshot(
 
             elif output == "daily-issue" and bot_repo:
                 publish_workflow_report(
-                    token, bot_repo, wf, new_analyses, pending, state,
+                    bot_repo_token, bot_repo, wf, new_analyses, pending, state,
                     gh_comments=gh_comments,
                     use_agent=use_agent,
                     agent_repo_path=agent_repo_path,
@@ -1428,7 +1439,9 @@ def run_oneshot(
                 "Building Daily Cross-Workflow Summary (%d workflow(s) updated)",
                 total_reports,
             )
-            build_and_publish_summary(token, bot_repo, use_agent=use_agent)
+            build_and_publish_summary(
+                bot_repo_token, bot_repo, use_agent=use_agent,
+            )
         except Exception as exc:
             log.warning("Daily Cross-Workflow Summary build failed: %s", exc)
             traceback.print_exc()
@@ -1479,9 +1492,14 @@ def main():
         help="Use Claude Code agent (default: enabled, use --no-use-agent to disable)",
     )
     parser.add_argument(
-        "--github-token",
-        default=os.environ.get("BOT_PAT", os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", ""))),
-        help="GitHub token",
+        "--sglang-token", "--github-token", dest="sglang_token",
+        default=sglang_token_from_env(),
+        help="bingxche token for upstream reads/comments",
+    )
+    parser.add_argument(
+        "--bot-repo-token",
+        default=bot_repo_token_from_env(),
+        help="Token limited to the bot repo (normally GITHUB_TOKEN)",
     )
 
     args = parser.parse_args()
@@ -1493,8 +1511,17 @@ def main():
         stream=sys.stdout,
     )
 
-    if not args.github_token:
-        log.error("GitHub token required. Set GH_PAT.")
+    if not args.sglang_token:
+        log.error("Upstream token required. Set SGLANG_PAT.")
+        sys.exit(1)
+    if args.output == "daily-issue" and not args.bot_repo_token:
+        log.error("Bot repository token required. Set BOT_REPO_TOKEN.")
+        sys.exit(1)
+    try:
+        require_distinct_tokens(args.sglang_token, args.bot_repo_token)
+        validate_sglang_token(args.sglang_token)
+    except (ValueError, requests.RequestException) as exc:
+        log.error("Invalid SGLANG_PAT: %s", exc)
         sys.exit(1)
 
     if not args.use_agent:
@@ -1506,7 +1533,7 @@ def main():
             sys.exit(1)
 
     run_oneshot(
-        args.github_token, args.bot_repo, args.output,
+        args.sglang_token, args.bot_repo_token, args.bot_repo, args.output,
         args.workflows, args.hours_back, args.branch, args.job_name,
         use_agent=args.use_agent,
     )
