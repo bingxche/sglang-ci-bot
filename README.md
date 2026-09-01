@@ -4,10 +4,7 @@ Automated CI monitoring and PR review bot for [sglang](https://github.com/sgl-pr
 
 All AI behavior — both agent mode and API mode — is defined in a single file: [`agent/CLAUDE.md`](agent/CLAUDE.md). Agent mode reads it automatically; API mode loads prompt templates from it at runtime via `load_prompt_template()`. To change any AI behavior, edit only this file.
 
-`amd-bot` is currently suspended. During the emergency fallback, users keep
-typing `@amd-bot`, but **[bingxche](https://github.com/bingxche)** adds the
-reactions and publishes the resulting comments. The command syntax and report
-branding stay unchanged so no caller migration is required.
+All public-facing comments are posted under the dedicated **[amd-bot](https://github.com/amd-bot)** GitHub account.
 
 ---
 
@@ -15,13 +12,13 @@ branding stay unchanged so no caller migration is required.
 
 | Feature | Script | Trigger | What it does |
 |---------|--------|---------|--------------|
-| Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` every 30min | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 8, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyzes its workflow's failures in API mode, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. For `nightly-amd-mi355x-disagg.yml`, per-job analysis pre-downloads the run's `mi355x-*` artifacts and includes bundled prefill/decode/router logs in the API context. After its workflow has any new failure analyzed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
+| Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` every 30min | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 8, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. For `nightly-amd-mi355x-disagg.yml`, per-job analysis pre-downloads the run's `mi355x-*` artifacts and unpacks bundled prefill/decode/router logs into `.ci-context/mi355x-artifacts` before invoking the agent. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
 | Daily Cross-Workflow Summary | `daily_cross_workflow_summary.py` | Auto-invoked by each `monitor_ci.py` matrix job that produced new failures (gated by `BUILD_DAILY_SUMMARY` env, default enabled); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling **Daily Cross-Workflow Summary** **pinned in the daily issue's body** (above all per-workflow comments) between `<!-- daily-cross-workflow-summary:start -->` / `<!-- daily-cross-workflow-summary:end -->` placeholder markers. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes the issue body in place, replacing only the content between the placeholders (matching the legacy `ci-monitor-daily-status-board` markers too, so older issues migrate in place). Legacy summary *comments* from before this move are auto-deleted by `_cleanup_legacy_summary_comments`. |
-| Failure Trackers (per workflow) | `failure_tracker.py` | A `finalize` job in `ci-monitor.yml` (`needs: monitor`), once per 30-min tick after the whole matrix completes | Maintains **one long-lived issue per tracked workflow on the upstream `sgl-project/sglang` repo** (`[Failure Tracker] <workflow>`), each a persistent fact record of every test failure that workflow has shown. During the emergency fallback, production uses the deterministic parser over the per-job `### Failed Tests` tables; a focused agent extractor remains available only for controlled local runs. **State** (each failure's `first_seen` date, duration, dedup-by-test) is owned by deterministic Python in a hidden JSON blob in the issue body. |
+| Failure Trackers (per workflow) | `failure_tracker.py` | A `finalize` job in `ci-monitor.yml` (`needs: monitor`), once per 30-min tick after the whole matrix completes | Maintains **one long-lived issue per tracked workflow on the upstream `sgl-project/sglang` repo** (`[Failure Tracker] <workflow>`), each a persistent fact record of every test failure that workflow has shown — one unified, transparent place to see every AMD CI failure and how long it has been red. **Content** (which tests failed, error, cluster, regression status) is found by a small, dedicated agent task (`Task: Failure Tracker Data`) reading the SAME per-job analyses the daily report is built from — kept consistent with the daily report, and decoupled from the giant Daily Cross-Workflow Summary prose (the earlier "append JSON to the summary output" approach was observed to silently drop the block). A deterministic fallback parses the per-job `### Failed Tests` tables if the agent is unavailable. **State** (each failure's `first_seen` date, duration, dedup-by-test) is owned by deterministic Python — a hidden JSON blob in the issue body, NEVER recomputed — so a test red for months keeps an accurate "Broken since" date independent of the daily report's short lookback or GitHub's log retention. Config-driven via `TRACKED_WORKFLOWS`: add a workflow → it gets its own ledger issue. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
-| PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Production sends the PR metadata/diff to the API and posts a structured review; controlled local agent mode can additionally inspect a PR worktree |
+| PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, separates CI completeness from executed failure attribution, determines if executed failures are PR-related, and warns when required downstream jobs were fast-fail skipped or when the AMD test covering a changed code path did not run |
-| Comment Watcher | `watch_comments.py` | Daemon (15s poll) + Cron (5min fallback) | Polls sglang PRs for `@amd-bot` commands, claims them as `bingxche`, and dispatches workflows |
+| Comment Watcher | `watch_comments.py` | Daemon (15s poll) + Cron (5min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches workflows |
 
 ### Supported commands
 
@@ -50,7 +47,7 @@ AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "
 
 ## End-to-end execution flow
 
-There are **three independent loops** running concurrently. Each is triggered differently and handles a different responsibility. Durable report state is shared through GitHub (issues, comments, reactions); the daemon watcher also keeps its polling checkpoint in the `sglang-ci-bot-watcher-state` Docker volume.
+There are **three independent loops** running concurrently. Each is triggered differently and handles a different responsibility. They share state only via GitHub (issues, comments, reactions) — never via local disk.
 
 ### Loop 1 — CI monitoring (every 30 minutes)
 
@@ -79,30 +76,38 @@ runner-1 entrypoint.sh (sleep 1800) ─┐
                             amd-       amd-720-                           (sched-   (sched-
                             nightly    nightly                            only)     only)
 
-   each matrix job runs:  python scripts/monitor_ci.py
-                            --workflows <one> --no-use-agent
+   each matrix job runs:  python scripts/monitor_ci.py --workflows <one>
+                                      AGENT_PARALLEL=3
+                                      AGENT_TIMEOUT_SECS=1500
+                                      AGENT_MAX_TURNS=150
                                     │
                                     ▼
                   monitor_ci.run_oneshot() per workflow:
-                  1. get_workflow_runs(event=workflow-specific filter) —
+                  1. ensure_sglang_repo() — clone or fast-forward /workspace/sglang
+                  2. get_workflow_runs(event=workflow-specific filter) —
                                             non-success completed + in-progress
                                             runs in the lookback window (default
                                             24h). Most workflows use `schedule`;
                                             AMD AITER Scout also includes manual
                                             `workflow_dispatch` runs.
-                  2. for each run, get_failed_jobs() — drop gates, dedup vs
+                  3. for each run, get_failed_jobs() — drop gates, dedup vs
                      <!-- processed_job_ids: ... --> in existing comment
-                  3. for each surviving failed job in parallel:
-                        - download and pre-filter the job log
+                  4. for each surviving failed job (up to AGENT_PARALLEL=3
+                     in parallel):
+                        - create_agent_worktree(job_id, head_sha)
+                          → /workspace/sglang-wt-<job_id> at the CI commit
                         - for nightly-amd-mi355x-disagg.yml only, download
                           the run's mi355x-* artifacts and unpack bundled
-                          prefill/decode/router logs into API context
-                        - run one Claude API analysis through the AMD LLM Gateway
-                  4. if >1 failure, synthesize a Cross-Job Summary via the API
-                  5. render_workflow_comment(...) — split into 60KB parts if
+                          prefill/decode/router logs under
+                          .ci-context/mi355x-artifacts
+                        - deploy /workspace/CLAUDE.md
+                        - run claude -p "Task: Job Failure Analysis ..." (cwd=worktree)
+                        - parse output, append to job_analyses
+                  5. if >1 failure, run Task: Cross-Job Summary agent
+                  6. render_workflow_comment(...) — split into 60KB parts if
                      needed (Part 1/N, Part 2/N, ... markers)
-                  6. PATCH or POST the per-workflow comment on today's issue
-                  7. if total_reports > 0 AND BUILD_DAILY_SUMMARY != false:
+                  7. PATCH or POST the per-workflow comment on today's issue
+                  8. if total_reports > 0 AND BUILD_DAILY_SUMMARY != false:
                         → call daily_cross_workflow_summary.build_and_publish_summary()
                                     │
                                     ▼
@@ -111,10 +116,11 @@ runner-1 entrypoint.sh (sleep 1800) ─┐
                   2. parse_job_analyses_from_comment() to recover structured data
                   3. fetch yesterday's summary (issue body, then legacy comment)
                      for trend / NEW-cluster detection
-                  4. synthesize the summary through the AMD LLM Gateway API
-                  5. PATCH the daily issue body, replacing only the content
+                  4. write context to .ci-context/per-workflow-analyses.md
+                  5. run claude -p "Task: Daily Cross-Workflow Summary ..."
+                  6. PATCH the daily issue body, replacing only the content
                      between :start --> and :end --> placeholders
-                  6. delete any legacy daily-summary comments left over from
+                  7. delete any legacy daily-summary comments left over from
                      before this body-pinning move
 ```
 
@@ -142,31 +148,32 @@ sglang PR comment: "@amd-bot review"
             1. skip if author NOT in AUTHORIZED_USERS
             2. parse_command()  → command + args
             3. skip if not actually a PR (is_pull_request)
-            4. has_bot_claimed(comment_id, "rocket", owners={amd-bot,bingxche}) ?
+            4. has_bot_claimed(comment_id, "rocket") ?
                  - YES → another watcher already grabbed it, skip
                  - NO  → claim it now:
                           add_reaction(comment_id, "rocket")  ← idempotency key
-            5. POST the corresponding workflow-dispatch endpoint:
-                 actions/workflows/pr-review.yml/dispatches
-                 actions/workflows/ci-status-check.yml/dispatches
-                 payload: {ref: main, inputs: {pr_number, comment_id, ...}}
+                          add_reaction(comment_id, "eyes")
+            5. POST bingxche/sglang-ci-bot/dispatches
+                 event_type: pr-review     (review / review-focus)
+                 event_type: ci-status     (ci-status)
                  (help → no dispatch; daemon posts help comment directly)
-            6. after a successful dispatch/comment, add the eyes reaction
                           │
                           ▼
-          workflow_dispatch fires the corresponding workflow:
+          repository_dispatch fires the corresponding workflow:
             pr-review.yml         → scripts/review_pr.py <PR>
             ci-status-check.yml   → scripts/check_ci_for_pr.py <PR>
                           │
                           ▼
           on a self-hosted runner:
-            - production workflow always passes --no-use-agent
-            - run a single-shot Anthropic API call via AMD LLM Gateway
+            - USE_AGENT comes from vars.USE_AGENT (repo Variable)
+            - if true: clone sglang, agent_worktree(tag, pr_number=N)
+                       → checkout pull/N/head → run claude
+            - else:    single-shot Anthropic API call via AMD LLM Gateway
             - post the result as a comment on the sglang PR
-              (under bingxche identity using secrets.GH_PAT)
+              (under amd-bot identity using secrets.GH_PAT)
 ```
 
-**Why two redundant paths?** The daemon (15s poll) is the fast path; the cron (5min) is the safety net for when runner-1 is restarting or rebuilding. Both treat `rocket` reactions from either `amd-bot` or `bingxche` as the same cross-process claim. A newly-created `bingxche` rocket is removed when workflow dispatch returns a definitive HTTP error, allowing a later poll to retry.
+**Why two redundant paths?** The daemon (15s poll) is the fast path; the cron (5min) is the safety net for when runner-1 is restarting or rebuilding. Both use the **same `rocket` reaction** as the cross-process idempotency lock, so they cannot double-dispatch even when they observe the same comment in the same window.
 
 ### Loop 3 — On-demand analysis (manual)
 
@@ -174,15 +181,18 @@ sglang PR comment: "@amd-bot review"
 maintainer pastes URL into Actions tab → analyze-ci.yml workflow_dispatch
                           │
                           ▼
-          scripts/analyze_url.py --url <url> --bot-repo ... --no-use-agent
+          scripts/analyze_url.py --url <url> --bot-repo ... --use-agent
             1. parse URL → (run_id, optional job_id)
             2. if job URL: analyze just that job
                if run URL: get_failed_jobs() (gates filtered out)
             3. create_github_issue(
                   title="[Analyze] <workflow>.yml run #<id> (<short_sha>)"
                ) on bingxche/sglang-ci-bot
-            4. parallel API analysis calls (max 2) → post per-job comments
-            5. if >1 jobs: synthesize a Cross-Job Summary via the API
+            4. parallel agents (max 2):
+                  agent_worktree(job_id, head_sha=run.head_sha)
+                  → run claude "Task: Job Failure Analysis ..."
+                  → post per-job comment
+            5. if >1 jobs: run "Task: Cross-Job Summary"
             6. PATCH the issue body with the rolled-up summary report
 ```
 
@@ -192,7 +202,7 @@ Concurrency is keyed on `${{ github.run_id }}` so independent dispatches run sid
 
 ## How Agent Mode Works
 
-Agent mode is a controlled local-only capability during the emergency fallback. When it is explicitly selected from a local CLI invocation, the Python script:
+When a task is triggered (CI failure analysis, PR review, or CI status check), the Python script:
 
 1. Clones/updates the sglang repo to `/workspace/sglang` (shared git object store)
 2. Creates an **isolated git worktree** per agent (e.g. `/workspace/sglang-wt-{job_id}`)
@@ -221,7 +231,7 @@ Agent prompts are **data-only** — they contain a `Task:` line and metadata, bu
 
 - **CI failures**: Download logs via GitHub API, identify failed tests at the **test file + function** level, compare with recent **completed** runs, detect regressions, propose hypothesised commits with confidence labels, search for in-flight fix PRs to avoid duplication. For `nightly-amd-mi355x-disagg.yml`, the bot also downloads `mi355x-*` run artifacts and analyzes bundled `bench.log`, `prefill_*.log`, `decode_*.log`, `server_exit_*`, and `bench_exit` files because the job page log alone does not contain the full multi-node failure evidence.
 - **PR reviews**: Read full source files in workspace, find callers of modified functions, verify AMD/ROCm parity, check test coverage
-- **Isolation (controlled local mode)**: Each agent gets its own worktree; concurrent local agent tasks cannot interfere with each other
+- **Isolation**: Each agent gets its own worktree — parallel agents (`AGENT_PARALLEL=3` per `monitor_ci.py` matrix job; `MAX_PARALLEL_JOBS=2` in `analyze_url.py`) and concurrent tasks cannot interfere with each other
 
 ### CI report methodology principles
 
@@ -240,64 +250,35 @@ The Job Failure Analysis / Cross-Job Summary / Cross-Run Pattern Analysis / Dail
 
 If Claude Code CLI is not available, all scripts automatically fall back to API mode (single-shot Anthropic API calls via AMD LLM Gateway). API mode loads prompt templates from the `## API Mode Prompts` section of `CLAUDE.md` via `load_prompt_template()`, ensuring both modes follow the same output format. API mode requires `LLM_GATEWAY_KEY` and `LLM_GATEWAY_URL` environment variables.
 
-During the `bingxche` emergency publisher fallback, all production workflows
-unconditionally pass `--no-use-agent`; none can launch Claude Code while a PAT
-is present in the workflow process environment. Agent mode remains available
-for controlled local testing only. Its child environment is scrubbed of GitHub
-and SSH variables as defense in depth, but that scrubbing is not a substitute
-for process isolation when a parent process holds secrets.
-
 ### Comment footers
 
 All bot-generated comments include a footer indicating the method used:
 
 | Method | Footer |
 |--------|--------|
-| Claude Code CLI (agent mode) | *Generated by amd-bot using Claude Code CLI* (posted by `bingxche` during fallback) |
-| Claude API (API mode) | *Generated by amd-bot using Claude API* (posted by `bingxche` during fallback) |
-| No LLM (e.g. help command) | *Generated by amd-bot* (posted by `bingxche` during fallback) |
+| Claude Code CLI (agent mode) | *Generated by amd-bot using Claude Code CLI* |
+| Claude API (API mode) | *Generated by amd-bot using Claude API* |
+| No LLM (e.g. help command) | *Generated by amd-bot* |
 
 ---
 
 ## Architecture
 
-The fallback uses one active GitHub account while preserving the old command
-name:
+The bot uses **two GitHub accounts**:
 
 | Account | Role |
 |---------|------|
-| **bingxche** | Repo owner, runner registrar, and temporary publisher of comments/reactions |
-| **amd-bot** | Suspended account; its username remains only as the public command trigger and report brand |
+| **bingxche** | Repo owner. Owns `bingxche/sglang-ci-bot`, registers self-hosted runners (requires admin access) |
+| **amd-bot** | Bot identity. Posts all public-facing comments and reactions on sglang PRs |
 
 **Token usage:**
 
 | Context | Token | Identity |
 |---------|-------|----------|
-| GitHub Actions access to `sgl-project/sglang` | `secrets.GH_PAT`, exposed to Python as `SGLANG_PAT` | bingxche |
-| GitHub Actions writes/dispatch inside this bot repo | short-lived `${{ github.token }}`, exposed as `BOT_REPO_TOKEN` | github-actions[bot] |
-| Daemon watcher + monitor trigger on runner-1 | the same existing bingxche PAT (`SGLANG_PAT`) | bingxche |
-| Claude Code analysis subprocess | not launched by production workflows; controlled local runs scrub GitHub variables but are not a hard process-isolation boundary | none directly |
-| Runner registration | one-hour registration token minted by `setup.sh` | bingxche |
-
-### Upstream code-write boundary
-
-Because `bingxche` is currently an outside collaborator, GitHub does not offer
-a comment-only fine-grained PAT for `sgl-project/sglang`. The emergency classic
-PAT is therefore broader at the GitHub account layer. The deployed bot contains
-that risk operationally:
-
-- production workflows force API mode and never launch an agent subprocess
-  while the workflow process holds `SGLANG_PAT`;
-- the sglang checkout always has a public fetch URL, an intentionally invalid
-  push URL, and no credential helper/Actions extraheader;
-- every workflow checkout uses `persist-credentials: false`;
-- the bot has no `git push`, merge, Git-ref write, or Contents-write path;
-- untrusted workflow values are passed via environment variables and shell
-  arrays; no workflow uses `eval`.
-
-This is a runtime containment boundary, not a GitHub-enforced token scope. Move
-back to an organization-scoped fine-grained PAT or GitHub App when
-`sgl-project` can approve one.
+| GitHub Actions workflows | `secrets.GH_PAT` (amd-bot's PAT) | amd-bot |
+| Daemon comment watcher + CI monitor (runner-1) | `BOT_PAT` env var (amd-bot's PAT) | amd-bot |
+| Claude Code agent (all containers) | `GH_PAT` env var | amd-bot |
+| Runner registration (`entrypoint.sh`) | `GH_PAT` env var (bingxche's PAT) | bingxche |
 
 ---
 
@@ -306,10 +287,11 @@ back to an organization-scoped fine-grained PAT or GitHub App when
 ### Prerequisites
 
 - **bingxche** GitHub account: owner of this bot repo
+- **amd-bot** GitHub account: collaborator (write access) on `bingxche/sglang-ci-bot`
 - AMD LLM Gateway subscription key and endpoint URL
-- One existing **bingxche** PAT that can read sglang Actions, post issue-style
-  PR comments/reactions, access this bot repository, and mint runner
-  registration tokens
+- Two GitHub PATs:
+  - **bingxche's PAT**: `repo` + `workflow` + `admin:repo_hook` scopes (runner registration)
+  - **amd-bot's PAT**: `repo` scope (posting comments, dispatching workflows)
 
 ### Repository secrets and variables
 
@@ -319,7 +301,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 
 | Secret | Value |
 |--------|-------|
-| `GH_PAT` | bingxche's existing PAT (temporary publisher credential) |
+| `GH_PAT` | amd-bot's GitHub PAT |
 | `LLM_GATEWAY_KEY` | AMD LLM Gateway subscription key |
 | `LLM_GATEWAY_URL` | AMD LLM Gateway endpoint (e.g. `https://llm-api.amd.com/Anthropic`) |
 
@@ -327,22 +309,19 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 
 | Variable | Value |
 |----------|-------|
-| `USE_AGENT` | Retained for local compatibility; production workflows pin API mode during the fallback |
+| `USE_AGENT` | `true` to enable agent mode in workflow-triggered reviews and CI checks |
 
 ### Deploy self-hosted runners
 
-`runner/setup.sh` spawns 10 runner containers. Runner-1 runs a comment watcher daemon + a CI monitor dispatch loop (dispatches `ci-monitor.yml` every 30 minutes via `workflow_dispatch`). It is registered with the dedicated `amd-control` label; all production jobs require `amd-internal`, so they run only on runners 2-10.
-
-`setup.sh` uses the personal token on the host to mint a short-lived runner
-registration token for each container. Runners 2-10 never receive the
-long-lived PAT. Runner-1 receives it only for its watcher/monitor subprocesses;
-`entrypoint.sh` removes it before starting `Runner.Listener`, and no production
-workflow targets its `amd-control` label. The public bot repository is cloned
-without credentials.
+`runner/setup.sh` spawns 10 runner containers. Runner-1 runs a comment watcher daemon + a CI monitor dispatch loop (dispatches `ci-monitor.yml` every 30 minutes via `workflow_dispatch`). Runners 2-10 are plain job executors.
 
 ```bash
 bash runner/setup.sh \
   --pat <bingxche-PAT> \
+  --bot-pat <amd-bot-PAT> \
+  --llm-gateway-key <KEY> \
+  --claude-env .secrets/claude.env \
+  --use-agent \
   --build
 ```
 
@@ -351,6 +330,10 @@ Or pull a pre-built image instead of building locally:
 ```bash
 bash runner/setup.sh \
   --pat <bingxche-PAT> \
+  --bot-pat <amd-bot-PAT> \
+  --llm-gateway-key <KEY> \
+  --claude-env .secrets/claude.env \
+  --use-agent \
   --image bingxche/sglang-ci-bot-runner:latest
 ```
 
@@ -358,11 +341,12 @@ bash runner/setup.sh \
 
 | Option | Description |
 |--------|-------------|
-| `--pat` | The single bingxche PAT. `setup.sh` uses it on the host to mint one-hour runner registration tokens; only runner-1 also receives it for the watcher/monitor loops. |
+| `--pat` | bingxche's PAT (runner registration, requires repo admin) |
+| `--bot-pat` | amd-bot's PAT (daemon comment watcher + CI monitor) |
 | `--llm-gateway-key` | AMD LLM Gateway key (enables CI monitor dispatch + API mode fallback) |
 | `--llm-gateway-url` | AMD LLM Gateway endpoint URL |
 | `--claude-env` | Path to env file with all Claude Code variables (e.g. `.secrets/claude.env`) |
-| `--use-agent` | Inject optional Claude Code settings for controlled local/container testing; production workflows still force API mode |
+| `--use-agent` | Enable Claude Code agent mode |
 | `--image` | Pull image from registry instead of building |
 | `--build` | Force local build from Dockerfile |
 | `--repo` | GitHub repo (default: `bingxche/sglang-ci-bot`) |
@@ -392,7 +376,6 @@ Containers are fully isolated from the host. The only host files mounted are:
 
 - `runner/entrypoint.sh` — read-only bind mount
 - `sglang-runner-toolcache-{i}` — Docker named volume for GitHub Actions tool cache
-- `sglang-ci-bot-watcher-state` — runner-1-only named volume mounted at `/var/lib/sglang-ci-bot`
 
 The bot code is cloned by `entrypoint.sh` to `/tmp/bot`. The sglang repo (`/workspace/sglang`) is cloned on-demand by `ensure_sglang_repo()` in `utils.py` when agent mode is invoked. Each agent runs in an isolated git worktree (`/workspace/sglang-wt-{tag}`) created by `create_agent_worktree(tag, head_sha)`, checked out to the exact CI commit being analyzed. Concurrent agents (up to 2 in agent mode) cannot interfere with each other. All analysis happens entirely inside the container.
 
@@ -400,17 +383,16 @@ The bot code is cloned by `entrypoint.sh` to `/tmp/bot`. The sglang repo (`/work
 
 ## Disaster recovery / migration to a new host
 
-The bot is containerized. Durable report state lives on GitHub; the watcher also
-keeps its polling checkpoint at `/var/lib/sglang-ci-bot/last_check.json` in the
-`sglang-ci-bot-watcher-state` named volume. `setup.sh` reuses that volume when
-runner-1 is recreated.
+The bot is fully containerized and stateless — all persistent state lives on GitHub (issues, comments, reactions). Migrating to a new host requires only Docker and the credentials listed below.
 
 ### What to bring
 
 | Item | Where to find it |
 |------|-----------------|
 | bingxche's GitHub PAT | GitHub > Settings > Developer settings > Personal access tokens |
-| `.secrets/claude.env` (optional) | Only needed for controlled local agent-mode testing |
+| amd-bot's GitHub PAT | Same, under the amd-bot account |
+| `.secrets/claude.env` | Copy from the old host (`sglang-ci-bot/.secrets/claude.env`) |
+| LLM Gateway key | Inside `claude.env` (`Ocp-Apim-Subscription-Key` value) |
 
 GitHub Actions repo secrets (`GH_PAT`, `LLM_GATEWAY_KEY`, `LLM_GATEWAY_URL`) and variables (`USE_AGENT`) are stored on GitHub — no migration needed.
 
@@ -424,12 +406,20 @@ curl -fsSL https://get.docker.com | sh
 git clone https://github.com/bingxche/sglang-ci-bot.git
 cd sglang-ci-bot
 
-# 3. Deploy (pulls pre-built image, no build needed)
+# 3. Copy secrets from old host (or recreate manually)
+mkdir -p .secrets
+scp old-host:/path/to/sglang-ci-bot/.secrets/claude.env .secrets/claude.env
+
+# 4. Deploy (pulls pre-built image, no build needed)
 bash runner/setup.sh \
   --pat <BINGXCHE_PAT> \
+  --bot-pat <AMD_BOT_PAT> \
+  --llm-gateway-key <LLM_GATEWAY_KEY> \
+  --claude-env .secrets/claude.env \
+  --use-agent \
   --image bingxche/sglang-ci-bot-runner:latest
 
-# 4. Verify
+# 5. Verify
 docker ps | grep amd-ci-bot-runner    # 10 containers running
 docker logs -f amd-ci-bot-runner-1    # watcher + CI monitor active
 ```
@@ -474,7 +464,7 @@ Most monitored workflows are filtered to `event=schedule` only. Manually-dispatc
 
 **AMD AITER Scout is the intentional exception.** `amd-aiter-scout.yml` is queried without an event filter, so both its scheduled and manually-dispatched scout runs enter the daily CI monitor. `workflow_event_filter()` owns this per-workflow policy; `CROSS_RUN_SUMMARY_WORKFLOWS` separately controls cross-run summaries and includes every monitored workflow. Cross-run synthesis is skipped automatically when fewer than 2 runs are present in the lookback window.
 
-Each workflow report includes the sglang commit (`head_sha`) in the header, and the analysis extracts the aiter commit from `[CI-AITER-CHECK]` log markers.
+Each workflow report includes the sglang commit (`head_sha`) in the header, and the agent extracts the aiter commit from `[CI-AITER-CHECK]` log markers.
 
 ---
 
@@ -488,7 +478,7 @@ Each workflow report includes the sglang commit (`head_sha`) in the header, and 
 | `ci-monitor.yml` | Single instance at workflow level (`group: ci-monitor`); inside each dispatch, `prepare` job runs once → `monitor` matrix (max-parallel 8, one per workflow file) → `finalize` job runs once (`needs: monitor`, `if: always()`) | Only one monitor *dispatch* runs at a time; within it, the prepare step seeds the daily issue once, then up to 8 per-workflow analyses run in parallel (each producing failures independently rebuilds the Daily Cross-Workflow Summary — last writer wins, convergent). After all matrix jobs finish, the single `finalize` job updates the upstream per-workflow Failure Trackers (`failure_tracker.py`) once, seeing the fully-populated daily issue. |
 | `analyze-ci.yml` | Per run ID | Independent analyses run concurrently |
 
-The comment watcher uses **reaction-based idempotency**: before dispatching, it checks if either `amd-bot` or `bingxche` has already added a `rocket` reaction to the comment. Both daemon and cron watcher share this mechanism, so running both simultaneously is safe.
+The comment watcher uses **reaction-based idempotency**: before dispatching, it checks if amd-bot has already added a `rocket` reaction to the comment. Both daemon and cron watcher share this mechanism, so running both simultaneously is safe.
 
 The CI monitor uses **comment metadata deduplication**: each workflow comment embeds `<!-- processed_job_ids: 111,222,333 -->`. Each run reads these IDs before analyzing, preventing duplicate analysis.
 
@@ -544,12 +534,6 @@ for i in $(seq 1 10); do docker restart amd-ci-bot-runner-$i; done
 for i in $(seq 1 10); do docker rm -f amd-ci-bot-runner-$i; done
 ```
 
-The entrypoint reuses an existing `.runner` configuration on container restart,
-so an expired one-hour registration token does not break restart recovery.
-Changing runner labels or activating the watcher-state volume requires
-recreating the containers with `setup.sh`; a restart intentionally keeps the
-already-registered labels and cannot add a new mount.
-
 ---
 
 ## CLI usage
@@ -575,8 +559,7 @@ USE_AGENT=false python scripts/monitor_ci.py --output stdout --hours-back 24
 | `--branch` | `main` | Only analyze runs on this branch |
 | `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` / `0` / `no` to disable) | Use Claude Code agent. Default ON; pass `--no-use-agent` (or set `USE_AGENT=false`) to fall back to direct Anthropic API calls via AMD LLM Gateway. |
 | `--bot-repo` | none | Bot repo for posting issues (required for `daily-issue`) |
-| `--sglang-token` (`--github-token` compatibility alias) | `SGLANG_PAT`, then legacy `GH_PAT` | Upstream read/comment credential |
-| `--bot-repo-token` | `BOT_REPO_TOKEN`, `${GITHUB_TOKEN}`, then upstream token | Bot-repo issue/report credential |
+| `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token for API access |
 
 When `--output daily-issue` is used and at least one workflow had new failures, `monitor_ci.py` automatically invokes `daily_cross_workflow_summary.build_and_publish_summary()` at the end to refresh the Daily Cross-Workflow Summary pinned in the daily issue body. Set the env var `BUILD_DAILY_SUMMARY=false` to disable this auto-trigger (e.g. for one-off debug runs).
 
@@ -603,7 +586,7 @@ python scripts/daily_cross_workflow_summary.py \
 | `--bot-repo` | required | Bot repo where the daily issue lives |
 | `--date` | today (UTC) | Daily issue date `YYYY-MM-DD` to rebuild for |
 | `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to force API fallback |
-| `--bot-repo-token` (`--github-token` compatibility alias) | `BOT_REPO_TOKEN` / `GITHUB_TOKEN` | Bot-repo issue/report credential |
+| `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token |
 
 The summary lives between two HTML placeholder markers in the daily issue body:
 
@@ -627,12 +610,12 @@ Long-lived issues on the upstream `sgl-project/sglang` repo — **one per tracke
 
 **Why a dedicated `finalize` job instead of generating alongside the Daily Cross-Workflow Summary?** Two reasons learned the hard way:
 
-1. **Reliability.** The tracker has its own extraction path rather than depending on a trailing machine-readable block in the long Daily Cross-Workflow Summary. Production emergency mode uses deterministic table parsing; controlled local mode may use the focused JSON-only agent task.
+1. **Reliability.** The Daily Cross-Workflow Summary agent emits ~30 KB of human prose; a trailing machine-readable JSON block appended to it was observed to be silently dropped by the model under output pressure (the tracker then never updated). A small, dedicated agent task whose *only* output is the JSON does not get dropped.
 2. **No races.** The summary is rebuilt by *each* matrix job that had new failures (up to 8 concurrently per tick), each seeing only partial data. The `finalize` job runs once after all 8 finish, so the tracker update is single and complete.
 
 **Content vs state split** (the core design):
 
-- **Content (what failed)** is found in production by a **deterministic parser** over the per-job `### Failed Tests` tables (scoped to each already-isolated per-job block, not a loose whole-comment scan). Controlled local mode can instead use the dedicated `Task: Failure Tracker Data` agent against the same per-job analyses.
+- **Content (what failed)** is found by the **agent** via the dedicated `Task: Failure Tracker Data`, reading the SAME per-job analyses the daily report is built from — so tracker rows are consistent with the daily report. If Claude Code is unavailable, a **deterministic fallback** parses the per-job `### Failed Tests` tables (scoped to each already-isolated per-job block, not a loose whole-comment scan).
 - **State (`first_seen` / duration / dedup)** is owned by **deterministic Python**. Each failure, keyed by `(test_file, test_function)` within its workflow's issue, lives in a hidden `<!-- ci-failure-tracker-state: {...} -->` JSON blob. On every scan an existing key keeps its original `first_seen` and only bumps `last_seen`; a new key is dated today; a key absent this scan is left untouched (never deleted, never re-dated). `Duration = last_seen − first_seen` and a `State` column (🔴 failing in latest scan / ⚪ quiet since `last_seen`) make "broken for N days" exact and persistent for months — the LLM is never asked to remember dates. (Issues created by the original single-workflow prototype using the legacy `<!-- pr-test-amd-tracker-state: -->` marker are read for backward compatibility and migrate to the generic marker on next update.)
 
 The `Detail` column on each row deep-links back to that day's per-job analysis in the bot's daily issue (`https://github.com/<bot-repo>/issues/<n>#job-<job_id>`).
@@ -652,8 +635,7 @@ python scripts/failure_tracker.py --bot-repo bingxche/sglang-ci-bot --no-use-age
 | `--bot-repo` | required | Bot repo hosting the daily issue (used to build `Detail` deep-links) |
 | `--date` | today (UTC) | Daily issue date `YYYY-MM-DD` to read failures from |
 | `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Agent extraction; `--no-use-agent` forces the deterministic table parser |
-| `--sglang-token` (`--github-token` compatibility alias) | `SGLANG_PAT`, then legacy `GH_PAT` | Upstream issue/comment credential |
-| `--bot-repo-token` | `BOT_REPO_TOKEN` / `GITHUB_TOKEN` | Reads the daily report from the bot repo |
+| `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token (needs issues:write on `sgl-project/sglang`) |
 
 Each tracker issue is found-or-created idempotently by exact-title search on the upstream repo (an issue still under the old `[CI Tracker] … — Persistent Failure Ledger` title is auto-renamed to the new `[Failure Tracker] …` scheme rather than duplicated). Per-workflow failures are caught and logged so one workflow's tracker error can never break another's.
 
@@ -696,7 +678,7 @@ python scripts/check_ci_for_pr.py 1234 --no-post --no-use-agent
 - **AMD CI was not triggered at all** for the commit → a `> [!CAUTION]` block (most dangerous: the change is completely untested on AMD; trigger / re-run AMD CI), or
 - **a relevant suite did not run** (cancelled, skipped, or blocked by an earlier stage failure) or is still pending → a `> [!WARNING]` block naming the test, its AMD job, and stage.
 
-The banner states that a passing / "Unlikely related" status does **not** mean the change is verified and tells the author to **re-run AMD CI** (no `/rerun-*` slash command is suggested — AMD tests can't be dispatched that way). This deterministic banner is computed in Python and injected at the top in **both** agent and API modes, so it appears regardless of agent behavior; in local agent mode the agent additionally traces changed **source** files to their covering registered tests. The production `ci-status-check.yml` workflow always selects API mode.
+The banner states that a passing / "Unlikely related" status does **not** mean the change is verified and tells the author to **re-run AMD CI** (no `/rerun-*` slash command is suggested — AMD tests can't be dispatched that way). This deterministic banner is computed in Python and injected at the top in **both** agent and API modes, so it appears regardless of agent behavior; in agent mode the agent additionally traces changed **source** files to their covering registered tests. (`ci-status-check.yml` defaults to agent mode — `USE_AGENT` defaults to `true`.)
 
 **CI completeness check (agent mode).** The `PR CI Status Check` agent also evaluates whether required vendor PR CI pipelines actually completed. If an upstream stage or wait/gate job fast-fails and downstream jobs are skipped / not reached, the merge verdict says **PR CI is incomplete** and the caution block calls out that fast-failed/skipped downstream jobs are **not tested**. Failure tables are scoped to **executed** CI failures only. For high-priority PRs that need full signal despite unrelated early failures, the bot suggests adding the `bypass-fastfail` label and rerunning/updating the branch, with a warning that this consumes more CI resources and should be used sparingly.
 
@@ -780,9 +762,8 @@ sglang-ci-bot/
                               all-workflows rollup). Reads per-workflow comments
                               posted by monitor_ci.py on the daily issue, re-parses
                               per-job analyses via parse_job_analyses_from_comment(),
-                              uses the API in production (or the agent in a
-                              controlled local run) to synthesize the summary,
-                              and PATCHes the DAILY ISSUE BODY between the
+                              spawns the agent with Task: Daily Cross-Workflow
+                              Summary, and PATCHes the DAILY ISSUE BODY between the
                               placeholder markers
                               <!-- daily-cross-workflow-summary:start --> /
                               <!-- daily-cross-workflow-summary:end --> (also
@@ -796,10 +777,10 @@ sglang-ci-bot/
                               by ci-monitor.yml's `finalize` job (needs:
                               monitor) after the matrix completes. Recovers the
                               tracked workflows' per-job analyses from today's
-                              daily issue, deterministically parses the
-                              `### Failed Tests` tables in production (with an
-                              optional local JSON-only agent mode), then merges
-                              into each issue's hidden
+                              daily issue, runs the dedicated `Task: Failure
+                              Tracker Data` agent (small JSON-only output, with
+                              a deterministic `### Failed Tests`-table parser as
+                              fallback), then merges into each issue's hidden
                               state blob that preserves every failure's
                               first_seen date forever (state = deterministic,
                               never recomputed by the LLM). Renders a table
@@ -812,7 +793,6 @@ sglang-ci-bot/
     check_ci_for_pr.py      PR CI status checker
     review_pr.py            PR code review
     watch_comments.py       Comment watcher / command dispatcher
-    github_auth.py          Token routing plus bingxche identity validation
     local_run.sh            Local dev runner
     verify_agent.sh         Claude Code agent verification
   .github/workflows/
@@ -835,7 +815,6 @@ sglang-ci-bot/
                               clone). Runner-1 only: starts watch_comments.py
                               --daemon AND a 30-minute loop that POSTs to
                               ci-monitor.yml/dispatches.
-  tests/                    Standard-library unit and security-contract tests
   .state/                   Persisted state files (gitignored)
   .secrets/                 Local secret files (gitignored): claude.env, llm_gateway_key, gh_pat
   requirements.txt          Python dependencies: anthropic, httpx, requests
@@ -847,15 +826,10 @@ sglang-ci-bot/
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `SGLANG_PAT` | Upstream-facing scripts | bingxche token used for sglang reads, PR comments/reactions, and existing Failure Tracker issue updates. Workflows map this from repository secret `GH_PAT`. |
-| `BOT_REPO_TOKEN` | Watcher/report scripts | Bot-repo token. Workflows use short-lived `${{ github.token }}`; runner-1 daemon temporarily falls back to the same `SGLANG_PAT`. |
-| `BOT_TRIGGER_LOGIN` | `watch_comments.py` | Command name to parse; fixed to `amd-bot` during fallback. |
-| `BOT_ACTOR_LOGIN` | `watch_comments.py` | Expected authenticated publisher; fixed to `bingxche` during fallback. |
-| `BOT_CLAIM_LOGINS` | `watch_comments.py` | Comma-separated reaction owners accepted as prior claims (`amd-bot,bingxche`). |
-| `WATCHER_STATE_FILE` | `watch_comments.py` | Poll checkpoint path; runner-1 defaults to `/var/lib/sglang-ci-bot/last_check.json` on a persistent named volume. |
+| `GH_PAT` / `BOT_PAT` | All scripts | GitHub token for API access and posting comments |
 | `LLM_GATEWAY_KEY` | API mode | AMD LLM Gateway subscription key |
 | `LLM_GATEWAY_URL` | API mode | AMD LLM Gateway endpoint |
-| `USE_AGENT` | All scripts | Set to `false` / `0` / `no` to disable agent mode. Production workflows currently force `false` so the emergency classic PAT is never exposed to an analysis subprocess. |
+| `USE_AGENT` | All scripts | Set to `false` / `0` / `no` to **disable** agent mode (default: enabled). Same effect as passing `--no-use-agent`. |
 | `BUILD_DAILY_SUMMARY` | `monitor_ci.py` | Set to `false` to skip the auto-trigger of `daily_cross_workflow_summary.py` after `monitor_ci` finishes (default: enabled; legacy alias `BUILD_DAILY_BOARD` still honored) |
 | `AGENT_PARALLEL` | `monitor_ci.py` | Max number of Claude Code agents per matrix job, processing failed jobs in parallel (default: `3`, capped to ≥1). Set in `ci-monitor.yml` env block. |
 | `AGENT_TIMEOUT_SECS` | `monitor_ci.py` per-job analysis | Per-job agent timeout (default: `1500` = 25 min in `ci-monitor.yml`; code fallback `1800` when env unset). |
@@ -897,10 +871,7 @@ Changes take effect on next `git push` + container restart (for daemon) or next 
 
 ### Bot identity
 
-Set `BOT_TRIGGER_LOGIN` for the command spelling, `BOT_ACTOR_LOGIN` for the
-authenticated publisher, and `BOT_CLAIM_LOGINS` for migration-time reaction
-deduplication. The emergency defaults are `amd-bot`, `bingxche`, and
-`amd-bot,bingxche` respectively.
+Edit `BOT_LOGIN` in `scripts/watch_comments.py`.
 
 ### Polling intervals
 

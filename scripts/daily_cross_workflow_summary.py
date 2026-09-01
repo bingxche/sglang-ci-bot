@@ -51,7 +51,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from github_auth import bot_repo_token_from_env
 from monitor_ci import (
     DAILY_SUMMARY_PLACEHOLDER_END,
     DAILY_SUMMARY_PLACEHOLDER_START,
@@ -270,7 +269,7 @@ def build_agent_prompt(
         f"Per-workflow analyses: .ci-context/per-workflow-analyses.md\n"
         f"{yesterday_line}"
         f"Source: current directory\n"
-        f"GitHub API authentication: none (public GET requests only)"
+        f"GitHub API token: $GH_PAT"
     )
 
 
@@ -484,7 +483,7 @@ def _cleanup_legacy_summary_comments(
 # ---------------------------------------------------------------------------
 
 def build_and_publish_summary(
-    bot_repo_token: str,
+    token: str,
     bot_repo: str,
     use_agent: bool = True,
     date_str: str | None = None,
@@ -506,7 +505,7 @@ def build_and_publish_summary(
     date_str = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     snapshot_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    issue_num = find_daily_issue(bot_repo_token, bot_repo, date_str)
+    issue_num = find_daily_issue(token, bot_repo, date_str)
     if not issue_num:
         log.info("No daily issue for %s yet; skipping summary build", date_str)
         return None
@@ -516,9 +515,7 @@ def build_and_publish_summary(
         issue_num, date_str, snapshot_utc,
     )
 
-    wf_analyses = collect_workflow_analyses(
-        bot_repo_token, bot_repo, issue_num,
-    )
+    wf_analyses = collect_workflow_analyses(token, bot_repo, issue_num)
     total = sum(len(v) for v in wf_analyses.values())
     workflows_with_failures = [wf for wf, v in wf_analyses.items() if v]
     log.info(
@@ -530,9 +527,7 @@ def build_and_publish_summary(
         return None
 
     workflows_block = build_workflows_block(wf_analyses)
-    yesterday_block = fetch_yesterday_summary(
-        bot_repo_token, bot_repo, date_str,
-    )
+    yesterday_block = fetch_yesterday_summary(token, bot_repo, date_str)
 
     agent_text: str | None = None
     used_agent = False
@@ -557,9 +552,7 @@ def build_and_publish_summary(
 
     body = render_summary_body(snapshot_utc, agent_text, used_agent)
     try:
-        return publish_summary(
-            bot_repo_token, bot_repo, issue_num, body, date_str,
-        )
+        return publish_summary(token, bot_repo, issue_num, body, date_str)
     except Exception as exc:
         log.error("Failed to publish summary to issue body (%s)", exc)
         traceback.print_exc()
@@ -591,9 +584,12 @@ def main() -> int:
         help="Use Claude Code agent (default: enabled, --no-use-agent to disable)",
     )
     parser.add_argument(
-        "--bot-repo-token", "--github-token", dest="bot_repo_token",
-        default=bot_repo_token_from_env(),
-        help="Token limited to the bot repo (normally GITHUB_TOKEN)",
+        "--github-token",
+        default=os.environ.get(
+            "BOT_PAT",
+            os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")),
+        ),
+        help="GitHub token (default: BOT_PAT / GH_PAT / GITHUB_TOKEN)",
     )
     args = parser.parse_args()
 
@@ -604,8 +600,8 @@ def main() -> int:
         stream=sys.stdout,
     )
 
-    if not args.bot_repo_token:
-        log.error("Bot repository token required. Set BOT_REPO_TOKEN.")
+    if not args.github_token:
+        log.error("GitHub token required. Set GH_PAT / BOT_PAT / GITHUB_TOKEN.")
         return 1
 
     if not args.use_agent and not os.environ.get("LLM_GATEWAY_KEY"):
@@ -616,7 +612,7 @@ def main() -> int:
         return 1
 
     issue_id = build_and_publish_summary(
-        args.bot_repo_token, args.bot_repo,
+        args.github_token, args.bot_repo,
         use_agent=args.use_agent,
         date_str=args.date,
     )

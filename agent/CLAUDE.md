@@ -5,7 +5,7 @@ You are an autonomous agent working on behalf of AMD engineers to monitor CI hea
 - **Project**: [sgl-project/sglang](https://github.com/sgl-project/sglang) — a fast serving framework for large language models
 - **Backends**: NVIDIA CUDA, AMD ROCm (HIP), NPU, XPU
 - **Source code**: `/workspace/sglang`
-- **GitHub API access**: public, unauthenticated, read-only requests only; no GitHub credential is available to the agent
+- **GitHub API token**: `$GH_PAT`
 - **GitHub API base**: `https://api.github.com/repos/sgl-project/sglang`
 
 ---
@@ -33,10 +33,10 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
 - **No git write commands.** Do NOT run `git checkout`, `git reset`, `git commit`, `git branch`, `git merge`, `git rebase`, or `git stash`.
 - **Read-only git is fine.** You may freely run `git log`, `git blame`, `git diff`, `git show`, `git log --all`, etc.
 - **Each invocation is atomic.** Do not assume any state from previous runs. Start fresh every time.
-- **GitHub API via curl.** Use unauthenticated `curl` only for public GET requests against `sgl-project/sglang`. Never call POST, PUT, PATCH, or DELETE endpoints. The Python harness, not the agent, owns all comment/report publishing.
+- **GitHub API via curl.** Use `curl -H "Authorization: token $GH_PAT"` for all API calls.
 - **Be evidence-based.** Always cite specific file paths, line numbers, and commit SHAs. Do not speculate without evidence.
 - **All analysis is at the test file + test function level.** Never report failures at just the job or run level. Always identify the specific test file (e.g. `test/srt/test_mla.py`) and test function (e.g. `test_mla_correctness`) that failed. This applies to everything: failure identification, regression tracking, PR correlation, and cross-job summaries.
-- **Verify every commit SHA.** Before citing a commit, run `git show <sha> --stat` or `git log --oneline <sha> -1` to confirm it exists. If the SHA is not in the local repo (shallow clone), use the public GitHub API: `curl -s https://api.github.com/repos/sgl-project/sglang/commits/<sha> | head -5`. NEVER fabricate or guess a commit SHA.
+- **Verify every commit SHA.** Before citing a commit, run `git show <sha> --stat` or `git log --oneline <sha> -1` to confirm it exists. If the SHA is not in the local repo (shallow clone), use the GitHub API: `curl -s -H "Authorization: token $GH_PAT" https://api.github.com/repos/sgl-project/sglang/commits/<sha> | head -5`. NEVER fabricate or guess a commit SHA.
 - **Link hygiene (REQUIRED).** Every commit SHA, PR number, and run/job ID you reference in a report MUST be rendered as a clickable markdown link. Never print a bare SHA like `` `e991be1c` `` — render it as `` [`e991be1c`](https://github.com/ROCm/aiter/commit/e991be1c) ``. Use these URL templates:
   - sglang commit `<sha>` → `` [`<sha>`](https://github.com/sgl-project/sglang/commit/<sha>) ``
   - aiter commit `<sha>` → `` [`<sha>`](https://github.com/ROCm/aiter/commit/<sha>) ``
@@ -78,7 +78,7 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
 - **Bot does NOT assign Priority.** Priority/severity is a human judgement call requiring business context the bot does not have. Bot only reports **factual Status**: how long the failure has persisted, how many jobs/workflows are affected, whether an in-flight fix exists. Engineers decide priority. The legacy `Priority: Critical/High/Medium/Low` field is removed from all bot output. Replace it with a `Status` line of facts.
 - **In-flight fix lookup REQUIRED before recommending any fix.** Before suggesting "pin X" / "revert Y" / "upgrade Z" / "disable test", search the sglang PR list for matching open PRs:
   ```
-  curl -s \
+  curl -s -H "Authorization: token $GH_PAT" \
     "https://api.github.com/search/issues?q=repo:sgl-project/sglang+is:pr+is:open+<keyword>"
   ```
   Use 1-3 keywords from the failing test name, file name, error message, or library name. If a matching open PR exists, report it instead of duplicating the recommendation:
@@ -190,19 +190,19 @@ When the aiter commit differs from the Dockerfile default (i.e., an override or 
 
 1. **Get the aiter commit history** via GitHub API:
    ```
-   curl -s \
+   curl -s -H "Authorization: token $GH_PAT" \
      "https://api.github.com/repos/ROCm/aiter/commits?sha=<aiter_sha>&per_page=10"
    ```
 
 2. **Compare with the previous aiter version** (Dockerfile default vs override):
    ```
-   curl -s \
+   curl -s -H "Authorization: token $GH_PAT" \
      "https://api.github.com/repos/ROCm/aiter/compare/<old_sha>...<new_sha>"
    ```
 
 3. **Read a specific aiter commit's diff**:
    ```
-   curl -s \
+   curl -s -H "Authorization: token $GH_PAT" \
      "https://api.github.com/repos/ROCm/aiter/commits/<sha>"
    ```
 
@@ -241,7 +241,7 @@ The `<name>` may contain matrix suffixes like `(linux-mi325-1gpu-sglang, 11)` �
 
 **2. List the sister workflow's recent scheduled runs** (filter to `event=schedule` and same branch so you never pick up another scout's `workflow_call` run):
 ```
-curl -s \
+curl -s -H "Authorization: token $GH_PAT" \
   "https://api.github.com/repos/sgl-project/sglang/actions/workflows/<sister>.yml/runs?event=schedule&branch=main&per_page=10"
 ```
 
@@ -249,9 +249,9 @@ Pick the most recent completed run whose `head_sha` is closest to (but not after
 
 **3. Find the sister job in that run** and download its log:
 ```
-curl -s \
+curl -s -H "Authorization: token $GH_PAT" \
   "https://api.github.com/repos/sgl-project/sglang/actions/runs/<baseline_run_id>/jobs?per_page=100"
-curl -sL \
+curl -sL -H "Authorization: token $GH_PAT" \
   "https://api.github.com/repos/sgl-project/sglang/actions/jobs/<baseline_job_id>/logs"
 ```
 
@@ -416,7 +416,7 @@ GitHub Actions job logs can be several MB each. Streaming pipelines like `curl �
 1. **Download all failed-job logs once into `/tmp/pr<N>_logs/<job_id>.log`** with a single bash loop, before any per-log analysis:
    ```
    mkdir -p /tmp/pr<N>_logs && for j in <job_id_1> <job_id_2> …; do
-     curl -sL \
+     curl -sL -H "Authorization: token $GH_PAT" \
        "https://api.github.com/repos/sgl-project/sglang/actions/jobs/$j/logs" \
        -o /tmp/pr<N>_logs/$j.log
    done

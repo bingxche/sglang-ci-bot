@@ -10,17 +10,9 @@ on:
         description: 'PR number to check CI status'
         required: true
         type: number
-      comment_id:
-        description: 'Source comment ID (watcher dispatch)'
-        required: false
-        default: ''
-      comment_author:
-        description: 'Source comment author (watcher dispatch)'
-        required: false
-        default: ''
 
 concurrency:
-  group: ci-status-${{ github.event.client_payload.comment_id || github.event.inputs.comment_id || github.event.inputs.pr_number }}
+  group: ci-status-${{ github.event.client_payload.comment_id || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
@@ -32,19 +24,27 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Determine PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "number=${{ github.event.client_payload.pr_number }}" >> $GITHUB_OUTPUT
+            echo "comment_author=${{ github.event.client_payload.comment_author }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+            echo "comment_author=" >> $GITHUB_OUTPUT
+          fi
+
       - name: Check CI Status
         env:
-          SGLANG_PAT: ${{ secrets.GH_PAT }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
-          PR_NUMBER: ${{ github.event.client_payload.pr_number || github.event.inputs.pr_number }}
-          COMMENT_AUTHOR: ${{ github.event.client_payload.comment_author || github.event.inputs.comment_author }}
-          USE_AGENT: 'false'
+          COMMENT_AUTHOR: ${{ steps.pr.outputs.comment_author }}
+          USE_AGENT: ${{ vars.USE_AGENT || 'true' }}
           AGENT_WORKSPACE: /workspace
-        run: python scripts/check_ci_for_pr.py "$PR_NUMBER" --no-use-agent
+        run: python scripts/check_ci_for_pr.py ${{ steps.pr.outputs.number }}

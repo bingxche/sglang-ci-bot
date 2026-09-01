@@ -54,12 +54,6 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from github_auth import (
-    bot_repo_token_from_env,
-    require_distinct_tokens,
-    sglang_token_from_env,
-    validate_sglang_token,
-)
 from monitor_ci import (
     find_daily_issue,
     find_workflow_comment_parts,
@@ -546,7 +540,7 @@ def _build_agent_prompt(workflows: list[str]) -> str:
         f"Workflows: {', '.join(workflows)}\n"
         "Per-workflow per-job analyses: .ci-context/failure-tracker-analyses.md\n"
         "Source: current directory\n"
-        "GitHub API authentication: none (public GET requests only)"
+        "GitHub API token: $GH_PAT"
     )
 
 
@@ -582,8 +576,7 @@ def run_agent_extraction(
 # ---------------------------------------------------------------------------
 
 def update_trackers(
-    upstream_token: str,
-    bot_repo_token: str,
+    token: str,
     bot_repo: str,
     date_str: str | None = None,
     use_agent: bool = True,
@@ -597,14 +590,12 @@ def update_trackers(
     date_str = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     snapshot_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    issue_num = find_daily_issue(bot_repo_token, bot_repo, date_str)
+    issue_num = find_daily_issue(token, bot_repo, date_str)
     if not issue_num:
         log.info("No daily issue for %s; nothing to track", date_str)
         return {}
 
-    wf_analyses = collect_tracked_analyses(
-        bot_repo_token, bot_repo, issue_num,
-    )
+    wf_analyses = collect_tracked_analyses(token, bot_repo, issue_num)
     total = sum(len(v) for v in wf_analyses.values())
     log.info(
         "Tracking %d workflow(s); %d per-job analyses recovered from issue #%d",
@@ -634,13 +625,7 @@ def update_trackers(
     for wf, cfg in TRACKED_WORKFLOWS.items():
         try:
             results[wf] = update_one_workflow(
-                upstream_token,
-                wf,
-                cfg,
-                bot_repo,
-                issue_num,
-                by_wf[wf],
-                snapshot_utc,
+                token, wf, cfg, bot_repo, issue_num, by_wf[wf], snapshot_utc,
             )
         except Exception as exc:
             log.warning("[%s] tracker update failed (%s)", wf, exc)
@@ -663,14 +648,10 @@ def main() -> int:
         default=os.environ.get("USE_AGENT", "").lower() not in ("false", "0", "no"),
     )
     parser.add_argument(
-        "--sglang-token", "--github-token", dest="sglang_token",
-        default=sglang_token_from_env(),
-        help="bingxche token for upstream issue/comment access",
-    )
-    parser.add_argument(
-        "--bot-repo-token",
-        default=bot_repo_token_from_env(),
-        help="Token limited to the bot repo (normally GITHUB_TOKEN)",
+        "--github-token",
+        default=os.environ.get(
+            "BOT_PAT", os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")),
+        ),
     )
     args = parser.parse_args()
 
@@ -679,21 +660,12 @@ def main() -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
         level=logging.INFO, stream=sys.stdout,
     )
-    if not args.sglang_token:
-        log.error("Upstream token required. Set SGLANG_PAT.")
-        return 1
-    if not args.bot_repo_token:
-        log.error("Bot repository token required. Set BOT_REPO_TOKEN.")
-        return 1
-    try:
-        require_distinct_tokens(args.sglang_token, args.bot_repo_token)
-        validate_sglang_token(args.sglang_token)
-    except (ValueError, requests.RequestException) as exc:
-        log.error("Invalid SGLANG_PAT: %s", exc)
+    if not args.github_token:
+        log.error("GitHub token required (BOT_PAT / GH_PAT / GITHUB_TOKEN).")
         return 1
 
     results = update_trackers(
-        args.sglang_token, args.bot_repo_token, args.bot_repo,
+        args.github_token, args.bot_repo,
         date_str=args.date, use_agent=args.use_agent,
     )
     for wf, num in results.items():

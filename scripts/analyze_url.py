@@ -24,12 +24,6 @@ from pathlib import Path
 
 import requests
 
-from github_auth import (
-    bot_repo_token_from_env,
-    require_distinct_tokens,
-    sglang_token_from_env,
-    validate_sglang_token,
-)
 from utils import (
     REPO,
     analyze_job_api,
@@ -148,8 +142,7 @@ def render_report(
 # ---------------------------------------------------------------------------
 
 def run_analysis(
-    upstream_token: str,
-    bot_repo_token: str,
+    token: str,
     url: str,
     bot_repo: str | None = None,
     use_agent: bool = True,
@@ -167,7 +160,7 @@ def run_analysis(
         log.warning("URL repo %s differs from target %s", repo_in_url, REPO)
 
     log.info("Fetching run %d...", run_id)
-    run = get_run(upstream_token, run_id)
+    run = get_run(token, run_id)
     head_sha = run.get("head_sha", "")
     run_url = run["html_url"]
     workflow_name = run.get("path", run.get("name", "unknown")).split("/")[-1]
@@ -176,12 +169,12 @@ def run_analysis(
     # Determine jobs to analyze
     if single_job_id:
         log.info("Fetching single job %d...", single_job_id)
-        job = get_job(upstream_token, single_job_id)
+        job = get_job(token, single_job_id)
         jobs = [job]
         title = f"[Analyze] {job['name']} (job {single_job_id})"
     else:
         log.info("Fetching failed jobs for run %d...", run_id)
-        all_failed = get_failed_jobs(upstream_token, run_id)
+        all_failed = get_failed_jobs(token, run_id)
         gate_jobs = [j for j in all_failed if is_gate_job(j)]
         for gj in gate_jobs:
             log.info("  Skipping gate job: %s", gj["name"])
@@ -197,9 +190,7 @@ def run_analysis(
                 f"({run_url}) (commit `{short_sha}`).\n\n"
                 f"All jobs passed or are still running."
             )
-            issue = create_github_issue(
-                bot_repo_token, title, body, labels=["analyze"], repo=bot_repo,
-            )
+            issue = create_github_issue(token, title, body, labels=["analyze"], repo=bot_repo)
             log.info("Created issue #%d: %s", issue["number"], title)
         return
 
@@ -216,9 +207,7 @@ def run_analysis(
             f"**Jobs to analyze** ({len(jobs)}):\n{job_list}\n\n"
             f"_Analysis in progress..._"
         )
-        issue = create_github_issue(
-            bot_repo_token, title, body, labels=["analyze"], repo=bot_repo,
-        )
+        issue = create_github_issue(token, title, body, labels=["analyze"], repo=bot_repo)
         issue_number = issue["number"]
         log.info("Created issue #%d: %s", issue_number, title)
 
@@ -255,7 +244,7 @@ def run_analysis(
                         worktrees[job["id"]], workflow_name,
                         head_sha=head_sha,
                         event_filter=run.get("event", ""),
-                        github_token=upstream_token,
+                        github_token=token,
                     ): job
                     for job in jobs
                 }
@@ -268,9 +257,7 @@ def run_analysis(
                             comment_body = (
                                 f"### `{result['job_name']}`\n\n{result['analysis']}"
                             )
-                            post_comment(
-                                bot_repo_token, bot_repo, issue_number, comment_body,
-                            )
+                            post_comment(token, bot_repo, issue_number, comment_body)
                             log.info("  Posted analysis for %s", result["job_name"])
                     except Exception as e:
                         log.error("  Error analyzing %s: %s", job["name"], e)
@@ -286,7 +273,7 @@ def run_analysis(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
-                    analyze_job_api, client, upstream_token, job, run_url,
+                    analyze_job_api, client, token, job, run_url,
                     head_sha=head_sha, workflow_file=workflow_name,
                 ): job
                 for job in jobs
@@ -300,9 +287,7 @@ def run_analysis(
                         comment_body = (
                             f"### `{result['job_name']}`\n\n{result['analysis']}"
                         )
-                        post_comment(
-                            bot_repo_token, bot_repo, issue_number, comment_body,
-                        )
+                        post_comment(token, bot_repo, issue_number, comment_body)
                         log.info("  Posted analysis for %s", result["job_name"])
                 except Exception as e:
                     log.error("  Error analyzing %s: %s", job["name"], e)
@@ -331,7 +316,7 @@ def run_analysis(
         issue_url = f"https://api.github.com/repos/{bot_repo}/issues/{issue_number}"
         resp = requests.patch(
             issue_url,
-            headers=gh_headers(bot_repo_token),
+            headers=gh_headers(token),
             json={"body": report},
         )
         resp.raise_for_status()
@@ -361,14 +346,9 @@ def main():
         help="Use Claude Code agent (default: enabled, use --no-use-agent to disable)",
     )
     parser.add_argument(
-        "--sglang-token", "--github-token", dest="sglang_token",
-        default=sglang_token_from_env(),
-        help="bingxche token for upstream reads",
-    )
-    parser.add_argument(
-        "--bot-repo-token",
-        default=bot_repo_token_from_env(),
-        help="Token limited to the bot repo (normally GITHUB_TOKEN)",
+        "--github-token",
+        default=os.environ.get("BOT_PAT", os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", ""))),
+        help="GitHub token",
     )
 
     args = parser.parse_args()
@@ -380,17 +360,8 @@ def main():
         stream=sys.stdout,
     )
 
-    if not args.sglang_token:
-        log.error("Upstream token required. Set SGLANG_PAT.")
-        sys.exit(1)
-    if args.bot_repo and not args.bot_repo_token:
-        log.error("Bot repository token required. Set BOT_REPO_TOKEN.")
-        sys.exit(1)
-    try:
-        require_distinct_tokens(args.sglang_token, args.bot_repo_token)
-        validate_sglang_token(args.sglang_token)
-    except (ValueError, requests.RequestException) as exc:
-        log.error("Invalid SGLANG_PAT: %s", exc)
+    if not args.github_token:
+        log.error("GitHub token required. Set GH_PAT.")
         sys.exit(1)
 
     if not args.use_agent:
@@ -401,13 +372,7 @@ def main():
             log.error("LLM_GATEWAY_URL env var required for API mode.")
             sys.exit(1)
 
-    run_analysis(
-        args.sglang_token,
-        args.bot_repo_token,
-        args.url,
-        args.bot_repo,
-        args.use_agent,
-    )
+    run_analysis(args.github_token, args.url, args.bot_repo, args.use_agent)
 
 
 if __name__ == "__main__":

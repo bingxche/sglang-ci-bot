@@ -18,14 +18,11 @@ jobs:
   watch:
     runs-on: [self-hosted, amd-internal]
     permissions:
-      actions: write
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -40,17 +37,12 @@ jobs:
 
       - name: Watch for commands
         env:
-          SGLANG_PAT: ${{ secrets.GH_PAT }}
-          BOT_REPO_TOKEN: ${{ github.token }}
-          BOT_TRIGGER_LOGIN: amd-bot
-          BOT_ACTOR_LOGIN: bingxche
-          BOT_CLAIM_LOGINS: amd-bot,bingxche
-          SINCE_HOURS: ${{ github.event.inputs.since_hours || '1' }}
-          BOT_REPOSITORY: ${{ github.repository }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
+          HOURS="${{ github.event.inputs.since_hours || '1' }}"
           python scripts/watch_comments.py \
-            --bot-repo "$BOT_REPOSITORY" \
-            --since-hours "$SINCE_HOURS"
+            --bot-repo "${{ github.repository }}" \
+            --since-hours "$HOURS"
 
       - name: Save state
         if: always()

@@ -19,6 +19,11 @@ on:
         options:
           - daily-issue
           - stdout
+      use_agent:
+        description: 'Use Claude Code agent for deeper analysis'
+        required: false
+        default: 'true'
+        type: boolean
       reset_state:
         description: 'Reset state to force re-analysis of all jobs'
         required: false
@@ -51,8 +56,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -69,8 +72,6 @@ jobs:
           for s in seps:
               raw = raw.replace(s, '\n')
           items = [x.strip() for x in raw.split('\n') if x.strip()]
-          if any(not x.endswith(('.yml', '.yaml')) or '/' in x for x in items):
-              raise SystemExit('workflow names must be basename .yml/.yaml files')
           print(json.dumps(items))
           ")
           echo "workflows=$WF_JSON" >> "$GITHUB_OUTPUT"
@@ -78,7 +79,7 @@ jobs:
 
       - name: Ensure daily issue exists
         env:
-          BOT_REPO_TOKEN: ${{ github.token }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           BOT_REPO: ${{ github.repository }}
         run: python scripts/ensure_daily_issue.py
 
@@ -97,18 +98,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Derive safe cache key
         id: cachekey
-        env:
-          WORKFLOW_FILE: ${{ matrix.workflow }}
         run: |
-          SAFE=$(printf '%s' "$WORKFLOW_FILE" | tr '/.' '--')
+          SAFE=$(echo "${{ matrix.workflow }}" | tr '/.' '--')
           echo "key=$SAFE" >> "$GITHUB_OUTPUT"
 
       - name: Restore state
@@ -125,24 +122,24 @@ jobs:
 
       - name: Run CI Monitor for ${{ matrix.workflow }}
         env:
-          SGLANG_PAT: ${{ secrets.GH_PAT }}
-          BOT_REPO_TOKEN: ${{ github.token }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
-          USE_AGENT: 'false'
-          HOURS_BACK: ${{ github.event.inputs.hours_back || '24' }}
-          OUTPUT_MODE: ${{ github.event.inputs.output_mode || 'daily-issue' }}
-          BOT_REPOSITORY: ${{ github.repository }}
-          WORKFLOW_FILE: ${{ matrix.workflow }}
+          AGENT_PARALLEL: '3'
+          AGENT_TIMEOUT_SECS: '1500'
+          AGENT_MAX_TURNS: '150'
         run: |
-          args=(
-            --hours-back "$HOURS_BACK"
-            --output "$OUTPUT_MODE"
-            --bot-repo "$BOT_REPOSITORY"
-            --workflows "$WORKFLOW_FILE"
-          )
-          args+=(--no-use-agent)
-          python scripts/monitor_ci.py "${args[@]}"
+          HOURS="${{ github.event.inputs.hours_back || '24' }}"
+          OUTPUT="${{ github.event.inputs.output_mode || 'daily-issue' }}"
+
+          ARGS="--hours-back $HOURS --output $OUTPUT --bot-repo ${{ github.repository }} --workflows ${{ matrix.workflow }}"
+
+          USE_AGENT="${{ github.event.inputs.use_agent || 'true' }}"
+          if [ "$USE_AGENT" = "true" ]; then
+            ARGS="$ARGS --use-agent"
+          fi
+
+          python scripts/monitor_ci.py $ARGS
 
       - name: Save state
         if: always()
@@ -161,20 +158,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Update upstream Failure Trackers
         env:
-          SGLANG_PAT: ${{ secrets.GH_PAT }}
-          BOT_REPO_TOKEN: ${{ github.token }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
-          USE_AGENT: 'false'
-          BOT_REPOSITORY: ${{ github.repository }}
+          TRACKER_AGENT_MAX_TURNS: '80'
+          TRACKER_AGENT_TIMEOUT_SECS: '900'
         run: |
-          args=(--bot-repo "$BOT_REPOSITORY" --no-use-agent)
-          python scripts/failure_tracker.py "${args[@]}"
+          USE_AGENT="${{ github.event.inputs.use_agent || 'true' }}"
+          ARGS="--bot-repo ${{ github.repository }}"
+          if [ "$USE_AGENT" != "true" ]; then
+            ARGS="$ARGS --no-use-agent"
+          fi
+          python scripts/failure_tracker.py $ARGS

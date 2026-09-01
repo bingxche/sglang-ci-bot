@@ -16,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-from github_auth import sglang_token_from_env, validate_sglang_token
 from utils import (
     CLAUDE_MODEL,
     REPO,
@@ -258,7 +257,7 @@ def analyze_pr_correlation(
                 f"Context files: .ci-context/pr-diff.txt, "
                 f".ci-context/pr-files.txt, .ci-context/ci-errors.md\n"
                 f"Source: current directory\n"
-                f"GitHub API authentication: none (public GET requests only)"
+                f"GitHub API token: $GH_PAT"
             )
             raw = claude_code_analyze(
                 prompt=prompt,
@@ -613,7 +612,7 @@ def _check_ci_with_agent(pr_number: int, repo_path) -> str:
         f"PR: #{pr_number}\n"
         f"Repo: sgl-project/sglang\n"
         f"Source: current directory (checked out to PR branch)\n"
-        f"GitHub API authentication: none (public GET requests only)"
+        f"GitHub API token: $GH_PAT"
     )
     return claude_code_analyze(
         prompt=prompt,
@@ -827,20 +826,14 @@ def main():
         help="Use Claude Code agent (default: enabled, use --no-use-agent to disable)",
     )
     parser.add_argument(
-        "--sglang-token", "--github-token", dest="sglang_token",
-        default=sglang_token_from_env(),
-        help="bingxche token for upstream reads/comments",
+        "--github-token",
+        default=os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")),
     )
 
     args = parser.parse_args()
 
-    if not args.sglang_token:
-        print("Error: upstream token required. Set SGLANG_PAT.", file=sys.stderr)
-        sys.exit(1)
-    try:
-        validate_sglang_token(args.sglang_token)
-    except (ValueError, requests.RequestException) as exc:
-        print(f"Error: invalid SGLANG_PAT: {exc}", file=sys.stderr)
+    if not args.github_token:
+        print("Error: GitHub token required. Set GH_PAT.", file=sys.stderr)
         sys.exit(1)
 
     if not args.use_agent:
@@ -852,7 +845,7 @@ def main():
             sys.exit(1)
 
     check_ci_for_pr(
-        args.sglang_token,
+        args.github_token,
         args.pr_number,
         post_comment_flag=not args.no_post,
         use_agent=args.use_agent,

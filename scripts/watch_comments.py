@@ -23,21 +23,14 @@ from pathlib import Path
 
 import requests
 
-from github_auth import (
-    bot_repo_token_from_env,
-    require_distinct_tokens,
-    sglang_token_from_env,
-    validate_sglang_token,
-)
-
 log = logging.getLogger("comment-watcher")
 
 REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
 
-BOT_TRIGGER_LOGIN = os.environ.get("BOT_TRIGGER_LOGIN", "amd-bot").strip()
-BOT_TRIGGER = f"@{BOT_TRIGGER_LOGIN}"
+BOT_LOGIN = "amd-bot"
+BOT_TRIGGER = f"@{BOT_LOGIN}"
 # To add a new user: append their GitHub username here AND update README.md
 AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd", "HaiShaw", "1am9trash", "sogalin", "Kangyan-Zhou", "Fridge003", "BowenBao", "ColinZ22", "fxmarty-amd", "hubertlu-tw", "RolaoDenthu", "Duyi-Wang", "amd-danli103", "akao-amd", "jonahbernard", "At1a8", "chuyeh", "mqhc2020", "chien-an-chen", "yuychang", "jiaryang", "Emmanuel0612"]
 AUTHORIZED_USER_LOGINS = {user.lower() for user in AUTHORIZED_USERS}
@@ -54,12 +47,7 @@ MAX_COMMENT_PAGES = 3
 HTTP_TIMEOUT = (10, 30)
 INITIAL_LOOKBACK_HOURS = 24
 
-STATE_FILE = Path(
-    os.environ.get(
-        "WATCHER_STATE_FILE",
-        str(Path(__file__).parent.parent / ".state" / "last_check.json"),
-    )
-)
+STATE_FILE = Path(__file__).parent.parent / ".state" / "last_check.json"
 
 
 def gh_headers(token: str) -> dict:
@@ -168,16 +156,15 @@ def dispatch_review(
     token: str, bot_repo: str, pr_number: int,
     focus: str = "", comment_author: str = "", comment_id: int = 0,
 ):
-    """Trigger the PR review workflow with a bot-repo-only credential."""
-    url = f"https://api.github.com/repos/{bot_repo}/actions/workflows/pr-review.yml/dispatches"
+    """Trigger the PR review workflow via repository_dispatch."""
+    url = f"https://api.github.com/repos/{bot_repo}/dispatches"
     payload = {
-        "ref": "main",
-        "inputs": {
+        "event_type": "pr-review",
+        "client_payload": {
             "pr_number": str(pr_number),
             "comment_id": str(comment_id),
             "focus": focus,
             "comment_author": comment_author,
-            "no_post": "false",
         },
     }
     resp = requests.post(url, headers=gh_headers(token), json=payload, timeout=HTTP_TIMEOUT)
@@ -189,11 +176,11 @@ def dispatch_ci_status(
     token: str, bot_repo: str, pr_number: int,
     comment_author: str = "", comment_id: int = 0,
 ):
-    """Trigger CI status check with a bot-repo-only credential."""
-    url = f"https://api.github.com/repos/{bot_repo}/actions/workflows/ci-status-check.yml/dispatches"
+    """Trigger CI status check workflow."""
+    url = f"https://api.github.com/repos/{bot_repo}/dispatches"
     payload = {
-        "ref": "main",
-        "inputs": {
+        "event_type": "ci-status",
+        "client_payload": {
             "pr_number": str(pr_number),
             "comment_id": str(comment_id),
             "comment_author": comment_author,
@@ -225,41 +212,17 @@ def post_help_comment(token: str, pr_number: int, unknown_command: str = ""):
     resp.raise_for_status()
 
 
-def add_reaction(
-    token: str, comment_id: int, reaction: str = "eyes"
-) -> tuple[bool, int | None]:
-    """Add a reaction and return ``(created, reaction_id)``.
-
-    GitHub returns 201 when this caller created the reaction and 200 when the
-    same reaction already exists.  The distinction makes the rocket an atomic
-    cross-watcher claim instead of merely a decorative acknowledgement.
-    """
+def add_reaction(token: str, comment_id: int, reaction: str = "eyes"):
+    """Add a reaction to acknowledge the command."""
     url = f"https://api.github.com/repos/{REPO}/issues/comments/{comment_id}/reactions"
     headers = gh_headers(token)
     headers["Accept"] = "application/vnd.github.squirrel-girl-preview+json"
     resp = requests.post(url, headers=headers, json={"content": reaction}, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    payload = resp.json()
-    return resp.status_code == 201, payload.get("id")
+    if resp.status_code not in (200, 201):
+        log.warning("Could not add reaction: HTTP %d", resp.status_code)
 
 
-def delete_reaction(token: str, comment_id: int, reaction_id: int) -> None:
-    """Release a claim after a definitive dispatch failure."""
-    url = (
-        f"https://api.github.com/repos/{REPO}/issues/comments/"
-        f"{comment_id}/reactions/{reaction_id}"
-    )
-    resp = requests.delete(url, headers=gh_headers(token), timeout=HTTP_TIMEOUT)
-    if resp.status_code not in (204, 404):
-        resp.raise_for_status()
-
-
-def has_bot_claimed(
-    token: str,
-    comment_id: int,
-    claim_logins: set[str],
-    reaction: str = "rocket",
-) -> bool:
+def has_bot_claimed(token: str, comment_id: int, reaction: str = "rocket") -> bool:
     """Check if the bot has already claimed this comment via a reaction.
 
     Uses GitHub reactions as a distributed idempotency mechanism so that
@@ -275,23 +238,15 @@ def has_bot_claimed(
     if resp.status_code != 200:
         log.warning("Could not check reactions: HTTP %d", resp.status_code)
         return False
-    normalized_logins = {login.lower() for login in claim_logins}
     for r in resp.json():
-        login = r.get("user", {}).get("login", "").lower()
-        if r.get("content") == reaction and login in normalized_logins:
+        if r.get("content") == reaction and r.get("user", {}).get("login") == BOT_LOGIN:
             return True
     return False
 
 
-def process_comments(
-    upstream_token: str,
-    dispatch_token: str,
-    bot_repo: str,
-    claim_logins: set[str],
-    since: str | None = None,
-):
+def process_comments(token: str, bot_repo: str, since: str | None = None):
     """Process new comments and dispatch actions."""
-    comments = get_recent_comments(upstream_token, since)
+    comments = get_recent_comments(token, since)
     state = load_state()
     processed_ids = set(state.get("processed_comment_ids", []))
 
@@ -314,7 +269,7 @@ def process_comments(
         if not pr_number:
             continue
 
-        if not is_pull_request(upstream_token, issue_url):
+        if not is_pull_request(token, issue_url):
             continue
 
         new_commands.append(
@@ -331,51 +286,27 @@ def process_comments(
     for cmd in new_commands:
         cid = cmd["comment_id"]
 
-        if has_bot_claimed(upstream_token, cid, claim_logins, "rocket"):
+        if has_bot_claimed(token, cid, "rocket"):
             log.info("Skipping PR #%d - %s (already claimed by another watcher)", cmd["pr_number"], cmd["command"])
             processed_ids.add(cid)
             continue
 
         log.info("Processing: PR #%d - %s (by @%s)", cmd["pr_number"], cmd["command"], cmd["author"])
 
-        claim_created, claim_id = add_reaction(upstream_token, cid, "rocket")
-        if not claim_created:
-            log.info(
-                "Skipping PR #%d - %s (claim won by another watcher)",
-                cmd["pr_number"],
-                cmd["command"],
-            )
-            processed_ids.add(cid)
-            continue
+        add_reaction(token, cid, "rocket")
+        add_reaction(token, cid, "eyes")
 
-        try:
-            if cmd["command"] == "review":
-                dispatch_review(dispatch_token, bot_repo, cmd["pr_number"], comment_author=cmd["author"], comment_id=cid)
-            elif cmd["command"] == "review-focus":
-                dispatch_review(dispatch_token, bot_repo, cmd["pr_number"], focus=cmd["args"], comment_author=cmd["author"], comment_id=cid)
-            elif cmd["command"] == "ci-status":
-                dispatch_ci_status(dispatch_token, bot_repo, cmd["pr_number"], comment_author=cmd["author"], comment_id=cid)
-            elif cmd["command"] == "help":
-                post_help_comment(upstream_token, cmd["pr_number"])
-            else:
-                log.warning("Unknown command: %s", cmd["command"])
-                post_help_comment(upstream_token, cmd["pr_number"], unknown_command=cmd["command"])
-        except requests.exceptions.HTTPError:
-            # A concrete 4xx/5xx means no workflow was accepted.  Remove only
-            # the rocket created by this watcher so a later poll can retry.
-            if claim_id is not None:
-                try:
-                    delete_reaction(upstream_token, cid, claim_id)
-                except requests.exceptions.RequestException:
-                    log.exception("Could not release failed claim for comment %d", cid)
-            raise
-
-        # Eyes means dispatch/comment succeeded.  Failure to add this cosmetic
-        # acknowledgement must not undo the successful rocket claim.
-        try:
-            add_reaction(upstream_token, cid, "eyes")
-        except requests.exceptions.RequestException:
-            log.warning("Could not add eyes reaction for comment %d", cid)
+        if cmd["command"] == "review":
+            dispatch_review(token, bot_repo, cmd["pr_number"], comment_author=cmd["author"], comment_id=cid)
+        elif cmd["command"] == "review-focus":
+            dispatch_review(token, bot_repo, cmd["pr_number"], focus=cmd["args"], comment_author=cmd["author"], comment_id=cid)
+        elif cmd["command"] == "ci-status":
+            dispatch_ci_status(token, bot_repo, cmd["pr_number"], comment_author=cmd["author"], comment_id=cid)
+        elif cmd["command"] == "help":
+            post_help_comment(token, cmd["pr_number"])
+        else:
+            log.warning("Unknown command: %s", cmd["command"])
+            post_help_comment(token, cmd["pr_number"], unknown_command=cmd["command"])
 
         processed_ids.add(cid)
 
@@ -396,13 +327,7 @@ def _handle_signal(signum, _frame):
     _shutdown = True
 
 
-def run_daemon(
-    upstream_token: str,
-    dispatch_token: str,
-    bot_repo: str,
-    poll_interval: int,
-    claim_logins: set[str],
-):
+def run_daemon(token: str, bot_repo: str, poll_interval: int):
     """Run the comment watcher as a long-lived daemon process."""
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -418,13 +343,7 @@ def run_daemon(
     while not _shutdown:
         try:
             since = daemon_since(poll_interval)
-            cmds = process_comments(
-                upstream_token,
-                dispatch_token,
-                bot_repo,
-                claim_logins,
-                since=since,
-            )
+            cmds = process_comments(token, bot_repo, since=since)
             consecutive_errors = 0
             if cmds:
                 log.info("Dispatched %d command(s)", len(cmds))
@@ -480,24 +399,8 @@ def main():
         help="Seconds between polls in daemon mode (default: 30)",
     )
     parser.add_argument(
-        "--sglang-token", "--github-token", dest="sglang_token",
-        default=sglang_token_from_env(),
-        help="bingxche token for upstream reads/comments",
-    )
-    parser.add_argument(
-        "--dispatch-token",
-        default=bot_repo_token_from_env(),
-        help="Token limited to the bot repo with Actions: write",
-    )
-    parser.add_argument(
-        "--actor-login",
-        default=os.environ.get("BOT_ACTOR_LOGIN", "bingxche"),
-        help="Expected identity of SGLANG_PAT (default: bingxche)",
-    )
-    parser.add_argument(
-        "--claim-logins",
-        default=os.environ.get("BOT_CLAIM_LOGINS", "amd-bot,bingxche"),
-        help="Comma-separated reaction owners accepted as prior claims",
+        "--github-token",
+        default=os.environ.get("BOT_PAT", os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", ""))),
     )
 
     args = parser.parse_args()
@@ -510,53 +413,17 @@ def main():
         stream=sys.stdout,
     )
 
-    if not args.sglang_token:
-        log.error("Upstream token required. Set SGLANG_PAT.")
+    if not args.github_token:
+        log.error("GitHub token required. Set GH_PAT env var.")
         sys.exit(1)
-    if not args.dispatch_token:
-        log.error("Bot repository dispatch token required. Set BOT_REPO_TOKEN.")
-        sys.exit(1)
-
-    try:
-        require_distinct_tokens(args.sglang_token, args.dispatch_token)
-        actor_login = validate_sglang_token(
-            args.sglang_token, expected_login=args.actor_login,
-        )
-    except (ValueError, requests.RequestException) as exc:
-        log.error("Invalid SGLANG_PAT: %s", exc)
-        sys.exit(1)
-
-    claim_logins = {
-        login.strip().lower()
-        for login in args.claim_logins.split(",")
-        if login.strip()
-    }
-    claim_logins.update({BOT_TRIGGER_LOGIN.lower(), actor_login.lower()})
-    log.info(
-        "Authenticated upstream actor @%s; trigger remains %s",
-        actor_login,
-        BOT_TRIGGER,
-    )
 
     if args.daemon:
-        run_daemon(
-            args.sglang_token,
-            args.dispatch_token,
-            args.bot_repo,
-            args.poll_interval,
-            claim_logins,
-        )
+        run_daemon(args.github_token, args.bot_repo, args.poll_interval)
     else:
         since = (datetime.now(timezone.utc) - timedelta(hours=args.since_hours)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
-        process_comments(
-            args.sglang_token,
-            args.dispatch_token,
-            args.bot_repo,
-            claim_logins,
-            since=since,
-        )
+        process_comments(args.github_token, args.bot_repo, since=since)
 
 
 if __name__ == "__main__":

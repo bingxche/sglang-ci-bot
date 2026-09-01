@@ -865,8 +865,8 @@ def analyze_job_with_agent(
 ) -> dict:
     """Invoke Claude Code agent to fully analyze a CI failure.
 
-    The agent handles everything autonomously using only public read access:
-    downloading logs where GitHub permits it, parsing errors,
+    The agent handles everything autonomously: downloading logs via the
+    GitHub API (using ``$GH_PAT`` from the environment), parsing errors,
     reading sglang source code, checking git history, and producing a
     root-cause analysis.  Investigation methodology is defined in
     ``CLAUDE.md`` which Claude Code reads automatically.
@@ -886,7 +886,9 @@ def analyze_job_with_agent(
         if run_id is not None:
             artifact_token = (
                 github_token
-                or os.environ.get("SGLANG_PAT")
+                or os.environ.get("GH_PAT")
+                or os.environ.get("BOT_PAT")
+                or os.environ.get("GITHUB_TOKEN")
             )
             artifact_root = prepare_mi355x_artifact_context(
                 artifact_token, run_id, repo_path,
@@ -913,7 +915,7 @@ def analyze_job_with_agent(
         f"Log URL: https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs\n"
         f"{artifact_lines}"
         f"Source: current directory\n"
-        f"GitHub API authentication: none (public GET requests only)"
+        f"GitHub API token: $GH_PAT"
     )
 
     _log = logging.getLogger("ci-monitor")
@@ -1103,7 +1105,7 @@ def cross_job_analysis(
                 f"Number of failed jobs: {len(job_analyses)}\n"
                 f"Per-job analyses: .ci-context/per-job-analyses.md\n"
                 f"Source: current directory\n"
-                f"GitHub API authentication: none (public GET requests only)"
+                f"GitHub API token: $GH_PAT"
             )
             return claude_code_analyze(
                 prompt=prompt,
@@ -1272,21 +1274,7 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
     """
     AGENT_WORKSPACE.mkdir(parents=True, exist_ok=True)
 
-    clone_url = f"https://github.com/{REPO}.git"
-    push_block_url = "disabled://sglang-code-write-blocked"
-
     if SGLANG_REPO_PATH.exists() and (SGLANG_REPO_PATH / ".git").exists():
-        # Always scrub stale authenticated remotes and install a local push
-        # guard before any agent sees the checkout.
-        subprocess.run(
-            ["git", "remote", "set-url", "origin", clone_url],
-            cwd=SGLANG_REPO_PATH, capture_output=True, timeout=10, check=True,
-        )
-        subprocess.run(
-            ["git", "remote", "set-url", "--push", "origin", push_block_url],
-            cwd=SGLANG_REPO_PATH, capture_output=True, timeout=10, check=True,
-        )
-
         _agent_log.info("Updating sglang repo at %s (ref: %s)...", SGLANG_REPO_PATH, ref)
         subprocess.run(
             ["git", "fetch", "origin", ref, "--depth", "100"],
@@ -1306,6 +1294,7 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
         if SGLANG_REPO_PATH.exists():
             shutil.rmtree(SGLANG_REPO_PATH)
         _agent_log.info("Cloning sglang repo to %s...", SGLANG_REPO_PATH)
+        clone_url = f"https://github.com/{REPO}.git"
         subprocess.run(
             ["git", "clone", "--depth", "100", "--single-branch", "--branch", "main",
              clone_url, str(SGLANG_REPO_PATH)],
@@ -1320,30 +1309,6 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
                 ["git", "checkout", "FETCH_HEAD", "--force"],
                 cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
             )
-        subprocess.run(
-            ["git", "remote", "set-url", "--push", "origin", push_block_url],
-            cwd=SGLANG_REPO_PATH, capture_output=True, timeout=10, check=True,
-        )
-
-    # Do not let a credential helper or an Actions checkout extraheader turn
-    # this public read-only checkout into an authenticated push path.
-    subprocess.run(
-        ["git", "config", "--local", "credential.helper", ""],
-        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=10, check=True,
-    )
-    subprocess.run(
-        [
-            "git",
-            "config",
-            "--local",
-            "--unset-all",
-            "http.https://github.com/.extraheader",
-        ],
-        cwd=SGLANG_REPO_PATH,
-        capture_output=True,
-        timeout=10,
-        check=False,
-    )
 
     _deploy_claude_md()
     _agent_log.info("sglang repo ready at %s", SGLANG_REPO_PATH)
@@ -1485,25 +1450,6 @@ def claude_code_analyze(
             max_turns, timeout_secs, work_dir,
         )
 
-        child_env = os.environ.copy()
-        for name in (
-            "BOT_REPO_TOKEN",
-            "GITHUB_TOKEN",
-            "GH_TOKEN",
-            "GH_PAT",
-            "BOT_PAT",
-            "SGLANG_PAT",
-            "RUNNER_ADMIN_TOKEN",
-            "RUNNER_REGISTRATION_TOKEN",
-            "SSH_AUTH_SOCK",
-            "GIT_ASKPASS",
-            "SSH_ASKPASS",
-        ):
-            child_env.pop(name, None)
-        child_env["GIT_TERMINAL_PROMPT"] = "0"
-        child_env["GIT_SSH_COMMAND"] = "/bin/false"
-        child_env["GH_CONFIG_DIR"] = str(context_dir / "no-github-auth")
-
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -1511,7 +1457,6 @@ def claude_code_analyze(
             cwd=str(work_dir),
             timeout=timeout_secs,
             stdin=subprocess.DEVNULL,
-            env=child_env,
         )
 
         _agent_log.info(
