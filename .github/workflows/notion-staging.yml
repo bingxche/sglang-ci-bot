@@ -1,9 +1,6 @@
 name: SGLang AMD CI Daily Staging
 
 on:
-  schedule:
-    # GitHub cron is UTC. 12:00 UTC is 20:00 Asia/Shanghai year-round.
-    - cron: '0 12 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -63,11 +60,11 @@ jobs:
             --input .state/notion-staging-candidates.json \
             --dry-run
 
-      # Scheduled runs always use write mode. This step never launches an
-      # agent; the minimum-permission connection reads both data sources and
-      # can insert only into the isolated staging destination.
+      # This step never launches an agent. The minimum-permission connection
+      # reads both data sources and can insert only into the isolated staging
+      # destination.
       - name: Write and verify Notion staging candidates
-        if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'write' }}
+        if: ${{ github.event.inputs.mode == 'write' }}
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_KNOWN_DATA_SOURCE_ID: ${{ vars.NOTION_KNOWN_DATA_SOURCE_ID }}
