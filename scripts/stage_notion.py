@@ -58,8 +58,8 @@ EXPECTED_PROPERTY_TYPES = {
     "Error msg": "rich_text",
 }
 FINGERPRINT_PREFIX = "staging-fingerprint:"
-OFFICIAL_DATA_SOURCE_TITLE = "AMD CI Known Issue Table"
-STAGING_DATA_SOURCE_TITLE = "staging errors"
+OFFICIAL_DATA_SOURCE_TITLE = "SGLang AMD CI Known Errors"
+STAGING_DATA_SOURCE_TITLE = "SGLang AMD CI Staging Errors"
 
 
 def _strip_fence(text: str) -> str:
@@ -590,7 +590,7 @@ def sync(
     if known_title and known_title.strip().lower() != OFFICIAL_DATA_SOURCE_TITLE.lower():
         raise ValueError(f"refusing to treat unexpected data source {known_title!r} as official")
     staging_title = data_source_title(staging_schema_obj)
-    if staging_title and staging_title.strip().lower() != STAGING_DATA_SOURCE_TITLE:
+    if staging_title and staging_title.strip().lower() != STAGING_DATA_SOURCE_TITLE.lower():
         raise ValueError(f"refusing to write unexpected staging data source {staging_title!r}")
     schema = validate_staging_schema(staging_schema_obj)
 

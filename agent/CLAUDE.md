@@ -802,7 +802,7 @@ Output ONLY this block (verbatim markers, JSON inside the fence, nothing else):
 ## SGLang AMD CI Staging Candidates
 
 This task produces the machine-readable candidate file for the isolated Notion
-`staging errors` data source. It is an evidence gate, not a general summary.
+`SGLang AMD CI Staging Errors` data source. It is an evidence gate, not a general summary.
 The Python harness performs schema validation, deduplication, writes, and
 post-write verification; you only classify and canonicalize CI evidence.
 
