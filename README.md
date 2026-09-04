@@ -672,6 +672,12 @@ python scripts/stage_notion.py sync \
     --input .state/notion-staging-candidates.json
 ```
 
+The analyzer prefers the marked JSON contract. If Claude Code drops only the
+HTML markers, it accepts exactly one structurally identifiable fenced JSON
+report and still applies the full deterministic gate; zero or multiple reports
+fail closed. The raw agent response is retained beside the candidate file for
+diagnostics.
+
 In the Actions UI, run **Cron CI Monitor** with `staging_mode=dry-run` first.
 After reviewing its output, use `staging_mode=write` for the first real sync.
 The default is `off`, including dispatcher calls that omit the input.

@@ -197,10 +197,14 @@ jobs:
           STAGING_AGENT_MAX_TURNS: '120'
           STAGING_AGENT_TIMEOUT_SECS: '1200'
         run: |
-          python scripts/stage_notion.py analyze \
-            --bot-repo ${{ github.repository }} \
-            --lookback-days 7 \
-            --output .state/notion-staging-candidates.json
+          if ! python scripts/stage_notion.py analyze \
+              --bot-repo ${{ github.repository }} \
+              --lookback-days 7 \
+              --output .state/notion-staging-candidates.json; then
+            echo "Claude output tail (diagnostic only):"
+            tail -c 8000 .state/notion-staging-candidates.json.raw.txt 2>/dev/null || true
+            exit 1
+          fi
 
       - name: Preview Notion staging candidates
         if: ${{ needs.monitor.result == 'success' && github.event.inputs.staging_mode == 'dry-run' }}

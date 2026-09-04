@@ -75,15 +75,32 @@ def extract_candidate_report(agent_text: str) -> dict[str, Any]:
         raise ValueError("Claude Code returned no staging-candidate output")
     start = agent_text.rfind(CANDIDATES_START)
     end = agent_text.find(CANDIDATES_END, start + len(CANDIDATES_START))
-    if start == -1 or end == -1:
-        raise ValueError("staging-candidate markers are missing")
-    payload = _strip_fence(agent_text[start + len(CANDIDATES_START) : end])
-    try:
-        report = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid staging-candidate JSON: {exc}") from exc
-    if not isinstance(report, dict):
-        raise ValueError("staging-candidate output must be a JSON object")
+    payloads: list[str] = []
+    if start != -1 and end != -1:
+        payloads.append(_strip_fence(agent_text[start + len(CANDIDATES_START) : end]))
+    else:
+        # Claude Code occasionally drops HTML comments while preserving the
+        # requested fenced JSON. Accept only a uniquely identifiable report;
+        # deterministic candidate validation still runs immediately after.
+        payloads.extend(
+            match.group(1).strip()
+            for match in re.finditer(r"```json\s*(\{.*?\})\s*```", agent_text, re.DOTALL | re.IGNORECASE)
+        )
+
+    reports: list[dict[str, Any]] = []
+    for payload in payloads:
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and "stable" in parsed:
+            reports.append(parsed)
+    if len(reports) != 1:
+        raise ValueError(
+            "expected exactly one marked or fenced staging-candidate JSON object; "
+            f"found {len(reports)}"
+        )
+    report = reports[0]
     for key in ("stable", "known", "existing_staging", "flakes", "watchlist"):
         value = report.setdefault(key, [])
         if not isinstance(value, list):
@@ -304,6 +321,8 @@ def analyze(
             timeout_secs=int(os.environ.get("STAGING_AGENT_TIMEOUT_SECS", "1200")),
             output_must_contain=CANDIDATES_START,
         )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.with_name(f"{output.name}.raw.txt").write_text(agent_text, encoding="utf-8")
         report = extract_candidate_report(agent_text)
 
     accepted, rejected = prepare_candidates(report)

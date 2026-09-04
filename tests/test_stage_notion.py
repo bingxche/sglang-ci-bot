@@ -63,6 +63,24 @@ class CandidateTests(unittest.TestCase):
         parsed = stage_notion.extract_candidate_report(text)
         self.assertEqual(len(parsed["stable"]), 1)
 
+    def test_extract_unique_fenced_json_when_markers_are_dropped(self):
+        payload = {
+            "stable": [candidate()],
+            "known": [],
+            "existing_staging": [],
+            "flakes": [],
+            "watchlist": [],
+        }
+        text = f"analysis preamble\n```json\n{json.dumps(payload)}\n```\nfinished"
+        parsed = stage_notion.extract_candidate_report(text)
+        self.assertEqual(len(parsed["stable"]), 1)
+
+    def test_rejects_ambiguous_fenced_reports(self):
+        payload = json.dumps({"stable": []})
+        text = f"```json\n{payload}\n```\n```json\n{payload}\n```"
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            stage_notion.extract_candidate_report(text)
+
     def test_v1_accepts_two_independent_runs(self):
         accepted, rejected = stage_notion.prepare_candidates({"stable": [candidate()]})
         self.assertEqual(len(accepted), 1)
