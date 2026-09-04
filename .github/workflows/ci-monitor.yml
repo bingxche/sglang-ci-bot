@@ -29,6 +29,15 @@ on:
         required: false
         default: 'false'
         type: boolean
+      staging_mode:
+        description: 'Notion staging: off, generate a dry-run preview, or write verified rows'
+        required: false
+        default: 'off'
+        type: choice
+        options:
+          - 'off'
+          - dry-run
+          - write
 
 concurrency:
   group: ci-monitor
@@ -176,3 +185,38 @@ jobs:
             ARGS="$ARGS --no-use-agent"
           fi
           python scripts/failure_tracker.py $ARGS
+
+      # Notion credentials are intentionally absent here: Claude Code only
+      # sees GitHub evidence and writes a machine-readable candidate file.
+      - name: Analyze Notion staging candidates with Claude Code
+        if: ${{ needs.monitor.result == 'success' && (github.event.inputs.staging_mode == 'dry-run' || github.event.inputs.staging_mode == 'write') }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
+          LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
+          STAGING_AGENT_MAX_TURNS: '120'
+          STAGING_AGENT_TIMEOUT_SECS: '1200'
+        run: |
+          python scripts/stage_notion.py analyze \
+            --bot-repo ${{ github.repository }} \
+            --lookback-days 7 \
+            --output .state/notion-staging-candidates.json
+
+      - name: Preview Notion staging candidates
+        if: ${{ needs.monitor.result == 'success' && github.event.inputs.staging_mode == 'dry-run' }}
+        run: |
+          python scripts/stage_notion.py sync \
+            --input .state/notion-staging-candidates.json \
+            --dry-run
+
+      # This step never launches an agent. Its single minimum-permission Notion
+      # connection can read both sources and insert rows into staging.
+      - name: Write and verify Notion staging candidates
+        if: ${{ needs.monitor.result == 'success' && github.event.inputs.staging_mode == 'write' }}
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_KNOWN_DATA_SOURCE_ID: ${{ vars.NOTION_KNOWN_DATA_SOURCE_ID }}
+          NOTION_STAGING_DATA_SOURCE_ID: ${{ vars.NOTION_STAGING_DATA_SOURCE_ID }}
+        run: |
+          python scripts/stage_notion.py sync \
+            --input .state/notion-staging-candidates.json

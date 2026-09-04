@@ -15,6 +15,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 | Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` every 30min | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 8, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. For `nightly-amd-mi355x-disagg.yml`, per-job analysis pre-downloads the run's `mi355x-*` artifacts and unpacks bundled prefill/decode/router logs into `.ci-context/mi355x-artifacts` before invoking the agent. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
 | Daily Cross-Workflow Summary | `daily_cross_workflow_summary.py` | Auto-invoked by each `monitor_ci.py` matrix job that produced new failures (gated by `BUILD_DAILY_SUMMARY` env, default enabled); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling **Daily Cross-Workflow Summary** **pinned in the daily issue's body** (above all per-workflow comments) between `<!-- daily-cross-workflow-summary:start -->` / `<!-- daily-cross-workflow-summary:end -->` placeholder markers. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes the issue body in place, replacing only the content between the placeholders (matching the legacy `ci-monitor-daily-status-board` markers too, so older issues migrate in place). Legacy summary *comments* from before this move are auto-deleted by `_cleanup_legacy_summary_comments`. |
 | Failure Trackers (per workflow) | `failure_tracker.py` | A `finalize` job in `ci-monitor.yml` (`needs: monitor`), once per 30-min tick after the whole matrix completes | Maintains **one long-lived issue per tracked workflow on the upstream `sgl-project/sglang` repo** (`[Failure Tracker] <workflow>`), each a persistent fact record of every test failure that workflow has shown — one unified, transparent place to see every AMD CI failure and how long it has been red. **Content** (which tests failed, error, cluster, regression status) is found by a small, dedicated agent task (`Task: Failure Tracker Data`) reading the SAME per-job analyses the daily report is built from — kept consistent with the daily report, and decoupled from the giant Daily Cross-Workflow Summary prose (the earlier "append JSON to the summary output" approach was observed to silently drop the block). A deterministic fallback parses the per-job `### Failed Tests` tables if the agent is unavailable. **State** (each failure's `first_seen` date, duration, dedup-by-test) is owned by deterministic Python — a hidden JSON blob in the issue body, NEVER recomputed — so a test red for months keeps an accurate "Broken since" date independent of the daily report's short lookback or GitHub's log retention. Config-driven via `TRACKED_WORKFLOWS`: add a workflow → it gets its own ledger issue. |
+| Notion Staging (opt-in) | `stage_notion.py` | `ci-monitor.yml` manual input `staging_mode=dry-run` or `write`; default `off` | Uses the existing Claude Code agent to canonicalize failures from recent Daily Reports, then applies a deterministic two-completed-run/no-later-pass gate. Analysis and writing are separate steps: the agent never receives Notion credentials. The sync phase reads the official and isolated staging data sources, skips known/staged matches, appends only new rows to `staging errors` with `Needs review`, and verifies both the new pages and that the official data source is unchanged. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, separates CI completeness from executed failure attribution, determines if executed failures are PR-related, and warns when required downstream jobs were fast-fail skipped or when the AMD test covering a changed code path did not run |
@@ -127,6 +128,8 @@ runner-1 entrypoint.sh (sleep 1800) ─┐
 **Why matrix instead of one big loop?** Earlier the monitor processed all workflows sequentially in one job, which often timed out and lost in-flight data. Matrix fan-out caps each job at one workflow, runs them in parallel, and uses the GitHub Actions runner pool elastically. The trade-off: every matrix job that produces failures **independently** rebuilds the Daily Cross-Workflow Summary, so the summary can be rebuilt up to 8 times per dispatch. This is intentional — last writer wins, and since they all read the same per-workflow comments the result is convergent.
 
 **Why a `prepare` step?** Without it, multiple matrix jobs racing `find_or_create_daily_issue()` would create duplicate issues for the same day. `ensure_daily_issue.py` runs once before fan-out so the issue (and its `:start`/`:end` placeholder block) exists by the time the matrix fires.
+
+After the matrix completes, `finalize` always refreshes the Failure Trackers. Notion staging is an additional **opt-in** tail: `staging_mode=dry-run` runs Claude Code and prints the validated candidate payload; `staging_mode=write` then performs the isolated Notion sync. The production dispatcher omits this input, so existing 30-minute monitoring behavior remains unchanged until staging is explicitly enabled after testing.
 
 ### Loop 2 — PR command dispatch (continuous, two redundant paths)
 
@@ -639,6 +642,80 @@ python scripts/failure_tracker.py --bot-repo bingxche/sglang-ci-bot --no-use-age
 
 Each tracker issue is found-or-created idempotently by exact-title search on the upstream repo (an issue still under the old `[CI Tracker] … — Persistent Failure Ledger` title is auto-renamed to the new `[Failure Tracker] …` scheme rather than duplicated). Per-workflow failures are caught and logged so one workflow's tracker error can never break another's.
 
+### Notion staging
+
+The initial rollout is deliberately fail-closed and opt-in. It recognizes a
+stable candidate only when Claude Code verifies the same canonical signature in
+at least two independent **completed** comparable runs, emits a direct URL and
+completion/comparability record for every supporting run, and finds no later
+comparable pass. One-run regressions, partial runs, incomplete history, and the
+two more subjective policy paths remain on the watchlist for this first version.
+
+The flow is split so the agent cannot inherit Notion secrets:
+
+```bash
+# Phase 1: GitHub evidence + Claude Code only
+python scripts/stage_notion.py analyze \
+    --bot-repo bingxche/sglang-ci-bot \
+    --lookback-days 7 \
+    --output .state/notion-staging-candidates.json
+
+# Safe preview: validates and prints exactly what would be staged
+python scripts/stage_notion.py sync \
+    --input .state/notion-staging-candidates.json \
+    --dry-run
+
+# Phase 2: deterministic Notion read/dedup/write/verify; never runs an agent
+NOTION_TOKEN=... \
+NOTION_KNOWN_DATA_SOURCE_ID=... NOTION_STAGING_DATA_SOURCE_ID=... \
+python scripts/stage_notion.py sync \
+    --input .state/notion-staging-candidates.json
+```
+
+In the Actions UI, run **Cron CI Monitor** with `staging_mode=dry-run` first.
+After reviewing its output, use `staging_mode=write` for the first real sync.
+The default is `off`, including dispatcher calls that omit the input.
+
+Use one minimum-permission Notion connection and keep the staging table in a
+**separate database container on its own page** (not merely as a second data
+source inside the official database, because Notion shares permissions at the
+database-container level):
+
+- `NOTION_TOKEN`: enable Read content and Insert content, disable Update
+  content, and share only the official known-error database and isolated
+  `staging errors` database with this connection. The deterministic sync code
+  uses the official ID only for reads and the staging ID as its sole create-page
+  destination; the agent process never receives this token.
+
+The script refuses identical official/staging IDs, verifies that the staging
+schema contains exactly `Time`, `Status`, `Test File`, `Job`, `Owner`, `Fix PR`,
+`Repro`, and `Error msg` with no extra columns, requires the target title to be
+`staging errors`, adds a
+stable fingerprint to `Repro`, and checks after every run that all created rows
+exist with `Status = Needs review` while the official data source's page IDs are
+unchanged. `Time` is the title property, `Status` is a status property, and the
+remaining six columns are rich text exactly as shown in the staging-table
+layout. Blank `Owner` and `Fix PR` values are omitted.
+
+`analyze` options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bot-repo` | required | Repository containing the Daily Report issues |
+| `--lookback-days` | `7` | Number of UTC Daily Reports supplied to Claude Code |
+| `--end-date` | today (UTC) | Replay boundary in `YYYY-MM-DD` form |
+| `--output` | required | Machine-readable candidate JSON path |
+| `--github-token` | `GH_PAT` / `BOT_PAT` / `GITHUB_TOKEN` | GitHub API token |
+
+`sync` options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--input` | required | Candidate JSON generated by `analyze` |
+| `--dry-run` | false | Validate and print candidates without contacting Notion |
+| `--known-data-source-id` | `NOTION_KNOWN_DATA_SOURCE_ID` | Official read-only data source |
+| `--staging-data-source-id` | `NOTION_STAGING_DATA_SOURCE_ID` | Isolated writable staging data source |
+
 ### PR Review
 
 ```bash
@@ -725,6 +802,8 @@ sglang-ci-bot/
                               - Cross-Run Pattern Analysis (one workflow across runs)
                               - Daily Cross-Workflow Summary (rendered into the daily
                                   issue body between :start --> / :end --> placeholders)
+                              - SGLang AMD CI Staging Candidates (strict JSON for
+                                  the isolated Notion staging gate)
                               - PR CI Status Check methodology + output format
                               - PR Code Review methodology + output format
                               - AITER analysis instructions (GitHub API)
@@ -789,6 +868,15 @@ sglang-ci-bot/
                               via #job-<id> anchors) and PATCHes the issue body
                               idempotently. Generic over workflow — add a line
                               to TRACKED_WORKFLOWS to extend.
+    stage_notion.py         Two-phase, opt-in Notion staging pipeline. `analyze`
+                              collects recent Daily Reports and invokes Claude
+                              Code with Task: SGLang AMD CI Staging Candidates;
+                              deterministic validation accepts only repeated
+                              signatures from 2+ completed comparable runs with
+                              no later pass. `sync --dry-run` previews without
+                              Notion access. Write-mode reads both data sources,
+                              deduplicates, writes only to the isolated staging
+                              source, and verifies the official source is intact.
     analyze_url.py          On-demand analysis of a run/job URL
     check_ci_for_pr.py      PR CI status checker
     review_pr.py            PR code review
@@ -802,7 +890,10 @@ sglang-ci-bot/
                               Layout: prepare job (resolve workflow list +
                               ensure_daily_issue.py) → monitor matrix job
                               (max-parallel 8, one entry per workflow file
-                              from MONITORED_WORKFLOWS).
+                              from MONITORED_WORKFLOWS) → finalize job. The
+                              optional staging_mode input defaults to off;
+                              dry-run and write modes execute the separated
+                              Notion staging phases after the matrix succeeds.
     analyze-ci.yml          On-demand URL analysis (workflow_dispatch)
     ci-status-check.yml     PR CI check (repository_dispatch + workflow_dispatch)
     pr-review.yml           PR review (repository_dispatch + workflow_dispatch)
@@ -837,6 +928,11 @@ sglang-ci-bot/
 | `DAILY_SUMMARY_TIMEOUT_SECS` | `daily_cross_workflow_summary.py` | Agent timeout for the cross-workflow synthesis (default: `1200` = 20 min) |
 | `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Max turns for the `Task: Failure Tracker Data` extraction agent (default: `80`) |
 | `TRACKER_AGENT_TIMEOUT_SECS` | `failure_tracker.py` | Agent timeout for the Failure Tracker extraction (default: `900` = 15 min) |
+| `STAGING_AGENT_MAX_TURNS` | `stage_notion.py analyze` | Max turns for the machine-readable staging-candidate agent (default: `120`) |
+| `STAGING_AGENT_TIMEOUT_SECS` | `stage_notion.py analyze` | Timeout for the staging-candidate agent (default: `1200` = 20 min) |
+| `NOTION_TOKEN` | `stage_notion.py sync` | Single Notion token with Read + Insert but no Update capability, shared only with the official and isolated staging databases; never present in the agent step |
+| `NOTION_KNOWN_DATA_SOURCE_ID` | `stage_notion.py sync` | Official known-error data source ID; read-only and required to differ from the staging ID |
+| `NOTION_STAGING_DATA_SOURCE_ID` | `stage_notion.py sync` | Isolated data source titled `staging errors`; the only write destination |
 | `AGENT_WORKSPACE` | Agent mode | Base directory for sglang clone (default: `/workspace`) |
 | `ANTHROPIC_API_KEY` | Agent mode | Set to `dummy` (Claude Code uses gateway, not direct API) |
 | `ANTHROPIC_BASE_URL` | Agent mode | LLM Gateway endpoint for Claude Code |
