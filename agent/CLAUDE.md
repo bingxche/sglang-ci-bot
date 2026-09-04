@@ -878,8 +878,7 @@ arrays here because Notion deduplication happens after this agent exits.
           "run_url": "https://github.com/sgl-project/sglang/actions/runs/101"
         }
       ],
-      "comparable_pass_after_first": false,
-      "status": "Needs review"
+      "comparable_pass_after_first": false
     }
   ],
   "known": [],
@@ -895,9 +894,10 @@ direct representative job URL, `repro` must name the failing-run pattern and a
 concrete Daily Report issue URL copied exactly from an `Issue:` line in
 `.ci-context/notion-staging-history.md`; the generic `/issues` listing URL is
 invalid. `error_msg` must contain the normalized causal error plus failure
-phase rather than a log dump. Newly staged status is always
-`Needs review`; never recommend promotion, rejection, deletion, or changes to
-the official known-error data source.
+phase rather than a log dump. Do not set a staging status; the deterministic
+writer leaves the `Status` property blank for human triage. Never recommend
+promotion, rejection, deletion, or changes to the official known-error data
+source.
 
 ---
 

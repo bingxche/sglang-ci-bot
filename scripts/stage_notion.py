@@ -214,9 +214,6 @@ def validate_candidate(candidate: dict[str, Any]) -> list[str]:
     if candidate.get("comparable_pass_after_first") is not False:
         errors.append("a later comparable pass exists or was not disproved")
 
-    if candidate.get("status", "Needs review") != "Needs review":
-        errors.append("Status must be Needs review")
-
     return errors
 
 
@@ -229,7 +226,6 @@ def prepare_candidates(report: dict[str, Any]) -> tuple[list[dict[str, Any]], li
             rejected.append({"reason": "candidate is not an object", "candidate": raw})
             continue
         candidate = dict(raw)
-        candidate["status"] = "Needs review"
         reasons = validate_candidate(candidate)
         if reasons:
             rejected.append({"reason": "; ".join(reasons), "candidate": candidate})
@@ -456,7 +452,7 @@ def candidate_values(candidate: dict[str, Any]) -> dict[str, str]:
         repro = f"{repro} [{FINGERPRINT_PREFIX}{fingerprint}]"
     return {
         "Time": str(candidate["time"]).strip(),
-        "Status": "Needs review",
+        "Status": "",
         "Test File": str(candidate["test_file"]).strip(),
         "Job": f"{str(candidate['job_name']).strip()} — {str(candidate['job_url']).strip()}",
         "Owner": str(candidate.get("owner", "")).strip(),
@@ -612,8 +608,6 @@ def sync(
             raise RuntimeError("Notion create-page response did not include an id")
         verified = notion.retrieve_page(page_id)
         record = row_record(verified)
-        if record.get("Status") != "Needs review":
-            raise RuntimeError(f"created page {page_id} has unexpected Status")
         if f"{FINGERPRINT_PREFIX}{candidate['fingerprint']}" not in record.get("Repro", ""):
             raise RuntimeError(f"created page {page_id} is missing its fingerprint")
         created.append({"id": page_id, "url": page.get("url"), "fingerprint": candidate["fingerprint"]})

@@ -40,7 +40,6 @@ def candidate(**overrides):
             },
         ],
         "comparable_pass_after_first": False,
-        "status": "Needs review",
     }
     value.update(overrides)
     return value
@@ -175,10 +174,10 @@ class NotionPayloadTests(unittest.TestCase):
             "Error msg": {"type": "rich_text"},
         }
 
-    def test_build_payload_uses_exact_schema_and_status(self):
+    def test_build_payload_leaves_status_blank(self):
         props = stage_notion.build_notion_properties(self.item, self.schema)
-        self.assertEqual(set(props), {"Time", "Test File", "Job", "Repro", "Error msg", "Status"})
-        self.assertEqual(props["Status"], {"status": {"name": "Needs review"}})
+        self.assertEqual(set(props), {"Time", "Test File", "Job", "Repro", "Error msg"})
+        self.assertNotIn("Status", props)
         self.assertEqual(
             props["Job"]["rich_text"][0]["text"]["link"]["url"],
             self.item["job_url"],
