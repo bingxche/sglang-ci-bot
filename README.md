@@ -15,7 +15,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 | Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` every 30min | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 8, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. For `nightly-amd-mi355x-disagg.yml`, per-job analysis pre-downloads the run's `mi355x-*` artifacts and unpacks bundled prefill/decode/router logs into `.ci-context/mi355x-artifacts` before invoking the agent. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
 | Daily Cross-Workflow Summary | `daily_cross_workflow_summary.py` | Auto-invoked by each `monitor_ci.py` matrix job that produced new failures (gated by `BUILD_DAILY_SUMMARY` env, default enabled); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling **Daily Cross-Workflow Summary** **pinned in the daily issue's body** (above all per-workflow comments) between `<!-- daily-cross-workflow-summary:start -->` / `<!-- daily-cross-workflow-summary:end -->` placeholder markers. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes the issue body in place, replacing only the content between the placeholders (matching the legacy `ci-monitor-daily-status-board` markers too, so older issues migrate in place). Legacy summary *comments* from before this move are auto-deleted by `_cleanup_legacy_summary_comments`. |
 | Failure Trackers (per workflow) | `failure_tracker.py` | A `finalize` job in `ci-monitor.yml` (`needs: monitor`), once per 30-min tick after the whole matrix completes | Maintains **one long-lived issue per tracked workflow on the upstream `sgl-project/sglang` repo** (`[Failure Tracker] <workflow>`), each a persistent fact record of every test failure that workflow has shown — one unified, transparent place to see every AMD CI failure and how long it has been red. **Content** (which tests failed, error, cluster, regression status) is found by a small, dedicated agent task (`Task: Failure Tracker Data`) reading the SAME per-job analyses the daily report is built from — kept consistent with the daily report, and decoupled from the giant Daily Cross-Workflow Summary prose (the earlier "append JSON to the summary output" approach was observed to silently drop the block). A deterministic fallback parses the per-job `### Failed Tests` tables if the agent is unavailable. **State** (each failure's `first_seen` date, duration, dedup-by-test) is owned by deterministic Python — a hidden JSON blob in the issue body, NEVER recomputed — so a test red for months keeps an accurate "Broken since" date independent of the daily report's short lookback or GitHub's log retention. Config-driven via `TRACKED_WORKFLOWS`: add a workflow → it gets its own ledger issue. |
-| Notion Staging (opt-in) | `stage_notion.py` | `ci-monitor.yml` manual input `staging_mode=dry-run` or `write`; default `off` | Uses the existing Claude Code agent to canonicalize failures from recent Daily Reports, then applies a deterministic two-completed-run/no-later-pass gate. Analysis and writing are separate steps: the agent never receives Notion credentials. The sync phase reads the official and isolated staging data sources, skips known/staged matches, appends only new rows to `SGLang AMD CI Staging Errors` with a blank `Status`, and verifies both the new pages and that the official data source is unchanged. |
+| Notion Staging (daily) | `stage_notion.py` | Independent `notion-staging.yml` schedule at **20:00 Asia/Shanghai daily**; manual `dry-run` / `write` | Uses the existing Claude Code agent to canonicalize failures from recent Daily Reports, then applies a deterministic two-completed-run/no-later-pass gate. Analysis and writing are separate steps: the agent never receives Notion credentials. The sync phase reads the official and isolated staging data sources, skips known/staged matches, appends only new rows to `SGLang AMD CI Staging Errors` with a blank `Status`, and verifies both the new pages and that the official data source is unchanged. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, separates CI completeness from executed failure attribution, determines if executed failures are PR-related, and warns when required downstream jobs were fast-fail skipped or when the AMD test covering a changed code path did not run |
@@ -129,7 +129,7 @@ runner-1 entrypoint.sh (sleep 1800) ─┐
 
 **Why a `prepare` step?** Without it, multiple matrix jobs racing `find_or_create_daily_issue()` would create duplicate issues for the same day. `ensure_daily_issue.py` runs once before fan-out so the issue (and its `:start`/`:end` placeholder block) exists by the time the matrix fires.
 
-After the matrix completes, `finalize` always refreshes the Failure Trackers. Notion staging is an additional **opt-in** tail: `staging_mode=dry-run` runs Claude Code and prints the validated candidate payload; `staging_mode=write` then performs the isolated Notion sync. The production dispatcher omits this input, so existing 30-minute monitoring behavior remains unchanged until staging is explicitly enabled after testing.
+After the matrix completes, `finalize` always refreshes the Failure Trackers. Notion staging runs in its own `notion-staging.yml` workflow, so the existing 30-minute monitor has no staging steps and keeps its original execution sequence.
 
 ### Loop 2 — PR command dispatch (continuous, two redundant paths)
 
@@ -644,7 +644,7 @@ Each tracker issue is found-or-created idempotently by exact-title search on the
 
 ### Notion staging
 
-The initial rollout is deliberately fail-closed and opt-in. It recognizes a
+The initial rollout is deliberately fail-closed. It recognizes a
 stable candidate only when Claude Code verifies the same canonical signature in
 at least two independent **completed** comparable runs, emits a direct URL and
 completion/comparability record for every supporting run, and finds no later
@@ -678,9 +678,10 @@ report and still applies the full deterministic gate; zero or multiple reports
 fail closed. The raw agent response is retained beside the candidate file for
 diagnostics.
 
-In the Actions UI, run **Cron CI Monitor** with `staging_mode=dry-run` first.
-After reviewing its output, use `staging_mode=write` for the first real sync.
-The default is `off`, including dispatcher calls that omit the input.
+`SGLang AMD CI Daily Staging` is independent from `Cron CI Monitor`. GitHub
+Actions schedules it at `12:00 UTC`, which is `20:00 Asia/Shanghai` every day.
+Scheduled runs always write after validation and deduplication. In the Actions
+UI, manual runs default to `dry-run`; select `write` for an explicit sync test.
 
 Use one minimum-permission Notion connection and keep the staging table in a
 **separate database container on its own page** (not merely as a second data
@@ -896,10 +897,11 @@ sglang-ci-bot/
                               Layout: prepare job (resolve workflow list +
                               ensure_daily_issue.py) → monitor matrix job
                               (max-parallel 8, one entry per workflow file
-                              from MONITORED_WORKFLOWS) → finalize job. The
-                              optional staging_mode input defaults to off;
-                              dry-run and write modes execute the separated
-                              Notion staging phases after the matrix succeeds.
+                              from MONITORED_WORKFLOWS) → finalize job.
+    notion-staging.yml      Independent daily Notion staging workflow. GitHub
+                              schedules it for 12:00 UTC / 20:00 Asia/Shanghai;
+                              scheduled runs write, while manual runs offer
+                              dry-run and write modes.
     analyze-ci.yml          On-demand URL analysis (workflow_dispatch)
     ci-status-check.yml     PR CI check (repository_dispatch + workflow_dispatch)
     pr-review.yml           PR review (repository_dispatch + workflow_dispatch)

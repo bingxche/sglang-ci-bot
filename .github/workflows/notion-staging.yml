@@ -1,0 +1,77 @@
+name: SGLang AMD CI Daily Staging
+
+on:
+  schedule:
+    # GitHub cron is UTC. 12:00 UTC is 20:00 Asia/Shanghai year-round.
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Preview candidates or write verified rows to Notion'
+        required: false
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - write
+      lookback_days:
+        description: 'UTC Daily Reports supplied to staging analysis'
+        required: false
+        default: '7'
+
+concurrency:
+  group: notion-staging
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    runs-on: [self-hosted, amd-internal]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Notion credentials are intentionally absent here: Claude Code sees
+      # only GitHub evidence and writes a machine-readable candidate file.
+      - name: Analyze staging candidates with Claude Code
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
+          LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
+          STAGING_AGENT_MAX_TURNS: '120'
+          STAGING_AGENT_TIMEOUT_SECS: '1200'
+        run: |
+          if ! python scripts/stage_notion.py analyze \
+              --bot-repo ${{ github.repository }} \
+              --lookback-days "${{ github.event.inputs.lookback_days || '7' }}" \
+              --output .state/notion-staging-candidates.json; then
+            echo "Claude output tail (diagnostic only):"
+            tail -c 8000 .state/notion-staging-candidates.json.raw.txt 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Preview staging candidates
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry-run' }}
+        run: |
+          python scripts/stage_notion.py sync \
+            --input .state/notion-staging-candidates.json \
+            --dry-run
+
+      # Scheduled runs always use write mode. This step never launches an
+      # agent; the minimum-permission connection reads both data sources and
+      # can insert only into the isolated staging destination.
+      - name: Write and verify Notion staging candidates
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'write' }}
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_KNOWN_DATA_SOURCE_ID: ${{ vars.NOTION_KNOWN_DATA_SOURCE_ID }}
+          NOTION_STAGING_DATA_SOURCE_ID: ${{ vars.NOTION_STAGING_DATA_SOURCE_ID }}
+        run: |
+          python scripts/stage_notion.py sync \
+            --input .state/notion-staging-candidates.json
