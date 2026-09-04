@@ -305,10 +305,12 @@ def analyze(
         from utils import claude_code_analyze, ensure_sglang_repo
 
         repo_path = ensure_sglang_repo()
+        allowed_report_urls = ", ".join(report["url"] for report in reports)
         prompt = (
             "Task: SGLang AMD CI Staging Candidates\n"
             f"Bot repository: {bot_repo}\n"
             f"Daily Reports: .ci-context/notion-staging-history.md\n"
+            f"Allowed concrete Daily Report issue URLs: {allowed_report_urls}\n"
             f"Lookback days: {lookback_days}\n"
             "Source: current directory\n"
             "GitHub API token: $GH_PAT"

@@ -892,8 +892,10 @@ arrays here because Notion deduplication happens after this agent exits.
 
 Every `stable` row must include every field shown above. `job_url` must be a
 direct representative job URL, `repro` must name the failing-run pattern and a
-Daily Report URL, and `error_msg` must contain the normalized causal error plus
-failure phase rather than a log dump. Newly staged status is always
+concrete Daily Report issue URL copied exactly from an `Issue:` line in
+`.ci-context/notion-staging-history.md`; the generic `/issues` listing URL is
+invalid. `error_msg` must contain the normalized causal error plus failure
+phase rather than a log dump. Newly staged status is always
 `Needs review`; never recommend promotion, rejection, deletion, or changes to
 the official known-error data source.
 
