@@ -20,7 +20,7 @@ used to reuse an earlier analysis when the current lookup returns the exact
 same GitHub job ID.
 
 Runs as a one-shot process triggered by GitHub Actions workflow_dispatch
-(every 30min from runner-1's entrypoint.sh dispatch loop).
+(every hour from runner-1's entrypoint.sh dispatch loop).
 """
 
 import argparse
@@ -422,7 +422,7 @@ def _initial_issue_body(date_str: str) -> str:
     return (
         f"{DAILY_SUMMARY_PLACEHOLDER_START}\n"
         f"_The Daily Cross-Workflow Summary will appear here once the "
-        f"first scan completes (typically within 30 minutes of the first run "
+        f"first scan completes (typically within one hour of the first run "
         f"finishing)._\n"
         f"{DAILY_SUMMARY_PLACEHOLDER_END}\n\n"
         f"---\n\n"

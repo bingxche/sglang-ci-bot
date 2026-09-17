@@ -12,9 +12,9 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 
 | Feature | Script | Trigger | What it does |
 |---------|--------|---------|--------------|
-| Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` every 30min | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 8, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. For `nightly-amd-mi355x-disagg.yml`, per-job analysis pre-downloads the run's `mi355x-*` artifacts and unpacks bundled prefill/decode/router logs into `.ci-context/mi355x-artifacts` before invoking the agent. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
+| Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` hourly | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 8, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. For `nightly-amd-mi355x-disagg.yml`, per-job analysis pre-downloads the run's `mi355x-*` artifacts and unpacks bundled prefill/decode/router logs into `.ci-context/mi355x-artifacts` before invoking the agent. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
 | Daily Cross-Workflow Summary | `daily_cross_workflow_summary.py` | Auto-invoked by each `monitor_ci.py` matrix job that produced new failures (gated by `BUILD_DAILY_SUMMARY` env, default enabled); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling **Daily Cross-Workflow Summary** **pinned in the daily issue's body** (above all per-workflow comments) between `<!-- daily-cross-workflow-summary:start -->` / `<!-- daily-cross-workflow-summary:end -->` placeholder markers. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes the issue body in place, replacing only the content between the placeholders (matching the legacy `ci-monitor-daily-status-board` markers too, so older issues migrate in place). Legacy summary *comments* from before this move are auto-deleted by `_cleanup_legacy_summary_comments`. |
-| Failure Trackers (per workflow) | `failure_tracker.py` | A `finalize` job in `ci-monitor.yml` (`needs: monitor`), once per 30-min tick after the whole matrix completes | Maintains **one long-lived issue per tracked workflow on the upstream `sgl-project/sglang` repo** (`[Failure Tracker] <workflow>`), each a persistent fact record of every test failure that workflow has shown — one unified, transparent place to see every AMD CI failure and how long it has been red. **Content** (which tests failed, error, cluster, regression status) is found by a small, dedicated agent task (`Task: Failure Tracker Data`) reading the SAME per-job analyses the daily report is built from — kept consistent with the daily report, and decoupled from the giant Daily Cross-Workflow Summary prose (the earlier "append JSON to the summary output" approach was observed to silently drop the block). A deterministic fallback parses the per-job `### Failed Tests` tables if the agent is unavailable. **State** (each failure's `first_seen` date, duration, dedup-by-test) is owned by deterministic Python — a hidden JSON blob in the issue body, NEVER recomputed — so a test red for months keeps an accurate "Broken since" date independent of the daily report's short lookback or GitHub's log retention. Config-driven via `TRACKED_WORKFLOWS`: add a workflow → it gets its own ledger issue. |
+| Failure Trackers (per workflow) | `failure_tracker.py` | A `finalize` job in `ci-monitor.yml` (`needs: monitor`), once per hourly tick after the whole matrix completes | Maintains **one long-lived issue per tracked workflow on the upstream `sgl-project/sglang` repo** (`[Failure Tracker] <workflow>`), each a persistent fact record of every test failure that workflow has shown — one unified, transparent place to see every AMD CI failure and how long it has been red. **Content** (which tests failed, error, cluster, regression status) is found by a small, dedicated agent task (`Task: Failure Tracker Data`) reading the SAME per-job analyses the daily report is built from — kept consistent with the daily report, and decoupled from the giant Daily Cross-Workflow Summary prose (the earlier "append JSON to the summary output" approach was observed to silently drop the block). A deterministic fallback parses the per-job `### Failed Tests` tables if the agent is unavailable. **State** (each failure's `first_seen` date, duration, dedup-by-test) is owned by deterministic Python — a hidden JSON blob in the issue body, NEVER recomputed — so a test red for months keeps an accurate "Broken since" date independent of the daily report's short lookback or GitHub's log retention. Config-driven via `TRACKED_WORKFLOWS`: add a workflow → it gets its own ledger issue. |
 | Notion Staging (daily) | `stage_notion.py` | Independent `notion-staging.yml` schedule at **20:00 Asia/Shanghai daily**; manual `dry-run` / `write` | Uses the existing Claude Code agent to canonicalize failures from recent Daily Reports, then applies a deterministic two-completed-run/no-later-pass gate. Analysis and writing are separate steps: the agent never receives Notion credentials. The sync phase reads the official and isolated staging data sources, skips known/staged matches, appends only new rows to `SGLang AMD CI Staging Errors` with a blank `Status`, and verifies both the new pages and that the official data source is unchanged. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
@@ -50,10 +50,10 @@ AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "
 
 There are **three independent loops** running concurrently. Each is triggered differently and handles a different responsibility. They share state only via GitHub (issues, comments, reactions) — never via local disk.
 
-### Loop 1 — CI monitoring (every 30 minutes)
+### Loop 1 — CI monitoring (hourly)
 
 ```
-runner-1 entrypoint.sh (sleep 1800) ─┐
+runner-1 entrypoint.sh (sleep 3600) ─┐
                                     ▼
               POST .../actions/workflows/ci-monitor.yml/dispatches
                                     │
@@ -129,7 +129,7 @@ runner-1 entrypoint.sh (sleep 1800) ─┐
 
 **Why a `prepare` step?** Without it, multiple matrix jobs racing `find_or_create_daily_issue()` would create duplicate issues for the same day. `ensure_daily_issue.py` runs once before fan-out so the issue (and its `:start`/`:end` placeholder block) exists by the time the matrix fires.
 
-After the matrix completes, `finalize` always refreshes the Failure Trackers. Notion staging runs in its own `notion-staging.yml` workflow, so the existing 30-minute monitor has no staging steps and keeps its original execution sequence.
+After the matrix completes, `finalize` always refreshes the Failure Trackers. Notion staging runs in its own `notion-staging.yml` workflow, so the hourly monitor has no staging steps and keeps its original execution sequence.
 
 ### Loop 2 — PR command dispatch (continuous, two redundant paths)
 
@@ -316,7 +316,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 
 ### Deploy self-hosted runners
 
-`runner/setup.sh` spawns 10 runner containers. Runner-1 runs a comment watcher daemon + a CI monitor dispatch loop (dispatches `ci-monitor.yml` every 30 minutes via `workflow_dispatch`). Runners 2-10 are plain job executors.
+`runner/setup.sh` spawns 10 runner containers. Runner-1 runs a comment watcher daemon + a CI monitor dispatch loop (dispatches `ci-monitor.yml` hourly via `workflow_dispatch`). Runners 2-10 are plain job executors.
 
 ```bash
 bash runner/setup.sh \
@@ -498,7 +498,7 @@ same date through per-workflow publication and Daily Summary refresh. A long
 agent run that crosses UTC midnight therefore cannot attach new-day state to a
 comment fetched from the previous day's issue.
 
-When re-rendering an existing per-workflow comment (e.g. on the next 30-minute cron tick after a previous tick added new analyses), the bot needs to recover the previously-analysed jobs to merge them with the new batch. **Recovery is strict and self-contained per `<details>` block**: every per-job block emitted by `_render_per_job_block()` carries its `job_id`, `run_url`, and `started_at` as HTML attributes on the `<details>` tag itself:
+When re-rendering an existing per-workflow comment (e.g. on the next hourly cron tick after a previous tick added new analyses), the bot needs to recover the previously-analysed jobs to merge them with the new batch. **Recovery is strict and self-contained per `<details>` block**: every per-job block emitted by `_render_per_job_block()` carries its `job_id`, `run_url`, and `started_at` as HTML attributes on the `<details>` tag itself:
 
 ```html
 <details data-job-id="71234567"
@@ -906,7 +906,7 @@ sglang-ci-bot/
   .github/workflows/
     ci-monitor.yml          CI monitor — workflow_dispatch only (no cron in the
                               workflow itself). Runner-1's entrypoint.sh
-                              dispatches it every 30 minutes via API.
+                              dispatches it hourly via API.
                               Layout: prepare job (resolve workflow list +
                               ensure_daily_issue.py) → monitor matrix job
                               (max-parallel 8, one entry per workflow file
@@ -925,7 +925,7 @@ sglang-ci-bot/
     setup.sh                Multi-runner deployment (default 10 containers)
     entrypoint.sh           Container entrypoint (register + daemons + bot repo
                               clone). Runner-1 only: starts watch_comments.py
-                              --daemon AND a 30-minute loop that POSTs to
+                              --daemon AND an hourly loop that POSTs to
                               ci-monitor.yml/dispatches.
   tests/
     test_monitor_ci.py      Standard-library regression tests for CI-monitor
@@ -1007,9 +1007,9 @@ Edit `BOT_LOGIN` in `scripts/watch_comments.py`.
 
 Comment watcher daemon: `--poll-interval` in `scripts/watch_comments.py` (default: 30s, deployed as 15s via `setup.sh`).
 
-CI monitor dispatch: `entrypoint.sh` dispatches `ci-monitor.yml` via `workflow_dispatch` every 30 minutes (`sleep 1800` loop).
+CI monitor dispatch: `entrypoint.sh` dispatches `ci-monitor.yml` via `workflow_dispatch` hourly (`sleep 3600` loop).
 
 ### Schedules
 
-- `ci-monitor.yml`: triggered by runner-1 every 30 minutes via `workflow_dispatch`
+- `ci-monitor.yml`: triggered hourly by runner-1 via `workflow_dispatch`
 - `comment-watcher.yml`: `'*/5 * * * *'` (every 5 minutes)

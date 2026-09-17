@@ -670,7 +670,7 @@ When asked to produce the **top-of-issue Daily Cross-Workflow Summary** that agg
 
 ```
 # Daily Cross-Workflow Summary — <YYYY-MM-DD>
-**Snapshot**: <YYYY-MM-DD HH:MM UTC> · Only completed runs counted · Auto-updated every 30 min
+**Snapshot**: <YYYY-MM-DD HH:MM UTC> · Only completed runs counted · Checked hourly; updated when new failures are found
 
 ## TL;DR
 <one of: 🟢 GREEN | 🟡 YELLOW | 🔴 RED> · <N> unique clusters · <X> NEW today · <Y> carrying over · <Z> in-flight fix(es)

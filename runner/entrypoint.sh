@@ -74,10 +74,10 @@ if [ "${ENABLE_WATCHER:-}" = "true" ]; then
         done
     ) &
 
-    echo "Starting CI monitor trigger (every 30 minutes)..."
+    echo "Starting CI monitor trigger (every hour)..."
     (
         while true; do
-            sleep 1800
+            sleep 3600
             curl -fsSL -X POST \
                 -H "Authorization: token ${GH_PAT}" \
                 -H "Accept: application/vnd.github+json" \
