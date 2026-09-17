@@ -11,11 +11,13 @@ new failures are discovered.  In-progress runs are monitored so that
 already-failed jobs can be analyzed immediately, without waiting for the
 entire workflow to finish.
 
-Deduplication is achieved by embedding processed job IDs in the comment
-body as an HTML comment:
+Within a daily issue, deduplication is achieved by embedding processed job
+IDs in the comment body as an HTML comment:
   <!-- processed_job_ids: 111,222,333 -->
 Each cron run reads this metadata before analyzing, ensuring no job is
-analyzed twice.
+analyzed twice that day. Across UTC-day rollovers, retained local state is
+used to reuse an earlier analysis when the current lookup returns the exact
+same GitHub job ID.
 
 Runs as a one-shot process triggered by GitHub Actions workflow_dispatch
 (every 30min from runner-1's entrypoint.sh dispatch loop).
@@ -46,6 +48,7 @@ from utils import (
     delete_comment,
     ensure_sglang_repo,
     get_failed_jobs,
+    get_run_jobs,
     gh_headers,
     is_gate_job,
     post_comment,
@@ -57,13 +60,10 @@ log = logging.getLogger("ci-monitor")
 
 MONITORED_WORKFLOWS = [
     "nightly-test-amd.yml",
-    "nightly-test-amd-rocm720.yml",
-    "release-docker-amd-nightly.yml",
     "release-docker-amd-rocm720-nightly.yml",
     "nightly-amd-mi355x-disagg.yml",
     "amd-aiter-scout.yml",
     "pr-test-amd.yml",
-    "pr-test-amd-rocm720.yml",
 ]
 
 # Most monitored workflows are analyzed only when triggered by ``schedule``
@@ -145,6 +145,47 @@ def get_workflow_state(daily: dict, workflow_file: str) -> dict:
     return wfs[workflow_file]
 
 
+def get_prior_analyses_by_job_id(
+    state: dict,
+    workflow_file: str,
+    current_date: str,
+) -> dict[int, dict]:
+    """Index reusable analyses from earlier UTC-day state by exact job ID.
+
+    The current GitHub lookup remains responsible for deciding which jobs are
+    in the active lookback window. This cache only avoids asking the agent to
+    analyze the same immutable GitHub job again after the daily state rolls
+    over. Later saved dates win if the same job appears more than once.
+    """
+    reusable: dict[int, dict] = {}
+    daily_comments = state.get("daily_comments", {})
+    if not isinstance(daily_comments, dict):
+        return reusable
+
+    for date_str in sorted(daily_comments):
+        if date_str >= current_date:
+            continue
+        daily = daily_comments.get(date_str)
+        if not isinstance(daily, dict):
+            continue
+        workflow_state = daily.get("workflows", {}).get(workflow_file, {})
+        if not isinstance(workflow_state, dict):
+            continue
+        for analysis in workflow_state.get("job_analyses", []):
+            if not isinstance(analysis, dict) or not _is_usable_per_job_analysis(
+                analysis.get("analysis")
+            ):
+                continue
+            try:
+                job_id = int(analysis.get("job_id", 0))
+            except (TypeError, ValueError):
+                continue
+            if job_id > 0:
+                reusable[job_id] = analysis
+
+    return reusable
+
+
 # ---------------------------------------------------------------------------
 # GitHub API helpers
 # ---------------------------------------------------------------------------
@@ -193,11 +234,7 @@ def get_workflow_runs(
 
 def get_pending_job_info(token: str, run_id: int) -> dict:
     """Count still-running jobs in a workflow run."""
-    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
-    params = {"filter": "latest", "per_page": 100}
-    resp = requests.get(url, headers=gh_headers(token), params=params)
-    resp.raise_for_status()
-    jobs = resp.json().get("jobs", [])
+    jobs = get_run_jobs(token, run_id)
     running = [j for j in jobs if j.get("status") != "completed"]
     return {"count": len(running), "run_id": run_id}
 
@@ -506,6 +543,24 @@ def _extract_report(text: str, anchor_re: re.Pattern) -> str:
     return _strip_llm_preamble(text)
 
 
+def _is_usable_per_job_analysis(raw_analysis: object) -> bool:
+    """Match the renderer's definition of a complete per-job analysis."""
+    if not isinstance(raw_analysis, str):
+        return False
+    analysis_text = _extract_report(raw_analysis.strip(), _PER_JOB_ANCHOR_RE)
+    return bool(
+        len(analysis_text) >= 200
+        and not analysis_text.lower().startswith(
+            (
+                "stub",
+                "analysis failed",
+                "agent timed out",
+                "**analysis did not complete.**",
+            )
+        )
+    )
+
+
 def _render_per_job_block(ja: dict) -> str:
     """Render a single <details> block for one job analysis."""
     job_id = ja.get("job_id", 0)
@@ -516,13 +571,7 @@ def _render_per_job_block(ja: dict) -> str:
 
     raw_analysis = (ja.get("analysis") or "").strip()
     analysis_text = _extract_report(raw_analysis, _PER_JOB_ANCHOR_RE)
-    stub_marker = (
-        not analysis_text
-        or len(analysis_text) < 200
-        or analysis_text.lower().startswith(
-            ("stub", "analysis failed", "agent timed out")
-        )
-    )
+    stub_marker = not _is_usable_per_job_analysis(raw_analysis)
 
     if stub_marker:
         summary_suffix = " — ⚠️ analysis failed"
@@ -1031,10 +1080,13 @@ def monitor_workflow(
     use_agent: bool = True,
     agent_repo_path: Path | None = None,
     event: str | None = None,
+    reusable_job_analyses: dict[int, dict] | None = None,
 ) -> tuple[list[dict], list[int], list[dict]]:
     """Monitor a single workflow.
 
-    Returns (new_job_analyses, new_job_ids, pending_info).
+    Returns (analyses newly added to today's report, their job IDs,
+    pending_info). An analysis may be reused from earlier-day state when the
+    current GitHub lookup contains the exact same job ID.
     """
     log.info("Monitoring: %s (branch: %s, event: %s)", workflow_file, branch, event or "all")
 
@@ -1051,7 +1103,9 @@ def monitor_workflow(
     )
 
     jobs_to_analyze: list[tuple[dict, str, str]] = []
+    reused_job_analyses: list[dict] = []
     pending_info: list[dict] = []
+    reusable_job_analyses = reusable_job_analyses or {}
 
     for run in runs:
         run_id = run["id"]
@@ -1072,18 +1126,48 @@ def monitor_workflow(
             log.info("    Skipping gate job: %s (ID: %d)", gj["name"], gj["id"])
         failed_jobs = [j for j in failed_jobs if not is_gate_job(j)]
 
-        if failed_jobs:
-            log.info("    %d new failed job(s) to analyze", len(failed_jobs))
-            for job in failed_jobs:
+        reused_in_run = 0
+        queued_in_run = 0
+        for job in failed_jobs:
+            cached = reusable_job_analyses.get(job["id"])
+            if cached is None:
                 jobs_to_analyze.append((job, run_url, head_sha))
+                queued_in_run += 1
+                continue
+
+            failed_step_names = {
+                step["name"]
+                for step in job.get("steps", [])
+                if step.get("conclusion") not in ("success", "skipped", None)
+            }
+            reused_job_analyses.append({
+                **cached,
+                "run_url": run_url,
+                "job_name": job["name"],
+                "job_id": job["id"],
+                "head_sha": head_sha,
+                "started_at": job.get("started_at") or cached.get("started_at"),
+                "failed_steps": sorted(failed_step_names),
+            })
+            reused_in_run += 1
+            log.info(
+                "    Reusing earlier-day analysis for %s (ID: %d)",
+                job["name"], job["id"],
+            )
+
+        if failed_jobs:
+            log.info(
+                "    %d failed job(s): %d reused, %d to analyze",
+                len(failed_jobs), reused_in_run, queued_in_run,
+            )
 
         if run_status != "completed":
             pi = get_pending_job_info(token, run_id)
             if pi["count"] > 0:
                 pending_info.append(pi)
 
-    new_job_analyses: list[dict] = []
-    new_job_ids: list[int] = []
+    new_job_analyses: list[dict] = list(reused_job_analyses)
+    new_job_ids: list[int] = [ja["job_id"] for ja in reused_job_analyses]
 
     if jobs_to_analyze:
         max_workers = min(
@@ -1149,7 +1233,7 @@ def monitor_workflow(
                         traceback.print_exc()
                         new_job_ids.append(job["id"])
     else:
-        log.info("  No new failed jobs to analyze.")
+        log.info("  No failed jobs require a fresh analysis.")
 
     return new_job_analyses, new_job_ids, pending_info
 
@@ -1168,6 +1252,7 @@ def publish_workflow_report(
     gh_comments: list[dict] | None = None,
     use_agent: bool = True,
     agent_repo_path: "Path | None" = None,
+    date_str: str | None = None,
 ):
     """Publish or update the workflow comment(s) in the daily issue.
 
@@ -1176,7 +1261,7 @@ def publish_workflow_report(
     the remaining per-job ``<details>`` blocks. Existing comments are
     adopted so a re-run patches in place instead of duplicating content.
     """
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    date_str = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = get_daily_state(state, date_str)
 
     if not daily.get("issue_number"):
@@ -1367,11 +1452,15 @@ def run_oneshot(
             local_ids = {ja["job_id"] for ja in wf_state.get("job_analyses", [])}
             gh_ids = extract_processed_ids_from_comments(gh_comments, wf) if gh_comments else set()
             processed_job_ids = local_ids | gh_ids
+            reusable_job_analyses = get_prior_analyses_by_job_id(
+                state, wf, date_str,
+            )
 
             new_analyses, new_ids, pending = monitor_workflow(
                 token, wf,
                 hours_back=hours_back,
                 processed_job_ids=processed_job_ids,
+                reusable_job_analyses=reusable_job_analyses,
                 job_name_filter=job_name_filter,
                 branch=branch,
                 use_agent=use_agent,
@@ -1404,6 +1493,7 @@ def run_oneshot(
                     gh_comments=gh_comments,
                     use_agent=use_agent,
                     agent_repo_path=agent_repo_path,
+                    date_str=date_str,
                 )
 
             save_state(state)
@@ -1428,7 +1518,9 @@ def run_oneshot(
                 "Building Daily Cross-Workflow Summary (%d workflow(s) updated)",
                 total_reports,
             )
-            build_and_publish_summary(token, bot_repo, use_agent=use_agent)
+            build_and_publish_summary(
+                token, bot_repo, use_agent=use_agent, date_str=date_str,
+            )
         except Exception as exc:
             log.warning("Daily Cross-Workflow Summary build failed: %s", exc)
             traceback.print_exc()

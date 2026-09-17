@@ -234,11 +234,15 @@ You MUST perform this A/B check for every scout failure before writing the Root 
 | Scout job name | Sister workflow file | Sister job name |
 |----------------|----------------------|-----------------|
 | `call-nightly-amd / <name>` | `nightly-test-amd.yml` | `<name>` |
-| `call-nightly-amd-rocm720 / <name>` | `nightly-test-amd-rocm720.yml` | `<name>` |
 | `call-pr-test-amd / <name>` | `pr-test-amd.yml` | `<name>` |
-| `call-pr-test-amd-rocm720 / <name>` | `pr-test-amd-rocm720.yml` | `<name>` |
+| `call-nightly-amd-rocm720 / <name>` (legacy run only) | `nightly-test-amd-rocm720.yml` | `<name>` |
+| `call-pr-test-amd-rocm720 / <name>` (legacy run only) | `pr-test-amd-rocm720.yml` | `<name>` |
 
-The `<name>` may contain matrix suffixes like `(linux-mi325-1gpu-sglang, 11)` — keep it verbatim when matching sister jobs.
+The unified workflows expand ROCm 10, ROCm 7.2.4, and ROCm 7.2 inside the
+same run. The `<name>` therefore contains a versioned matrix suffix such as
+`(rocm720, linux-mi300-1gpu-sglang, 11)` — keep it verbatim when matching
+sister jobs. The legacy rows are retained only for explicit analysis of old
+Scout run URLs; they are not current monitor defaults.
 
 **2. List the sister workflow's recent scheduled runs** (filter to `event=schedule` and same branch so you never pick up another scout's `workflow_call` run):
 ```
@@ -367,7 +371,7 @@ Do NOT write "Revert X" or "Pin Y<Z" as if they were the final answer. The maint
 
 ### Status (factual, no priority assignment)
 - **Persistence**: e.g. "Failing for 5 days (since 2026-04-14 06:41 UTC), every completed run since"
-- **Scope**: e.g. "6 jobs across 3 workflows (pr-test-amd, pr-test-amd-rocm720, nightly-test-amd)"
+- **Scope**: e.g. "6 jobs across 2 workflows and 3 ROCm versions (pr-test-amd, nightly-test-amd)"
 - **Blocked work**: e.g. "Blocks LoRA + DLLM CI signal on AMD"
 - **In-flight fix**: copy the line from the In-flight Fix Check above
 
@@ -677,7 +681,7 @@ When asked to produce the **top-of-issue Daily Cross-Workflow Summary** that agg
 | Workflow | Runs | ✅ | ❌ | 7d trend (completed runs only) | Δ vs yesterday |
 |---|---|---|---|---|---|
 | pr-test-amd | 4 | 0 | 4 | 14·14·14·17·17·17·12 | -2 (better) |
-| pr-test-amd-rocm720 | 4 | 0 | 4 | 15·15·15·15·15·15·15 | 0 |
+| amd-aiter-scout | 2 | 0 | 2 | 8·8·9·9·7·7·6 | -1 (better) |
 | nightly-test-amd | 1 | 0 | 1 | 10 | +0 |
 ...
 
@@ -697,7 +701,7 @@ For each unique cluster (sorted: 🆕 NEW first, then by total job count DESC, t
 |---|---|---|---|---|---|
 | pr-test-amd | [stage-b-1gpu-small (2)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/rl/test_lora_load_from_tensor.py` | `TestLoRALoadFromTensor.setUpClass` | `Memory access fault → exit -6` | [link](url) |
 | pr-test-amd | [stage-b-1gpu-small (4)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/dllm/test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault → exit -9` | [link](url) |
-| pr-test-amd-rocm720 | [stage-b-1gpu-small (4)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault` | [link](url) |
+| pr-test-amd | [stage-b-1gpu-small (rocm720, 4)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault` | [link](url) |
 | nightly-test-amd | [nightly-1-gpu-lora](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_lora_e2e.py` | `test_lora_full_pipeline` | same | [link](url) |
 
 (Test File + Test Function granularity is REQUIRED. Group rows by cluster, not by workflow. Same cluster across workflows lives in ONE table. The `Job (shard)` cell MUST be a clickable link to the actual sglang job page — `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>` — never an in-issue `#job-<id>` anchor.)
@@ -977,7 +981,7 @@ One or two sentences of FACTS: what failed. Reference the specific test files ab
 ### Stack Traces
 Include key error messages and stack traces verbatim (in code blocks). Only the relevant portions.
 
-### Failure Origin (include ONLY when the job name starts with `call-nightly-amd`, `call-nightly-amd-rocm720`, `call-pr-test-amd`, or `call-pr-test-amd-rocm720` — i.e. the job is an AMD AITER Scout sub-job)
+### Failure Origin (include ONLY when the job name starts with `call-nightly-amd` or `call-pr-test-amd` — i.e. the job is an AMD AITER Scout sub-job)
 API mode cannot query the sister workflow's baseline run, so the Origin MUST be reported as `unclear`. Add this line verbatim:
 `Origin: unclear — API-mode analyzer cannot perform baseline A/B check against the sister workflow; re-run in agent mode for a definitive classification.`
 

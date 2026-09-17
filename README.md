@@ -454,14 +454,22 @@ Configured in `MONITORED_WORKFLOWS` in `monitor_ci.py`:
 
 ```
 nightly-test-amd.yml
-nightly-test-amd-rocm720.yml
-release-docker-amd-nightly.yml
 release-docker-amd-rocm720-nightly.yml
 nightly-amd-mi355x-disagg.yml
 amd-aiter-scout.yml
 pr-test-amd.yml
-pr-test-amd-rocm720.yml
 ```
+
+Upstream now expands ROCm 10, ROCm 7.2.4, and ROCm 7.2 as job matrices inside
+the unified `nightly-test-amd.yml` and `pr-test-amd.yml` runs. The workflow
+files `nightly-test-amd-rocm720.yml`, `pr-test-amd-rocm720.yml`, and
+`release-docker-amd-nightly.yml` are retired from the upstream default branch
+and therefore are not dispatched by the monitor.
+`release-docker-amd-rocm720-nightly.yml` remains active and monitored; the
+unified `release-docker-amd.yml` is tag/manual-only and has no scheduled runs,
+so it is not part of this schedule-only monitor. Run job listings are fetched
+across every GitHub API page, so unified runs with more than 100 jobs are fully
+considered for failure analysis and pending counts.
 
 Most monitored workflows are filtered to `event=schedule` only. Manually-dispatched (`workflow_dispatch`) runs and PR-triggered runs are excluded so the daily report is not polluted by ad-hoc / debug runs. If you need on-demand analysis of a specific manual run, use the `analyze-ci.yml` workflow (Actions tab → "Analyze CI" → paste the run/job URL).
 
@@ -483,7 +491,12 @@ Each workflow report includes the sglang commit (`head_sha`) in the header, and 
 
 The comment watcher uses **reaction-based idempotency**: before dispatching, it checks if amd-bot has already added a `rocket` reaction to the comment. Both daemon and cron watcher share this mechanism, so running both simultaneously is safe.
 
-The CI monitor uses **comment metadata deduplication**: each workflow comment embeds `<!-- processed_job_ids: 111,222,333 -->`. Each run reads these IDs before analyzing, preventing duplicate analysis.
+The CI monitor uses **comment metadata deduplication**: each workflow comment embeds `<!-- processed_job_ids: 111,222,333 -->`. Each run reads these IDs before analyzing, preventing duplicate analysis within the same daily issue. Across UTC day boundaries, the monitor also indexes retained earlier-day state by exact GitHub job ID. If a failed job is still returned by the current lookback window, its saved analysis is copied into today's report instead of invoking Claude again. Prior-only jobs outside the current lookup are not copied, same-named jobs with different IDs are analyzed normally, and a missing or invalid cached analysis falls back to a fresh agent run.
+
+Each monitor invocation pins its UTC report date when it starts and passes that
+same date through per-workflow publication and Daily Summary refresh. A long
+agent run that crosses UTC midnight therefore cannot attach new-day state to a
+comment fetched from the previous day's issue.
 
 When re-rendering an existing per-workflow comment (e.g. on the next 30-minute cron tick after a previous tick added new analyses), the bot needs to recover the previously-analysed jobs to merge them with the new batch. **Recovery is strict and self-contained per `<details>` block**: every per-job block emitted by `_render_per_job_block()` carries its `job_id`, `run_url`, and `started_at` as HTML attributes on the `<details>` tag itself:
 
@@ -914,9 +927,22 @@ sglang-ci-bot/
                               clone). Runner-1 only: starts watch_comments.py
                               --daemon AND a 30-minute loop that POSTs to
                               ci-monitor.yml/dispatches.
+  tests/
+    test_monitor_ci.py      Standard-library regression tests for CI-monitor
+                              pagination, workflow configuration, cross-day
+                              analysis reuse, and publication.
   .state/                   Persisted state files (gitignored)
   .secrets/                 Local secret files (gitignored): claude.env, llm_gateway_key, gh_pat
   requirements.txt          Python dependencies: anthropic, httpx, requests
+```
+
+The regression tests cover exact job-ID reuse/publication, full multi-page job
+enumeration, production workflow defaults, and incremental analysis of
+completed failures while their parent workflow run is still in progress. Run
+them with:
+
+```bash
+PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 ---

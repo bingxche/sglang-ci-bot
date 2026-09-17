@@ -87,11 +87,6 @@ TRACKED_WORKFLOWS: dict[str, dict] = {
         "display": "PR Test (AMD)",
     },
     # To extend, e.g.:
-    # "pr-test-amd-rocm720.yml": {
-    #     "title": "[Failure Tracker] PR Test ROCm 7.2 (AMD)",
-    #     "legacy_titles": [],
-    #     "display": "PR Test ROCm 7.2 (AMD)",
-    # },
     # "nightly-test-amd.yml": {
     #     "title": "[Failure Tracker] Nightly Test (AMD)",
     #     "legacy_titles": [],

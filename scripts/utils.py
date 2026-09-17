@@ -111,11 +111,7 @@ def get_failed_jobs(token: str, run_id: int) -> list[dict]:
     Only returns jobs whose status is 'completed' so that still-running
     jobs in an in-progress workflow are not picked up prematurely.
     """
-    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
-    params = {"filter": "latest", "per_page": 100}
-    resp = requests.get(url, headers=gh_headers(token), params=params)
-    resp.raise_for_status()
-    jobs = resp.json().get("jobs", [])
+    jobs = get_run_jobs(token, run_id)
     return [
         j for j in jobs
         if j.get("status") == "completed"
@@ -468,9 +464,10 @@ def get_workflow_runs_for_sha(token: str, head_sha: str) -> list[dict]:
 
 
 def get_run_jobs(token: str, run_id: int) -> list[dict]:
-    """Get all jobs for a workflow run."""
+    """Get every latest-attempt job for a workflow run across all API pages."""
     url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
     all_jobs: list[dict] = []
+    seen_job_ids: set[int] = set()
     page = 1
     while True:
         resp = requests.get(
@@ -482,7 +479,13 @@ def get_run_jobs(token: str, run_id: int) -> list[dict]:
         jobs = resp.json().get("jobs", [])
         if not jobs:
             break
-        all_jobs.extend(jobs)
+        for job in jobs:
+            job_id = job.get("id")
+            if isinstance(job_id, int):
+                if job_id in seen_job_ids:
+                    continue
+                seen_job_ids.add(job_id)
+            all_jobs.append(job)
         if len(jobs) < 100:
             break
         page += 1
