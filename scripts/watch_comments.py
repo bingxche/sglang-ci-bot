@@ -35,7 +35,7 @@ BOT_TRIGGER = f"@{BOT_LOGIN}"
 # the replacement bingxche publisher identity.
 BOT_CLAIM_LOGINS = {BOT_LOGIN, "bingxche"}
 # To add a new user: append their GitHub username here AND update README.md
-AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd", "HaiShaw", "1am9trash", "sogalin", "Kangyan-Zhou", "Fridge003", "BowenBao", "ColinZ22", "fxmarty-amd", "hubertlu-tw", "RolaoDenthu", "Duyi-Wang", "amd-danli103", "akao-amd", "jonahbernard", "At1a8", "chuyeh", "mqhc2020", "chien-an-chen", "yuychang", "jiaryang", "Emmanuel0612"]
+AUTHORIZED_USERS = ["bingxche", "yctseng0211", "michaelzhang-ai", "Jacob0226", "yichiche", "kkHuang-amd", "HaiShaw", "1am9trash", "sogalin", "Kangyan-Zhou", "Fridge003", "BowenBao", "ColinZ22", "fxmarty-amd", "hubertlu-tw", "RolaoDenthu", "Duyi-Wang", "amd-danli103", "akao-amd", "jonahbernard", "At1a8", "chuyeh", "mqhc2020", "chien-an-chen", "yuychang", "jiaryang", "Emmanuel0612", "aditi-amd"]
 AUTHORIZED_USER_LOGINS = {user.lower() for user in AUTHORIZED_USERS}
 COMMANDS = {
     "review": "Perform a full code review of this PR",
