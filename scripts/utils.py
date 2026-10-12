@@ -30,7 +30,7 @@ REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
 
-CLAUDE_MODEL = "claude-opus-5"
+CLAUDE_MODEL = "claude-opus-5-5"
 
 STEP_LOG_PREFILTER_THRESHOLD = 150_000
 

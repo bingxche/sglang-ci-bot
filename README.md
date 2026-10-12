@@ -365,7 +365,7 @@ ANTHROPIC_API_KEY=dummy
 ANTHROPIC_BASE_URL=https://llm-api.amd.com/Anthropic
 ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: <your-key>
 ANTHROPIC_MODEL=opus[1m]
-ANTHROPIC_DEFAULT_OPUS_MODEL=Claude-Opus-5
+ANTHROPIC_DEFAULT_OPUS_MODEL=Claude-Opus-5.5
 ANTHROPIC_DEFAULT_SONNET_MODEL=Claude-Sonnet-4.8
 ANTHROPIC_DEFAULT_HAIKU_MODEL=Claude-Haiku-4.8
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
@@ -984,13 +984,15 @@ Edit `MONITORED_WORKFLOWS` in `scripts/monitor_ci.py`.
 
 ### Claude model (API mode)
 
-Edit `CLAUDE_MODEL` in `scripts/utils.py` (currently `claude-opus-5`).
+Edit `CLAUDE_MODEL` in `scripts/utils.py` (currently `claude-opus-5-5`).
 
 ### Claude Code model (agent mode)
 
 Set via `ANTHROPIC_MODEL` in `.secrets/claude.env`. The current runner setup uses
-`opus[1m]` and maps that selector to `Claude-Opus-5` with
-`ANTHROPIC_DEFAULT_OPUS_MODEL`.
+`opus[1m]` and maps that selector to `Claude-Opus-5.5` with
+`ANTHROPIC_DEFAULT_OPUS_MODEL`. Opus 5.5 requires Claude Code 2.1.280 or newer;
+the CLI version is pinned in `runner/Dockerfile`, so bump it there and rebuild
+the image when a new model needs a newer CLI.
 
 ### Agent behavior and prompt templates
 
