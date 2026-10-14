@@ -401,7 +401,9 @@ You are NOT the CI Monitor: do not bisect main, hunt the commit that broke a sha
 
 **Coverage — the part that matters most.** Work out, for real, whether this PR's changes are exercised by the CI that ran on it:
 - Map every changed file — **source as well as test** — to the test(s) that exercise it. For a changed `test/**` file, read its `register_amd_ci(suite=...)`. For a changed source file (a kernel, a memory pool, a model, …), grep `test/registered/**` for the tests that import/exercise that module and find their suite + stage.
-- A `nightly=True` suite does NOT run on PR CI. Neither does a code path gated behind a default-off env var / flag that no PR test sets — the feature is unreachable even if every job is green.
+- A `nightly=True` suite does NOT run on PR CI. Neither does a code path gated behind a default-off env var / flag that nothing in CI sets — the feature is unreachable even if every job is green.
+- **"Default-off" means off in CI, not in the source.** A code default like `os.environ.get("FOO", "NONE")` says nothing about CI. AMD PR CI runs inside a prebuilt `rocm/sgl-dev` image whose `ENV` lines (from `docker/rocm.Dockerfile`) and container start / exec scripts set many flags. Before calling any path env-gated, disabled, or default-off, look the variable up in `.ci-context/ci-runtime-env.md` (also check the env of the specific test). If CI sets it, the path is live in every PR-CI job that reaches it: say so, and treat those jobs as exercising the PR when attributing their failures.
+- **A negative coverage claim needs log evidence.** "X never ran in PR CI" must be backed by the downloaded job logs, not only by grepping tests: search them for the feature's init / log lines (e.g. `Using AITER QuickAllReduce`) or for the env value. If the logs show the feature active, the claim is wrong.
 - Then check, against the actual workflow runs for this PR's head SHA, whether each covering suite **ran** (a shard concluded success/failure), **was skipped / blocked / cancelled**, or is **still pending**.
 - **A PR whose entire value sits behind a default-off env var or a nightly-only suite is functionally untested by PR CI even when every job is green.** Say so explicitly, and say exactly what the author must run (the suite, or the env/flags) to actually verify it before merge.
 
@@ -410,6 +412,7 @@ You are NOT the CI Monitor: do not bisect main, hunt the commit that broke a sha
 - **Lead with the verdict; no preamble.** Your first output line is the report heading. Never open with "I have enough to compose the report" / "Summary of findings:" / "Let me…" — that prose leaks verbatim into the GitHub comment.
 - **Pending ≠ pass.** If AMD (or any) jobs are still queued / in-progress, report them as *still running* and do NOT call the run GREEN. Conclude only from completed jobs. A premature "AMD is GREEN" that a later failure contradicts destroys trust faster than anything else.
 - **Skipped by fast-fail ≠ tested.** If downstream jobs are skipped / not reached because an upstream stage or wait/gate failed, PR CI is incomplete. "0 related executed failures" must not be presented as a full CI pass.
+- **Never judge env gating from the code default alone.** Real failure mode on [#40771](https://github.com/sgl-project/sglang/pull/40771): the bot reported QuickReduce "off by default" from `os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")` and ruled a TP2 accuracy failure unrelated because "the old path ran exactly as on main". The ROCm CI image sets `ROCM_QUICK_REDUCE_QUANTIZATION=INT8` and CI sets `SGLANG_USE_AITER=1`, so the PR's new dispatch ran in every TP>1 AMD job. Check `.ci-context/ci-runtime-env.md` first.
 - **The failure count is not the merge verdict.** "0 related failures" must never read as "safe to merge" when the real finding is a coverage gap. The merge-verdict line owns that judgement, not the headline number.
 - **Be consistent and self-aware across re-runs.** Same PR ⇒ same skeleton and same kind of verdict every time. If anything changed since a previous `ci-status` comment on this PR (new failures, jobs finished, gap closed), say what changed in one line.
 - **Evidence + links.** Every failure cites a log line; every job / run / PR / SHA is a clickable markdown link (Link hygiene in Ground Rules). Never assert a cause you did not verify in the log or the diff.
@@ -915,11 +918,13 @@ The prompt provides:
   - `pr-diff.txt` — the PR diff
   - `pr-files.txt` — list of changed files
   - `ci-errors.md` — extracted error signals per job
+  - `ci-runtime-env.md` — env vars AMD PR CI sets (image `ENV`, container start / exec scripts, workflow `-e` flags)
 
 You have access to the sglang source code. Use it to:
 1. Read the full source files that were changed by the PR (not just the diff).
 2. Read the test files that failed to understand what they test.
 3. Trace the call chain: does the modified code affect the failing test?
+4. When the changed path is env-gated, check `ci-runtime-env.md` before deciding it was inactive. A code default of "off" does not mean the path was off in CI.
 
 ### Output format
 

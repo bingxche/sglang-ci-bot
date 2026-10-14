@@ -23,6 +23,7 @@ from utils import (
     agent_worktree,
     claude_code_analyze,
     claude_code_available,
+    collect_ci_runtime_env,
     create_anthropic_client,
     download_job_logs,
     ensure_sglang_repo,
@@ -255,7 +256,8 @@ def analyze_pr_correlation(
                 f"PR: #{pr_number}\n"
                 f"Job list:\n{job_list}\n"
                 f"Context files: .ci-context/pr-diff.txt, "
-                f".ci-context/pr-files.txt, .ci-context/ci-errors.md\n"
+                f".ci-context/pr-files.txt, .ci-context/ci-errors.md, "
+                f".ci-context/ci-runtime-env.md\n"
                 f"Source: current directory\n"
                 f"GitHub API token: $GH_PAT"
             )
@@ -266,6 +268,7 @@ def analyze_pr_correlation(
                     "pr-diff.txt": diff_text,
                     "pr-files.txt": files_summary,
                     "ci-errors.md": errors_text,
+                    "ci-runtime-env.md": collect_ci_runtime_env(work_dir),
                 },
                 max_turns=50,
                 timeout_secs=300,
@@ -612,11 +615,13 @@ def _check_ci_with_agent(pr_number: int, repo_path) -> str:
         f"PR: #{pr_number}\n"
         f"Repo: sgl-project/sglang\n"
         f"Source: current directory (checked out to PR branch)\n"
+        f"Context files: .ci-context/ci-runtime-env.md\n"
         f"GitHub API token: $GH_PAT"
     )
     return claude_code_analyze(
         prompt=prompt,
         work_dir=repo_path,
+        context_files={"ci-runtime-env.md": collect_ci_runtime_env(repo_path)},
         timeout_secs=1200,
         output_must_contain="## CI Status for PR",
     )
@@ -639,7 +644,9 @@ def check_ci_for_pr(
         else:
             try:
                 print(f"Checking CI for PR #{pr_number} (agent mode, worktree)...")
-                with agent_worktree(f"ci-status-pr{pr_number}") as wt_path:
+                with agent_worktree(
+                    f"ci-status-pr{pr_number}", pr_number=pr_number
+                ) as wt_path:
                     report = _check_ci_with_agent(pr_number, wt_path)
                     report = _strip_preamble(report)
                     body = requester_line + report

@@ -212,6 +212,7 @@ When a task is triggered (CI failure analysis, PR review, or CI status check), t
 3. For CI analysis: **checks out the exact commit** that was tested in CI (`head_sha`), so the agent reads the correct source code
 4. For `nightly-amd-mi355x-disagg.yml` CI analysis: downloads the run's `mi355x-*` artifacts, extracts bundled `*_logs.tar.gz` server logs, and writes a manifest under `.ci-context/mi355x-artifacts/`
 5. For PR tasks: **checks out the PR branch** in the worktree
+   - For `PR CI Status Check` and `PR Correlation`: writes `.ci-context/ci-runtime-env.md`, the env vars AMD PR CI actually sets (`collect_ci_runtime_env()` reads `docker/rocm.Dockerfile` `ENV` lines, `scripts/ci/amd/amd_ci_start_container.sh`, `scripts/ci/amd/amd_ci_exec.sh`, and `-e` flags in `.github/workflows/pr-test-amd*.yml`), so the agent judges env-gated code paths against CI's real environment instead of the code default
 6. Copies `agent/CLAUDE.md` to `/workspace/CLAUDE.md`
 7. Runs `claude -p "<task prompt>" --dangerously-skip-permissions` with `cwd=<worktree>`
 
@@ -777,6 +778,8 @@ python scripts/check_ci_for_pr.py 1234 --no-post --no-use-agent
 
 The banner states that a passing / "Unlikely related" status does **not** mean the change is verified and tells the author to **re-run AMD CI** (no `/rerun-*` slash command is suggested — AMD tests can't be dispatched that way). This deterministic banner is computed in Python and injected at the top in **both** agent and API modes, so it appears regardless of agent behavior; in agent mode the agent additionally traces changed **source** files to their covering registered tests. (`ci-status-check.yml` defaults to agent mode — `USE_AGENT` defaults to `true`.)
 
+**CI runtime environment (agent mode).** Before the agent runs, the checker writes `.ci-context/ci-runtime-env.md` listing the env vars AMD PR CI sets: `ENV` lines baked into the `rocm/sgl-dev` image from `docker/rocm.Dockerfile`, the container start / exec scripts, and per-job workflow `-e` flags. `CLAUDE.md` requires the agent to check it before calling any code path "default-off", and to back "never ran in PR CI" claims with log evidence. This exists because on sgl-project/sglang#40771 the bot called QuickReduce off from its code default (`"NONE"`), while the CI image sets `ROCM_QUICK_REDUCE_QUANTIZATION=INT8`, so the PR's new dispatch actually ran in every TP>1 AMD job.
+
 **CI completeness check (agent mode).** The `PR CI Status Check` agent also evaluates whether required vendor PR CI pipelines actually completed. If an upstream stage or wait/gate job fast-fails and downstream jobs are skipped / not reached, the merge verdict says **PR CI is incomplete** and the caution block calls out that fast-failed/skipped downstream jobs are **not tested**. Failure tables are scoped to **executed** CI failures only. For high-priority PRs that need full signal despite unrelated early failures, the bot suggests adding the `bypass-fastfail` label and rerunning/updating the branch, with a warning that this consumes more CI resources and should be used sparingly.
 
 ### On-Demand Analysis
@@ -837,6 +840,8 @@ sglang-ci-bot/
                               - analyze_job_with_agent(), analyze_job_api()
                               - load_prompt_template() — reads CLAUDE.md API templates
                               - Worktree management: create_/remove_/agent_worktree()
+                              - collect_ci_runtime_env() — AMD PR CI env vars for
+                                  .ci-context/ci-runtime-env.md
                               - Claude Code CLI wrapper: claude_code_analyze()
                               - _deploy_claude_md() — copies agent/CLAUDE.md to /workspace
     ensure_daily_issue.py   Idempotently create today's daily CI-monitor issue
@@ -931,6 +936,8 @@ sglang-ci-bot/
     test_monitor_ci.py      Standard-library regression tests for CI-monitor
                               pagination, workflow configuration, cross-day
                               analysis reuse, and publication.
+    test_ci_runtime_env.py  Tests for the AMD PR CI runtime-env extraction
+                              (Dockerfile ENV, ENV_MAP, -e flags).
   .state/                   Persisted state files (gitignored)
   .secrets/                 Local secret files (gitignored): claude.env, llm_gateway_key, gh_pat
   requirements.txt          Python dependencies: anthropic, httpx, requests
