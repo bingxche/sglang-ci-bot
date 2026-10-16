@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -1405,6 +1406,153 @@ def _recover_text_from_session_log(
         return last_text
 
     return None
+
+
+# Files that set the environment AMD PR CI tests actually run with. PR CI pulls
+# a prebuilt rocm/sgl-dev image (built from docker/rocm.Dockerfile), starts it
+# with amd_ci_start_container.sh, and runs every test through amd_ci_exec.sh.
+# Anything set here overrides code-level defaults like
+# os.environ.get("FOO", "NONE"), so the agent must see it before calling a code
+# path "default-off".
+CI_RUNTIME_DOCKERFILES = ("docker/rocm.Dockerfile",)
+CI_RUNTIME_SCRIPTS = (
+    "scripts/ci/amd/amd_ci_start_container.sh",
+    "scripts/ci/amd/amd_ci_exec.sh",
+)
+CI_RUNTIME_WORKFLOW_GLOB = ".github/workflows/pr-test-amd*.yml"
+
+_ENV_NAME = r"[A-Z][A-Z0-9_]*"
+_SHELL_ENV_RES = (
+    # amd_ci_exec.sh: `declare -A ENV_MAP=( [KEY]=VAL ... )` entries
+    re.compile(rf"^\s*\[({_ENV_NAME})\]=(\S*)"),
+    # amd_ci_exec.sh: conditional `ENV_MAP[KEY]="VAL"` assignments
+    re.compile(rf"ENV_MAP\[({_ENV_NAME})\]=(\S+)"),
+    # `docker run/exec -e KEY=VAL` and `amd_ci_exec.sh -e KEY=VAL`
+    re.compile(rf"(?:^|\s)-e\s+[\"']?({_ENV_NAME})=(\"[^\"]*\"|'[^']*'|[^\s\"']*)"),
+)
+
+
+def _parse_dockerfile_env(text: str) -> list[tuple[str, int, str, str]]:
+    """Return ``(stage, line, key, value)`` for every ``ENV`` instruction."""
+    entries: list[tuple[str, int, str, str]] = []
+    stage = "(first stage)"
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        start = i
+        logical = lines[i].rstrip()
+        while logical.endswith("\\") and i + 1 < len(lines):
+            i += 1
+            logical = logical[:-1] + " " + lines[i].strip()
+        i += 1
+
+        # Skip `RUN <<EOF ... EOF` heredoc bodies; an embedded script line
+        # such as `from pathlib import Path` is not a Dockerfile instruction.
+        heredoc = re.search(r"(?<!<)<<(?!<)-?\s*[\"']?(\w+)[\"']?", logical)
+        if heredoc:
+            end = next(
+                (j for j in range(i, len(lines)) if lines[j].strip() == heredoc.group(1)),
+                None,
+            )
+            if end is not None:
+                i = end + 1
+
+        # Instructions are matched in upper case only (the sglang convention),
+        # so stray lower-case shell or Python text is never misread.
+        parts = logical.strip().split(None, 1)
+        if not parts:
+            continue
+        instruction = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        if instruction == "FROM":
+            m = re.search(r"\s+AS\s+(\S+)", rest, re.IGNORECASE)
+            stage = m.group(1) if m else f"FROM {rest.strip()}"
+            continue
+        if instruction != "ENV":
+            continue
+        try:
+            tokens = shlex.split(rest)
+        except ValueError:
+            tokens = rest.split()
+        if not tokens:
+            continue
+        if "=" in tokens[0]:
+            for tok in tokens:
+                key, _, value = tok.partition("=")
+                entries.append((stage, start + 1, key, value))
+        else:
+            # Legacy `ENV KEY value with spaces` form.
+            entries.append((stage, start + 1, tokens[0], " ".join(tokens[1:])))
+    return entries
+
+
+def _parse_shell_env(text: str) -> list[tuple[int, str, str]]:
+    """Return ``(line, key, value)`` for env assignments passed into CI containers."""
+    entries: list[tuple[int, str, str]] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        for pattern in _SHELL_ENV_RES:
+            for m in pattern.finditer(line):
+                entries.append((lineno, m.group(1), m.group(2).strip("\"'")))
+    return entries
+
+
+def collect_ci_runtime_env(repo_path: Path) -> str:
+    """Render the env vars AMD PR CI sets, as a markdown context file.
+
+    Read from *repo_path* (the sglang checkout the agent works in). The agent
+    uses this to tell whether an env-gated code path is actually live in CI,
+    instead of judging from the default in the source code.
+    """
+    out = [
+        "# AMD PR CI runtime environment",
+        "",
+        "Env vars that AMD PR CI sets for its tests, extracted from the files "
+        "below in this checkout. They override code-level defaults such as "
+        '`os.environ.get("FOO", "NONE")`.',
+        "",
+        "- The `docker/rocm.Dockerfile` ENV lines are baked into the prebuilt "
+        "`rocm/sgl-dev` image, which is built nightly from `main`. If this PR edits that "
+        "file, CI still runs with the image's (main) values.",
+        "- The container start/exec scripts apply to every AMD test job and run "
+        "from the PR checkout, so their values are the PR's.",
+        "- Workflow `-e` flags apply only to the job that contains that line.",
+        "- Individual tests can still override any of these in their own env.",
+        "",
+    ]
+
+    for rel in CI_RUNTIME_DOCKERFILES:
+        path = repo_path / rel
+        out.append(f"## `{rel}` (image ENV, per build stage)")
+        out.append("")
+        if not path.exists():
+            out.append("*(file not found in this checkout)*")
+        else:
+            for stage, lineno, key, value in _parse_dockerfile_env(path.read_text(errors="replace")):
+                out.append(f"- `{key}={value}` (stage `{stage}`, L{lineno})")
+        out.append("")
+
+    workflow_paths = sorted(
+        str(p.relative_to(repo_path)).replace(os.sep, "/")
+        for p in repo_path.glob(CI_RUNTIME_WORKFLOW_GLOB)
+    )
+    for rel in (*CI_RUNTIME_SCRIPTS, *workflow_paths):
+        path = repo_path / rel
+        out.append(f"## `{rel}`")
+        out.append("")
+        if not path.exists():
+            out.append("*(file not found in this checkout)*")
+            out.append("")
+            continue
+        entries = _parse_shell_env(path.read_text(errors="replace"))
+        if not entries:
+            out.append("*(no env assignments found)*")
+        for lineno, key, value in entries:
+            out.append(f"- `{key}={value}` (L{lineno})")
+        out.append("")
+
+    return "\n".join(out)
 
 
 def claude_code_analyze(
