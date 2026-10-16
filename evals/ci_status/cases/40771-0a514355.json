@@ -1,0 +1,49 @@
+{
+  "id": "40771-0a514355",
+  "pr": 40771,
+  "head_sha": "0a514355126300880c26c5d3e1b2c801d8f7ece6",
+  "as_of": "2026-10-14T17:54:00Z",
+  "legacy_comment": "https://github.com/sgl-project/sglang/pull/40771#issuecomment-6175143657",
+  "labels": [
+    {
+      "job": "stage-b-test-large-8-gpu-mi35x-disaggregation-amd (rocm10, linux-mi35x-gpu-8.fabric)",
+      "test_file": "test/registered/amd/disaggregation/test_disaggregation_pp.py",
+      "truth": "related",
+      "status": "proposed",
+      "basis": "A/B on an MI355X node (2026-10-15) with CI image rocm/sgl-dev:v0.5.21-rocm10-mi35x-20261012 and only the PR's two changed files overlaid, running TestDisaggregationDecodePPAccuracy with the CI env: PR 0.000 accuracy / 1.000 invalid on both attempts; PR + ROCM_QUICK_REDUCE_QUANTIZATION=NONE 0.955; PR + AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0 0.950; without the PR 0.950. Kernel check on gfx950: AITER QuickReduce FP8 with the bf16->fp16 cast returns 100% non-finite output for inputs beyond the fp16 range.",
+      "legacy_label": "unrelated"
+    },
+    {
+      "job": "stage-b-test-1-gpu-small-amd-mi35x (rocm10, linux-mi35x-gpu-1, 0)",
+      "test_file": "test/registered/kernels/ops/attention/test_fused_kda_conv_recurrent_verify.py",
+      "truth": "unrelated",
+      "status": "proposed",
+      "basis": "The same two cases (test_glm_fp32_weights_bit_exact_on_rocm[8] and [9]) fail with the same assertion in four main scheduled runs on 2026-10-13/14 (runs 38563492873, 38491255542, 38397272827, 38329038574) on the same GPU family and the same image build or image line; main does not contain the PR. It is a single-GPU kernel test, and the PR changes only multi-GPU all-reduce code.",
+      "legacy_label": "unrelated"
+    },
+    {
+      "job": "stage-b-test-1-gpu-large-amd (rocm10, linux-mi300-1gpu-sglang, 2)",
+      "test_file": "test/registered/basic_perf/test_score_api.py",
+      "truth": "unrelated",
+      "status": "proposed",
+      "basis": "The test launches one server with tp_size 1 (server_args in the job log). In the tested code (parallel_state.py at 0a514355), QuickReduce is only constructed under world_size > 1 and GroupCoordinator.all_reduce returns immediately when world_size == 1, so none of the PR's changed code runs in this test. The failure is a latency threshold (65.6 ms > 60 ms).",
+      "legacy_label": "unrelated"
+    },
+    {
+      "job": "build-test (xeon-spr, spr, stage-a-test-cpu-intel,stage-b-test-cpu-intel, spr2, 1, 3)",
+      "test_file": "test/registered/cpu/test_subblock_sparse_attention.py",
+      "truth": "unrelated",
+      "status": "proposed",
+      "basis": "The test fails at import: the multimodal_gen video_sparse_attn backend's vsa package calls torch.cuda.get_device_capability on the CPU-only torch build ('Torch not compiled with CUDA enabled'). The PR changes none of those files, no dependencies, images, or CI config, and its changed code is gated by is_hip().",
+      "legacy_label": "unrelated"
+    },
+    {
+      "job": "base-b-test-1-gpu-large / base-b-test-1-gpu-large (0)",
+      "test_file": "test/registered/e2e/radix_cache/test_mamba_extra_buffer_spec_grammar.py",
+      "truth": "unrelated",
+      "status": "proposed",
+      "basis": "CUDA single-GPU job. Every PR change to all-reduce construction and dispatch is gated by is_hip() (should_use_quick_allreduce, the 'qr' early return, and create_quick_allreduce under is_hip()), so it cannot run on CUDA. The failure is the test helper's /flush_cache returning HTTP 400 ('Cache not flushed because there are pending requests').",
+      "legacy_label": "unrelated"
+    }
+  ]
+}

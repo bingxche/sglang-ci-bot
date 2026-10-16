@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -160,6 +161,9 @@ def download_job_logs(token: str, job_id: int) -> str:
     url = f"https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs"
     resp = requests.get(url, headers=gh_headers(token), allow_redirects=True)
     if resp.status_code == 200:
+        # The log response has no charset, so requests would decode it as
+        # Latin-1 and garble markers such as "✗ FAILED".
+        resp.encoding = "utf-8"
         return resp.text
     return f"[Failed to fetch logs: HTTP {resp.status_code}]"
 
@@ -1239,6 +1243,24 @@ def remove_agent_worktree(wt_path: Path):
         shutil.rmtree(wt_path, ignore_errors=True)
 
 
+def checkout_commit(wt_path: Path, sha: str, fetch_ref: str | None = None) -> bool:
+    """Check out *sha* in *wt_path* and return whether HEAD is now exactly *sha*.
+
+    Fetches *fetch_ref* (e.g. ``pull/123/head``) and then *sha* itself when the
+    commit is not already present; GitHub serves old merge commits by SHA.
+    """
+    def git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=wt_path, capture_output=True,
+                              text=True, timeout=timeout)
+
+    if fetch_ref:
+        git("fetch", "origin", fetch_ref, "--depth", "100")
+    if git("cat-file", "-t", sha).returncode != 0:
+        git("fetch", "origin", sha, "--depth", "1")
+    git("checkout", "--force", sha, timeout=60)
+    return git("rev-parse", "HEAD").stdout.strip() == sha
+
+
 @contextlib.contextmanager
 def agent_worktree(tag: str, pr_number: int | None = None):
     """Context manager: create an isolated worktree, optionally checkout a PR, and clean up.
@@ -1338,6 +1360,48 @@ def _deploy_claude_md(target_dir: Path | None = None):
             _agent_log.info("Deployed CLAUDE.md to %s", dst)
             return
     _agent_log.warning("agent/CLAUDE.md not found, skipping deployment")
+
+
+_SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS", "GH_PAT", "GH_TOKEN",
+               "GITHUB_TOKEN", "AGENT_GH_TOKEN", "LLM_GATEWAY_KEY", "BOT_PAT")
+_TOKEN_RE = re.compile(r"\b(ghp_|gho_|ghs_|github_pat_|sk-)[A-Za-z0-9_\-]{16,}")
+
+
+def redact_secrets(text: str) -> str:
+    """Replace this process's tokens and keys (and token-shaped strings) with ``[redacted]``."""
+    secrets = []
+    for name in _SECRET_ENV:
+        value = os.environ.get(name, "")
+        # ANTHROPIC_CUSTOM_HEADERS is "Header-Name: <key>"; the key alone can leak too.
+        secrets += [value, value.split(":", 1)[-1].strip()]
+    for secret in sorted({s for s in secrets if len(s) >= 8}, key=len, reverse=True):
+        text = text.replace(secret, "[redacted]")
+    return _TOKEN_RE.sub("[redacted]", text)
+
+
+def _archive_agent_session(work_dir: Path, started_at: float, prompt: str) -> None:
+    """Copy the agent's session log and prompt to ``$AGENT_ARCHIVE_DIR`` (if set).
+
+    Workflows upload that directory; without it a bad report cannot be traced
+    back to what the agent actually read and ran.
+    """
+    archive_root = os.environ.get("AGENT_ARCHIVE_DIR")
+    if not archive_root:
+        return
+    try:
+        task = prompt.split("\n", 1)[0].removeprefix("Task:").strip() or "agent"
+        dest = Path(archive_root) / f"{time.strftime('%Y%m%d-%H%M%S')}-{_safe_name(task)}"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "prompt.txt").write_text(redact_secrets(prompt))
+        cwd = str(work_dir.resolve())
+        projects = Path.home() / ".claude" / "projects"
+        for project in {projects / cwd.replace("/", "-"), projects / re.sub(r"[^A-Za-z0-9]", "-", cwd)}:
+            for session in project.glob("*.jsonl"):
+                # File mtimes come from a coarse clock and can trail time.time().
+                if session.stat().st_mtime >= started_at - 5:
+                    (dest / session.name).write_text(redact_secrets(session.read_text(errors="replace")))
+    except Exception as exc:
+        _agent_log.warning("Could not archive agent session: %s", exc)
 
 
 def _recover_text_from_session_log(
@@ -1581,6 +1645,16 @@ def claude_code_analyze(
     context_dir = work_dir / ".ci-context"
     context_dir.mkdir(parents=True, exist_ok=True)
 
+    # The agent reads PR content written by anyone; when a read-only token is
+    # configured, it replaces the bot's posting token in the agent's env.
+    env = dict(os.environ)
+    if env.get("AGENT_GH_TOKEN"):
+        env["GH_PAT"] = env["GH_TOKEN"] = env["AGENT_GH_TOKEN"]
+        env.pop("GITHUB_TOKEN", None)
+    for name in ("BOT_PAT", "LLM_GATEWAY_KEY"):
+        env.pop(name, None)
+
+    started_at = time.time()
     written: list[Path] = []
     try:
         if context_files:
@@ -1594,6 +1668,9 @@ def claude_code_analyze(
             "--output-format", "text",
             "--max-turns", str(max_turns),
             "--dangerously-skip-permissions",
+            # The sglang checkout ships developer skills (e.g. ones that push
+            # fixes or rerun CI); none of the bot's tasks use skills.
+            "--disable-slash-commands",
         ]
 
         _agent_log.info(
@@ -1608,6 +1685,7 @@ def claude_code_analyze(
             cwd=str(work_dir),
             timeout=timeout_secs,
             stdin=subprocess.DEVNULL,
+            env=env,
         )
 
         _agent_log.info(
@@ -1664,6 +1742,7 @@ def claude_code_analyze(
             "Claude Code CLI not found (install: npm install -g @anthropic-ai/claude-code)"
         )
     finally:
+        _archive_agent_session(work_dir, started_at, prompt)
         for p in written:
             p.unlink(missing_ok=True)
         try:

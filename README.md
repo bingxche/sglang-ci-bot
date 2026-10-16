@@ -212,9 +212,11 @@ When a task is triggered (CI failure analysis, PR review, or CI status check), t
 3. For CI analysis: **checks out the exact commit** that was tested in CI (`head_sha`), so the agent reads the correct source code
 4. For `nightly-amd-mi355x-disagg.yml` CI analysis: downloads the run's `mi355x-*` artifacts, extracts bundled `*_logs.tar.gz` server logs, and writes a manifest under `.ci-context/mi355x-artifacts/`
 5. For PR tasks: **checks out the PR branch** in the worktree
+   - For `PR CI Status Check`: builds the evidence pack (`ci_evidence.py`, see [CI Status Check](#ci-status-check)) and re-checks out the worktree at the **commit CI actually tested** (usually a merge commit, not the PR head)
    - For `PR CI Status Check` and `PR Correlation`: writes `.ci-context/ci-runtime-env.md`, the env vars AMD PR CI actually sets (`collect_ci_runtime_env()` reads `docker/rocm.Dockerfile` `ENV` lines, `scripts/ci/amd/amd_ci_start_container.sh`, `scripts/ci/amd/amd_ci_exec.sh`, and `-e` flags in `.github/workflows/pr-test-amd*.yml`), so the agent judges env-gated code paths against CI's real environment instead of the code default
 6. Copies `agent/CLAUDE.md` to `/workspace/CLAUDE.md`
-7. Runs `claude -p "<task prompt>" --dangerously-skip-permissions` with `cwd=<worktree>`
+7. Runs `claude -p "<task prompt>" --dangerously-skip-permissions --disable-slash-commands` with `cwd=<worktree>` (the sglang checkout ships developer skills the bot must not run). The agent's env drops `BOT_PAT` and `LLM_GATEWAY_KEY`; if `AGENT_GH_TOKEN` is set, it replaces `GH_PAT` / `GH_TOKEN`, so the agent, which reads PR content anyone can write, only holds a read-only token
+8. If `AGENT_ARCHIVE_DIR` is set, copies the prompt and the agent's session log (secrets redacted) there, so a bad report can be traced to what the agent read and ran
 
 ### Task dispatch
 
@@ -763,6 +765,13 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 
 # Force API-mode fallback:
 python scripts/check_ci_for_pr.py 1234 --no-post --no-use-agent
+
+# Replay a past check (CI state as of a time) and keep the evidence:
+python scripts/check_ci_for_pr.py 40771 --no-post --head-sha 0a514355126300880c26c5d3e1b2c801d8f7ece6 \
+  --as-of 2026-10-14T17:54:00Z --out-dir runs/40771-0a514355
+
+# Score replays against hand-labeled cases (evals/ci_status/cases/*.json):
+python scripts/eval_ci_status.py --runs runs [--run-missing]
 ```
 
 | Option | Default | Description |
@@ -770,6 +779,11 @@ python scripts/check_ci_for_pr.py 1234 --no-post --no-use-agent
 | `pr_number` | required | PR number |
 | `--no-post` | false | Print to stdout |
 | `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to force API fallback |
+| `--head-sha` | current PR head | Check this PR head (agent mode) |
+| `--as-of` | now | Use each workflow run's attempt that was current at this UTC time (agent mode) |
+| `--out-dir` | env `CI_STATUS_OUT_DIR` | Save `pack/` (evidence pack), `agent-report.md`, `report.md` (as posted), and `verdicts.json` (agent mode) |
+
+When `--head-sha` or `--as-of` is set, an agent-mode failure exits with an error instead of falling back to the API mode, which cannot honor them.
 
 **Untested-change check (AMD coverage gap).** Beyond classifying failures, the checker flags when an AMD test that covers this PR's changes never actually ran — the trap where AMD looks green only because the relevant test never executed. A changed `test/**` file declares its suite via `register_amd_ci(suite=...)` (nightly-only registrations are ignored); that suite maps to an AMD CI job (its `stage-a/b/c` is the stage). A banner is rendered at the **top** of the report whenever:
 
@@ -778,7 +792,9 @@ python scripts/check_ci_for_pr.py 1234 --no-post --no-use-agent
 
 The banner states that a passing / "Unlikely related" status does **not** mean the change is verified and tells the author to **re-run AMD CI** (no `/rerun-*` slash command is suggested — AMD tests can't be dispatched that way). This deterministic banner is computed in Python and injected at the top in **both** agent and API modes, so it appears regardless of agent behavior; in agent mode the agent additionally traces changed **source** files to their covering registered tests. (`ci-status-check.yml` defaults to agent mode — `USE_AGENT` defaults to `true`.)
 
-**CI runtime environment (agent mode).** Before the agent runs, the checker writes `.ci-context/ci-runtime-env.md` listing the env vars AMD PR CI sets: `ENV` lines baked into the `rocm/sgl-dev` image from `docker/rocm.Dockerfile`, the container start / exec scripts, and per-job workflow `-e` flags. `CLAUDE.md` requires the agent to check it before calling any code path "default-off", and to back "never ran in PR CI" claims with log evidence. This exists because on sgl-project/sglang#40771 the bot called QuickReduce off from its code default (`"NONE"`), while the CI image sets `ROCM_QUICK_REDUCE_QUANTIZATION=INT8`, so the PR's new dispatch actually ran in every TP>1 AMD job.
+**Evidence pack (agent mode).** Before the agent runs, `ci_evidence.py` collects into `.ci-context/`: every workflow run for the PR head (at the attempt current at `--as-of`); for each failed job the failing test file and cases, a log excerpt, raw metrics and how each retry attempt failed, the commit the job actually tested, the CI image tag and digest, the image's real `ENV` (from the registry by digest), the GPU, launch configs, backend-selection lines, and AITER modules loaded; the same job and test case in recent `main` runs, each marked comparable or not (same GPU, same image build or line, same launch config); the PR diff; full logs; and the gaps it could not fill. Every fact gets an ID (`D3`, `F1.env`, `F1.M2`, …). The worktree is checked out at the commit CI tested. `.ci-context/ci-runtime-env.md` adds the env vars the workflows and container scripts set. The pack is the agent's starting point, not a limit: it still reads source, history, and more logs as needed.
+
+**Verdict check (agent mode).** The agent ends its report with a hidden `<!-- ci-status-verdicts {...} -->` block: per failure, a label (`related` / `possibly_related` / `unrelated` / `unknown`), the basis, and the evidence IDs it rests on. `ci_verdicts.py` checks it against the pack: cited IDs exist; `related` cites the full chain (diff hunk, evidence the changed path ran in that job, the failure); `unrelated` rests on comparable `main` records that failed the same test the same way with the PR no worse in metrics or frequency, or on independence that cites the diff, the failure, and any CI/build/dependency changes; the table and the block agree. A row that fails is shown as **⚪ unverified**, and a `> [!WARNING]` under the title says why. The check proves a verdict is grounded in collected facts, not that its reasoning is right. `CI_STATUS_AGENT_TIMEOUT` (default 40 min) gives the agent time to investigate. These exist because on sgl-project/sglang#40771 the bot read the PR head instead of the tested merge commit, judged QuickReduce off from its code default while the CI image sets `ROCM_QUICK_REDUCE_QUANTIZATION=INT8`, and called a PR-caused accuracy drop (0.95 → 0.00) unrelated because `main` had a milder failure in the same test.
 
 **CI completeness check (agent mode).** The `PR CI Status Check` agent also evaluates whether required vendor PR CI pipelines actually completed. If an upstream stage or wait/gate job fast-fails and downstream jobs are skipped / not reached, the merge verdict says **PR CI is incomplete** and the caution block calls out that fast-failed/skipped downstream jobs are **not tested**. Failure tables are scoped to **executed** CI failures only. For high-priority PRs that need full signal despite unrelated early failures, the bot suggests adding the `bypass-fastfail` label and rerunning/updating the branch, with a warning that this consumes more CI resources and should be used sparingly.
 
@@ -828,6 +844,7 @@ sglang-ci-bot/
                               - SGLang AMD CI Staging Candidates (strict JSON for
                                   the isolated Notion staging gate)
                               - PR CI Status Check methodology + output format
+                                  (judgment bar, hidden verdict block)
                               - PR Code Review methodology + output format
                               - AITER analysis instructions (GitHub API)
                               - API Mode prompt templates (loaded at runtime)
@@ -842,7 +859,9 @@ sglang-ci-bot/
                               - Worktree management: create_/remove_/agent_worktree()
                               - collect_ci_runtime_env() — AMD PR CI env vars for
                                   .ci-context/ci-runtime-env.md
+                              - checkout_commit() — check out an exact SHA, verified
                               - Claude Code CLI wrapper: claude_code_analyze()
+                                  (agent env, session archive, redact_secrets())
                               - _deploy_claude_md() — copies agent/CLAUDE.md to /workspace
     ensure_daily_issue.py   Idempotently create today's daily CI-monitor issue
                               (with Daily Cross-Workflow Summary placeholder
@@ -904,6 +923,11 @@ sglang-ci-bot/
                               source, and verifies the official source is intact.
     analyze_url.py          On-demand analysis of a run/job URL
     check_ci_for_pr.py      PR CI status checker
+    ci_evidence.py          Evidence pack for PR CI status (runs, failed-job facts,
+                              main baseline, diff, logs; tested-commit checkout)
+    ci_verdicts.py          Checks the agent's verdict block against the evidence
+                              pack and marks unsupported rows in the report
+    eval_ci_status.py       Scores ci-status replays against evals/ci_status/cases
     review_pr.py            PR code review
     watch_comments.py       Comment watcher / command dispatcher
     local_run.sh            Local dev runner
@@ -938,6 +962,13 @@ sglang-ci-bot/
                               analysis reuse, and publication.
     test_ci_runtime_env.py  Tests for the AMD PR CI runtime-env extraction
                               (Dockerfile ENV, ENV_MAP, -e flags).
+    test_ci_evidence.py     Tests for evidence-pack log parsing and comparability.
+    test_ci_verdicts.py     Tests for the verdict check, report annotation, and
+                              agent env / session archive.
+    test_eval_ci_status.py  Tests for ci-status eval scoring.
+  evals/ci_status/cases/    Hand-labeled ci-status cases (PR head, as-of time,
+                              truth + basis per failure; "proposed" until a
+                              reviewer confirms)
   .state/                   Persisted state files (gitignored)
   .secrets/                 Local secret files (gitignored): claude.env, llm_gateway_key, gh_pat
   requirements.txt          Python dependencies: anthropic, httpx, requests
@@ -975,6 +1006,10 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py'
 | `NOTION_KNOWN_DATA_SOURCE_ID` | `stage_notion.py sync` | Read-only `SGLang AMD CI Known Errors` data source ID; required to differ from the staging ID |
 | `NOTION_STAGING_DATA_SOURCE_ID` | `stage_notion.py sync` | Isolated data source titled `SGLang AMD CI Staging Errors`; the only write destination |
 | `AGENT_WORKSPACE` | Agent mode | Base directory for sglang clone (default: `/workspace`) |
+| `AGENT_GH_TOKEN` | Agent mode | Optional read-only GitHub token; replaces `GH_PAT` / `GH_TOKEN` in the agent's env (the scripts keep the posting token) |
+| `AGENT_ARCHIVE_DIR` | Agent mode | If set, the prompt and agent session log (secrets redacted) of every agent run are copied here; `ci-status-check.yml` uploads it as an artifact (30 days; the repo is public, so artifacts are too) |
+| `CI_STATUS_OUT_DIR` | `check_ci_for_pr.py` | Same as `--out-dir` |
+| `CI_STATUS_AGENT_TIMEOUT` | `check_ci_for_pr.py` | PR CI Status Check agent timeout in seconds (default: `2400` = 40 min) |
 | `ANTHROPIC_API_KEY` | Agent mode | Set to `dummy` (Claude Code uses gateway, not direct API) |
 | `ANTHROPIC_BASE_URL` | Agent mode | LLM Gateway endpoint for Claude Code |
 | `ANTHROPIC_CUSTOM_HEADERS` | Agent mode | Gateway auth header (`Ocp-Apim-Subscription-Key: <key>`) |

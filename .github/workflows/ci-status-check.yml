@@ -42,9 +42,21 @@ jobs:
       - name: Check CI Status
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          AGENT_GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN }}
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
           COMMENT_AUTHOR: ${{ steps.pr.outputs.comment_author }}
           USE_AGENT: ${{ vars.USE_AGENT || 'true' }}
           AGENT_WORKSPACE: /workspace
+          AGENT_ARCHIVE_DIR: ${{ runner.temp }}/ci-status/agent-sessions
+          CI_STATUS_OUT_DIR: ${{ runner.temp }}/ci-status/result
         run: python scripts/check_ci_for_pr.py ${{ steps.pr.outputs.number }}
+
+      - name: Upload evidence pack and agent session
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-status-pr${{ steps.pr.outputs.number }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/ci-status/
+          if-no-files-found: ignore
+          retention-days: 30

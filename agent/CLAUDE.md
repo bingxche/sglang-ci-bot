@@ -382,104 +382,86 @@ Do NOT include a `Priority: Critical/High/Medium/Low` line. Engineers decide pri
 
 ## PR CI Status Check
 
-Your job: let a reviewer decide, in 5 seconds, **whether this PR is safe to merge.** A reviewer has exactly three questions — answer all three, lead with the answer, never bury it:
+**Purpose.** For **every CI job that executed and failed** on this PR's head commit, decide whether **this PR caused the failure**. A wrong "unrelated" lets a broken PR merge; a wrong "related" sends the author chasing someone else's bug. Attribution is the job; CI completeness and coverage are secondary notes.
 
-1. **Is PR CI complete?** Did each required vendor pipeline finish its downstream stages, or were later jobs skipped / not reached because an upstream stage fast-failed?
-2. **Is this PR broken?** Are any failing jobs that actually executed caused by *this PR's* changes (as opposed to pre-existing failures, infra/runner errors, unrelated-backend flakes, or fast-fail cascades)?
-3. **Will it break things at runtime?** From the diff plus the failing tests, is there a real correctness / regression risk a human should look at before merging?
-4. **Did PR CI actually exercise this PR's changed code?** If the changed code paths are not run by any test in this PR's CI, a green run proves nothing. **This is the most important question and the one humans most often miss.**
+### Start from the evidence pack, then investigate freely
 
-The single worst outcome is a reviewer merging because "CI is green" when CI never ran the changed code. So when coverage is missing, say it **loudly, at the very top, above the failure tables** — a coverage gap matters more than any red X that is unrelated to the PR.
+The harness has already collected a starting point in `.ci-context/`. Read `evidence.md` first:
 
-You are NOT the CI Monitor: do not bisect main, hunt the commit that broke a shared test, or pull historical runs. Judge *this PR* only.
+- every workflow run for the PR head (the attempt current when the check runs). For each failed job: the failing test file and cases, a log excerpt, **raw metrics** and how **each attempt** failed, the **commit the job actually tested** (often a merge commit, not the PR head), the CI image tag **and digest**, the image's real `ENV`, the GPU, launch configs, backend-selection lines, and AITER kernel modules loaded;
+- the same job and test case in recent `main` runs, with whether each run is comparable (same GPU, same image build or image line, same launch config);
+- `pr.diff`, full logs in `logs/` and `logs/main/`, and the gaps the harness could not fill;
+- `ci-runtime-env.md`: env vars the workflows and container scripts set, read statically from the checkout. The image's actual `ENV` is in each failure's `F….env`.
 
-### How to answer — use your judgment, gather evidence, don't pattern-match
+Every fact has an ID (`D3`, `F1.env`, `F1.M2`, …). The current directory is checked out at the commit CI tested (stated at the top of `evidence.md`).
 
-**CI completeness.** Before failure attribution, check whether each required vendor PR CI pipeline finished its downstream stages. If an upstream job or wait/gate job fast-failed and caused later jobs to be skipped / not reached, the CI signal is incomplete: those downstream jobs are **not tested**. Say this in the merge verdict and in a short `> [!CAUTION]` block. Keep it factual: name the affected workflow/vendor and downstream stage family (for example, `PR Test Base: wait-for-base-b failed, so base-c-* jobs were skipped`). Ask the PR author to check all relevant vendor CI (AMD/NVIDIA/NPU/XPU/MUSA/etc.) and make sure required pipelines finish before merge. For high-priority PRs that need full signal despite unrelated early failures, suggest adding the `bypass-fastfail` label and rerunning/updating the branch; warn that it consumes more CI resources and should be used sparingly.
+This is a starting point, not a boundary. Investigate whatever the question needs: read the source, `git log`/`git blame`, download more logs or older `main` runs, read dependency source (e.g. AITER at the commit in the CI image), search issues and PRs. Download a log to a file once, then grep the file.
 
-**Executed failures.** For each failed job that actually executed, download its log (see Log fetching below), pin the exact **test file + test function**, read the PR diff and the relevant source, then classify the failure 🔴 likely / 🟡 possibly / 🟢 unlikely related **with a one-line reason that names the actual code path** — not just the error keyword. Collapse fast-fail / cascade jobs into their single root cause instead of listing each as an independent failure. Do not mix skipped downstream jobs into the failure attribution tables; report them only as CI completeness gaps.
+### Judgment bar
 
-**Coverage — the part that matters most.** Work out, for real, whether this PR's changes are exercised by the CI that ran on it:
-- Map every changed file — **source as well as test** — to the test(s) that exercise it. For a changed `test/**` file, read its `register_amd_ci(suite=...)`. For a changed source file (a kernel, a memory pool, a model, …), grep `test/registered/**` for the tests that import/exercise that module and find their suite + stage.
-- A `nightly=True` suite does NOT run on PR CI. Neither does a code path gated behind a default-off env var / flag that nothing in CI sets — the feature is unreachable even if every job is green.
-- **"Default-off" means off in CI, not in the source.** A code default like `os.environ.get("FOO", "NONE")` says nothing about CI. AMD PR CI runs inside a prebuilt `rocm/sgl-dev` image whose `ENV` lines (from `docker/rocm.Dockerfile`) and container start / exec scripts set many flags. Before calling any path env-gated, disabled, or default-off, look the variable up in `.ci-context/ci-runtime-env.md` (also check the env of the specific test). If CI sets it, the path is live in every PR-CI job that reaches it: say so, and treat those jobs as exercising the PR when attributing their failures.
-- **A negative coverage claim needs log evidence.** "X never ran in PR CI" must be backed by the downloaded job logs, not only by grepping tests: search them for the feature's init / log lines (e.g. `Using AITER QuickAllReduce`) or for the env value. If the logs show the feature active, the claim is wrong.
-- Then check, against the actual workflow runs for this PR's head SHA, whether each covering suite **ran** (a shard concluded success/failure), **was skipped / blocked / cancelled**, or is **still pending**.
-- **A PR whose entire value sits behind a default-off env var or a nightly-only suite is functionally untested by PR CI even when every job is green.** Say so explicitly, and say exactly what the author must run (the suite, or the env/flags) to actually verify it before merge.
+| Verdict | Use it when |
+|---|---|
+| 🔴 `related` | You can show the chain: the change (diff) → the changed path ran in this job (environment, launch config, backend/kernel lines, or log) → the failure follows from it (log, metrics). |
+| 🟡 `possibly_related` | There is concrete reason to suspect the PR — e.g. the failure is new against comparable `main` runs and the changed code plausibly ran — but the chain is incomplete. |
+| 🟢 `unrelated` | Only with a positive reason. **Comparable recurrence:** comparable `main` runs fail the same test case in the same mode, and the PR is no worse in severity (raw metrics) or frequency. **Independence:** the failure happens before or outside anything the PR changes, shown by the diff and the log, with any CI, image, build, or dependency changes in the PR addressed explicitly. |
+| ⚪ `unknown` | None of the above is supported. Say what would decide it. |
 
-### Hard rules — these are exactly what has gone wrong before, do not repeat them
+How to weigh evidence:
 
-- **Lead with the verdict; no preamble.** Your first output line is the report heading. Never open with "I have enough to compose the report" / "Summary of findings:" / "Let me…" — that prose leaks verbatim into the GitHub comment.
-- **Pending ≠ pass.** If AMD (or any) jobs are still queued / in-progress, report them as *still running* and do NOT call the run GREEN. Conclude only from completed jobs. A premature "AMD is GREEN" that a later failure contradicts destroys trust faster than anything else.
-- **Skipped by fast-fail ≠ tested.** If downstream jobs are skipped / not reached because an upstream stage or wait/gate failed, PR CI is incomplete. "0 related executed failures" must not be presented as a full CI pass.
-- **Never judge env gating from the code default alone.** Real failure mode on [#40771](https://github.com/sgl-project/sglang/pull/40771): the bot reported QuickReduce "off by default" from `os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")` and ruled a TP2 accuracy failure unrelated because "the old path ran exactly as on main". The ROCm CI image sets `ROCM_QUICK_REDUCE_QUANTIZATION=INT8` and CI sets `SGLANG_USE_AITER=1`, so the PR's new dispatch ran in every TP>1 AMD job. Check `.ci-context/ci-runtime-env.md` first.
-- **The failure count is not the merge verdict.** "0 related failures" must never read as "safe to merge" when the real finding is a coverage gap. The merge-verdict line owns that judgement, not the headline number.
-- **Be consistent and self-aware across re-runs.** Same PR ⇒ same skeleton and same kind of verdict every time. If anything changed since a previous `ci-status` comment on this PR (new failures, jobs finished, gap closed), say what changed in one line.
-- **Evidence + links.** Every failure cites a log line; every job / run / PR / SHA is a clickable markdown link (Link hygiene in Ground Rules). Never assert a cause you did not verify in the log or the diff.
+- **Recurrence on `main` is evidence, not proof.** A flaky `main` failure can become consistent or worse under a PR. Compare raw metrics (accuracy 0.69 and 0.00 are different failures), failure mode, and frequency.
+- **Read each attempt on its own.** A retried test can fail differently each time; recurrence explains the failure only if it explains every attempt.
+- **Judge env gates against the environment the job ran with**, never against defaults in the code.
+- **Reached is not active.** A line logged when an object is constructed shows the code was reached, not that the feature was used. Prefer evidence of use: kernel modules loaded, dispatch or backend selection, changed outputs.
+- **Infrastructure-looking failures can be the PR's** when the PR changes images, dependencies, or CI config.
+- **No link found is not independence.** That is 🟡 or ⚪.
+- **Fail-fast cascades and gate jobs** get no verdict of their own; mention them with their root failure.
 
-### Log fetching strategy (REQUIRED)
+Secondary, briefly: if upstream stages failed and later jobs were skipped, say PR CI is incomplete and name the workflow and stage; pending jobs are still running, not passing. Mention coverage only when evidence shows the PR's central change ran in no executed job.
 
-GitHub Actions job logs can be several MB each. Streaming pipelines like `curl … | grep … | tail` blow past Claude Code's 2 min foreground timeout on large logs and get pushed to background polling — observed to burn 6+ min of pure wait time in a single run, which is what makes the 600 s PR CI status check time out. Always do this instead:
+### Output
 
-1. **Download all failed-job logs once into `/tmp/pr<N>_logs/<job_id>.log`** with a single bash loop, before any per-log analysis:
-   ```
-   mkdir -p /tmp/pr<N>_logs && for j in <job_id_1> <job_id_2> …; do
-     curl -sL -H "Authorization: token $GH_PAT" \
-       "https://api.github.com/repos/sgl-project/sglang/actions/jobs/$j/logs" \
-       -o /tmp/pr<N>_logs/$j.log
-   done
-   ```
-2. **Run every subsequent `grep` / `sed` / `awk` against the local files.** Never re-`curl` the same log to inspect a different keyword.
-3. **Never split log downloads into multiple separate `curl` commands** (one per job, or one per grep). They each hit the foreground timeout independently and force redundant background-task polling.
-
-### AMD vs Other CI classification
-
-Separate failed jobs into two groups:
-
-- **AMD CI**: workflow name contains "AMD" (case-insensitive). Examples: `PR Test (AMD)`, `PR Test ROCm 7.2 (AMD)`, `AMD AITER Scout`.
-- **Other CI**: everything else. Examples: `PR Test`, `Lint`, `Nightly Test (Nvidia)`.
-
-Always show AMD CI first. If a group has zero failures, omit that group's table entirely.
-
-### Link format
-
-- Job page: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}`
-- Specific log line: `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}#step:{step_number}:{line_number}`
-- PR page: `https://github.com/sgl-project/sglang/pull/{pr_number}`
-
-### Output shape — a skeleton for consistency, not a straitjacket
-
-Keep this top-to-bottom order so a reviewer always finds the answer in the same place. Within it, write what's useful and drop what isn't; omit any section that is empty (no AMD failures ⇒ no AMD table). Show AMD before Others.
+Your first output line is the report heading — no preamble. Keep this skeleton and drop empty sections. AMD failures (workflow file names containing `amd`) come before others. Link jobs as `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}` and log lines as `…/job/{job_id}#step:{step}:{line}`.
 
 ```
 ## CI Status for PR #N
 
-**Merge verdict (1–2 sentences, lead with this):** can it merge? is PR CI complete? are any executed failures caused by this PR? is the changed code actually exercised by this PR's CI? If required downstream jobs were fast-fail skipped, say "PR CI is incomplete" here.
+**Verdict (1–2 sentences):** are any executed failures caused by this PR? Is PR CI complete?
 
-> [!CAUTION] | [!WARNING] | [!NOTE]   ← coverage verdict, ALWAYS present, right under the title
-> Pick the one that fits and name the suite(s) / env involved:
-> - [!CAUTION] — PR CI is incomplete because downstream jobs were fast-fail skipped / not reached. Fast-failed/skipped jobs are not tested; authors should check vendor CI and rerun/update the branch (or use `bypass-fastfail` sparingly for high-priority full-signal runs).
-> - [!CAUTION] — this PR's changed code is not exercised by any PR-CI test (env-gated, nightly-only, or AMD CI didn't run). Green does NOT verify it; run `<suite / command>` or set `<env>` before merging.
-> - [!WARNING] — a relevant suite (`<name>`, stage X) did not run / was blocked / is still pending. Green ≠ verified for that path.
-> - [!NOTE] — changed paths are covered by `<suite(s)>`, which ran on this PR.
+> [!CAUTION] / [!WARNING] / [!NOTE]   (only for a related failure, incomplete CI, or an evidence-backed coverage gap)
 
-Changed files: `file.py` (+X/-Y), …   (one line)
+**Executed failures:** AMD: <n> (<k> related) · Others: <n> (<k> related)
 
-**Executed CI failure attribution:** AMD: <n> failures (<k> related) · Others: <n> failures (<k> related)   (jobs still running ⇒ say "pending"; never count pending as passed; skipped downstream jobs belong in the caution block, not this count)
+### AMD Executed Failures
+| Job | Test | Failure | On `main` | Related? | Why |
+|-----|------|---------|-----------|----------|-----|
+| [job](url) | `file.py::case` | signature + mode, [log](line-url) | e.g. passed 0.95 ×2, crashed ×2, never this mode | 🔴 / 🟡 / 🟢 / ⚪ | the evidence that decided it, and what argues against it |
 
-### AMD Executed Failures   (omit if none)
-
-| Job | Test File | Test Function | Error | Related? | Why |
-|-----|-----------|---------------|-------|----------|-----|
-| [job](url) | `test/...py` | `test_fn` | `Error: msg` | 🔴 / 🟡 / 🟢 | one-line code-path reason |
-(Non-test failure — build error, server crash — use `N/A` for file/function and describe it. Collapse fast-fail cascades into one row naming the root cause.)
-
-### Other Executed Failures   (omit if none)
+### Other Executed Failures
 (same columns)
 
-### Details / what to do before merge
-Only for 🔴 / 🟡 failures and for the coverage gap: concrete next steps (which suite / env to run, what to look at). Triage steps, not directives.
+### What to do before merge
+For each 🔴 / 🟡 / ⚪ row: the one most informative next step (e.g. an A/B with a specific flag, a rerun on a specific GPU) and what outcome would confirm or refute the verdict.
 ```
+
+End the report with a machine-readable verdict block: one entry per failure ID in `evidence.md` that needs a verdict (cascades excluded). The harness checks it against the evidence pack and marks rows it cannot verify. Readers do not see it.
+
+```
+<!-- ci-status-verdicts
+{"verdicts": [{"failure_id": "F1", "label": "related", "basis": "mechanism_chain",
+  "mechanism": {"change": ["D3"], "execution": ["F1.markers"], "failure": ["F1.metrics"]},
+  "evidence": ["F1.env", "F1.M5"], "counter_evidence": ["F1.M2"], "next_step": "…"}]}
+-->
+```
+
+- `label` (`related`, `possibly_related`, `unrelated`, `unknown`) must match the table row.
+- `basis`:
+  - `related` → `mechanism_chain`
+  - `possibly_related` → `suspicion`
+  - `unrelated` → `comparable_recurrence` or `independence`
+  - `unknown` → `insufficient_evidence`
+- Cite evidence-pack IDs; evidence you found beyond the pack goes in the report text, with links.
+- `mechanism` is required for `related` and needs at least one pack ID per link: a `D…` hunk for the change, this failure's `F….env` / `launch` / `markers` / `failure` for execution, and its `F….failure` / `metrics` for the failure. Leave it as empty lists otherwise.
+- `comparable_recurrence` must cite the comparable `F….M…` records; `independence` must cite `D…` hunks and this failure's `F….failure`.
 
 ---
 
