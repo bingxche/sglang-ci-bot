@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -39,6 +40,27 @@ STEP_LOG_PREFILTER_THRESHOLD = 150_000
 MI355X_DISAGG_WORKFLOW = "nightly-amd-mi355x-disagg.yml"
 MI355X_ARTIFACT_PREFIX = "mi355x-"
 MI355X_ARTIFACT_CONTEXT_MAX_CHARS = 120_000
+
+# Miles (radixark/miles) RL-training workflows. Their runs are on sglang main,
+# but what they test is /root/miles inside a dated image that the build
+# workflows assemble from radixark/miles and an sglang branch (sglang-miles),
+# so the run's own commit says nothing about the code that failed.
+MILES_REPO = "radixark/miles"
+MILES_WORKFLOWS = (
+    "nightly-test-amd-miles-rocm10.yml",
+    "nightly-test-amd-miles-rocm10-mi30x.yml",
+    "release-docker-amd-miles-rocm10-nightly.yml",
+    "release-docker-amd-miles-rocm724-nightly.yml",
+)
+# The sglang-ci dashboard's Miles Cause & Fix PRs payload: for every failing
+# job, the image's commits, the failing tests and traceback, when each test
+# last passed, the commit ranges in between and the commits in them that
+# touch the traceback. It is parsed from logs, not judged, so it is handed to
+# the agent as evidence to verify.
+MILES_CAUSE_FIX_URL = os.environ.get(
+    "MILES_CAUSE_FIX_URL",
+    "https://rocm.github.io/sglang-ci/api/miles/cause-fix.json",
+)
 
 ERROR_PATTERNS = re.compile(
     r"|".join([
@@ -375,6 +397,309 @@ def prepare_mi355x_artifact_context(
         run_id, len(artifacts), len(important_files),
     )
     return artifact_root
+
+
+# ---------------------------------------------------------------------------
+# Miles context
+# ---------------------------------------------------------------------------
+
+def is_miles_workflow(workflow_file: str) -> bool:
+    return workflow_file.split("/")[-1] in MILES_WORKFLOWS
+
+
+_miles_payload: dict = {}
+_miles_payload_lock = threading.Lock()
+_MILES_PAYLOAD_TTL_SECS = 600
+
+
+def fetch_miles_cause_fix(url: str = MILES_CAUSE_FIX_URL) -> dict | None:
+    """The dashboard's Miles Cause & Fix payload, or None if unavailable.
+
+    Fetched once per run of the monitor (the jobs of one workflow are
+    analysed in parallel, and the payload is a few hundred KB).
+    """
+    _log = logging.getLogger("ci-monitor")
+    with _miles_payload_lock:
+        cached = _miles_payload.get(url)
+        if cached and time.monotonic() - cached[0] < _MILES_PAYLOAD_TTL_SECS:
+            return cached[1]
+        try:
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            _log.warning("Miles cause-fix payload unavailable (%s): %s", url, exc)
+            data = None
+        if not isinstance(data, dict) or not data.get("available"):
+            data = None
+        _miles_payload[url] = (time.monotonic(), data)
+        return data
+
+
+def miles_rows_for_job(payload: dict | None, job_id: int) -> list[dict]:
+    """The payload's rows (failures) that include ``job_id``, failing first."""
+    rows = [
+        row for row in (payload or {}).get("rows", [])
+        if any(j.get("id") == job_id for j in row.get("jobs", []))
+    ]
+    return sorted(rows, key=lambda r: r.get("state") != "failing")
+
+
+def miles_job_image(rows: list[dict], job_id: int) -> dict:
+    """``{"image", "commits", "refs"}`` of the image ``job_id`` ran on."""
+    for row in rows:
+        for job in row.get("jobs", []):
+            if job.get("id") == job_id:
+                return {
+                    "image": job.get("image") or "",
+                    "commits": job.get("commits") or {},
+                    "refs": job.get("refs") or {},
+                }
+    return {"image": "", "commits": {}, "refs": {}}
+
+
+def _md_link(text: str, url: str) -> str:
+    return f"[{text}]({url})" if url else text
+
+
+def _miles_pr_line(pr: dict) -> str:
+    repo = pr.get("repo", "")
+    sha = (pr.get("sha") or "")[:10]
+    commit = _md_link(f"`{sha}`", pr.get("commit_url", "")) if sha else ""
+    label = (
+        _md_link(f"{repo}#{pr['number']}", pr.get("url", ""))
+        if pr.get("number") else repo
+    )
+    kind = "strong" if pr.get("strong") else "weak"
+    state = f", {pr['pr_state']}" if pr.get("pr_state") else ""
+    title = (pr.get("title") or "").replace("\n", " ")[:120]
+    ref = " ".join(p for p in (label, commit) if p)
+    return f"- {ref} — {title} ({kind}{state}): {pr.get('reason', '')}"
+
+
+def _miles_point(point: dict | None) -> str:
+    if not point:
+        return "none found"
+    run = _md_link(point.get("date", "?"), point.get("job_url") or point.get("run_url", ""))
+    image = f" on `{point['image']}`" if point.get("image") else ""
+    return f"{run}{image}"
+
+
+def render_miles_evidence(
+    job: dict, rows: list[dict], image: dict, checkout: dict, payload: dict | None,
+) -> str:
+    """The evidence file a Miles job's agent reads first."""
+    lines = [
+        "# Miles failure evidence",
+        "",
+        f"Job: {_md_link(job.get('name', ''), job.get('html_url', ''))} (ID `{job.get('id')}`)",
+        "",
+        "Collected by the sglang-ci dashboard's Miles Cause & Fix PRs card "
+        f"({MILES_CAUSE_FIX_URL}), which parses job logs and image build logs. "
+        "Nothing below is a verdict: the candidate commits only touch the "
+        "failing test or its traceback inside the regression window. Verify "
+        "each against its diff before citing it.",
+        "",
+        "## Code under test",
+        "",
+    ]
+    commits, refs = image.get("commits") or {}, image.get("refs") or {}
+    lines.append(f"- Image: `{image['image']}`" if image.get("image") else "- Image: unknown")
+    for repo, where in ((MILES_REPO, checkout.get("miles_src")), (REPO, checkout.get("sglang_src"))):
+        sha = commits.get(repo)
+        if not sha:
+            lines.append(f"- {repo}: unknown (the dashboard has not read this image's build log)")
+            continue
+        ref = f" (branch `{refs[repo]}`)" if refs.get(repo) else ""
+        url = f"https://github.com/{repo}/commit/{sha}"
+        place = f" — checked out at `{where}`" if where else " — NOT checked out"
+        lines.append(f"- {repo}: [`{sha[:12]}`]({url}){ref}{place}")
+    if payload is None:
+        lines += [
+            "",
+            "The dashboard payload could not be fetched, so there is no evidence "
+            "beyond the job itself. Follow the Miles workflow fallback in CLAUDE.md.",
+        ]
+    elif not rows:
+        lines += [
+            "",
+            "The dashboard has no row for this job yet (its log may still be "
+            "queued there). Follow the Miles workflow fallback in CLAUDE.md.",
+        ]
+
+    for n, row in enumerate(rows, 1):
+        lines += [
+            "",
+            f"## Failure {n}: {row.get('kind', 'test')} — state `{row.get('state', '')}`",
+            "",
+            f"- Error: `{(row.get('error') or '').strip()[:400]}`",
+        ]
+        for t in row.get("tests", []):
+            code = f", exit code {t['exit_code']}" if t.get("exit_code") is not None else ""
+            lines.append(f"- Test: `{t['file']}` — {t.get('status', '')}{code}: `{(t.get('error') or '')[:300]}`")
+        if row.get("frames"):
+            lines.append("- Traceback frames in miles / sglang (innermost last):")
+            for f in row["frames"]:
+                code = f" — `{f['code']}`" if f.get("code") else ""
+                lines.append(f"  - `{f['repo']}:{f['path']}:{f['line']}` in `{f['func']}`{code}")
+        for s in row.get("since", []):
+            lines.append(
+                f"- {s.get('label', '')}: failing since {_miles_point(s.get('first_failed'))} "
+                f"({s.get('failed_runs', '?')} failed run(s)); last passed {_miles_point(s.get('last_passed'))}"
+            )
+            if s.get("lower_bound"):
+                lines.append("  - lower bound: no passing run within the dashboard's history window")
+            if s.get("same_image") or s.get("image_unchanged"):
+                lines.append(
+                    "  - the last pass ran on the same code (same image / same build "
+                    "commits): this is not a code change — flaky, runner or data"
+                )
+            if s.get("window_unknown"):
+                lines.append("  - commit range unknown: a build log of one side was not readable")
+            for w in s.get("windows", []):
+                span = _md_link(f"{w['base'][:10]}...{w['head'][:10]}", w.get("url", ""))
+                lines.append(
+                    f"  - {w['repo']}: {span} — {w.get('commits', '?')} commit(s) "
+                    f"(branch `{w.get('ref', '')}`)"
+                )
+        causes, fixes = row.get("cause_prs") or [], row.get("fix_prs") or []
+        lines.append("- Candidate causes (in the window, touch the test or traceback):")
+        lines += [f"  {_miles_pr_line(p)}" for p in causes] or ["  - none"]
+        lines.append("- Candidate fixes (later commits on the image's branch, or open PRs naming the test):")
+        lines += [f"  {_miles_pr_line(p)}" for p in fixes] or ["  - none"]
+    return "\n".join(lines) + "\n"
+
+
+_miles_repo_lock = threading.Lock()
+
+
+def ensure_miles_repo() -> Path | None:
+    """Clone or update radixark/miles at ``MILES_REPO_PATH`` (full history,
+    so the agent can ``git log`` a regression window). None on failure."""
+    _log = logging.getLogger("ci-monitor")
+    with _miles_repo_lock:
+        try:
+            if (MILES_REPO_PATH / ".git").exists():
+                subprocess.run(["git", "worktree", "prune"], cwd=MILES_REPO_PATH,
+                               capture_output=True, timeout=30)
+                subprocess.run(["git", "fetch", "origin", "--prune"], cwd=MILES_REPO_PATH,
+                               capture_output=True, timeout=300)
+            else:
+                if MILES_REPO_PATH.exists():
+                    shutil.rmtree(MILES_REPO_PATH)
+                AGENT_WORKSPACE.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["git", "clone", f"https://github.com/{MILES_REPO}.git", str(MILES_REPO_PATH)],
+                    capture_output=True, timeout=600, check=True,
+                )
+        except (subprocess.SubprocessError, OSError) as exc:
+            _log.warning("Could not prepare the %s clone: %s", MILES_REPO, exc)
+            return None
+    return MILES_REPO_PATH
+
+
+def add_miles_worktree(dest: Path, sha: str) -> bool:
+    """Check radixark/miles out at ``sha`` into ``dest`` (a detached worktree)."""
+    repo = ensure_miles_repo()
+    if repo is None:
+        return False
+    with _miles_repo_lock:
+        def git(*args: str, cwd: Path = repo) -> subprocess.CompletedProcess:
+            return subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                                  text=True, timeout=300)
+
+        if git("cat-file", "-t", sha).returncode != 0:
+            git("fetch", "origin", sha)
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if git("worktree", "add", "--detach", str(dest), sha).returncode != 0:
+            return False
+        return git("rev-parse", "HEAD", cwd=dest).stdout.strip() == sha
+
+
+def checkout_sglang_for_miles(
+    wt_path: Path, sha: str, ref: str, token: str | None = None,
+) -> bool:
+    """Move an sglang worktree to the (possibly abbreviated) commit an image
+    was built from.
+
+    The build log prints the commit abbreviated, and the branch it came from
+    (``sglang-miles``) is force-pushed, so the commit is often no longer on
+    it. The branch is tried first; failing that, the full SHA is looked up and
+    fetched on its own (GitHub still serves it).
+    """
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=wt_path, capture_output=True,
+                              text=True, timeout=300)
+
+    if ref:
+        git("fetch", "origin", ref, "--depth", "300")
+    if git("cat-file", "-t", sha).returncode != 0 and token:
+        resp = requests.get(
+            f"https://api.github.com/repos/{REPO}/commits/{sha}",
+            headers=gh_headers(token), timeout=60,
+        )
+        full = resp.json().get("sha", "") if resp.status_code == 200 else ""
+        if full:
+            git("fetch", "origin", full, "--depth", "1")
+    if git("cat-file", "-t", sha).returncode != 0:
+        return False
+    git("checkout", "--force", "--detach", sha)
+    return git("rev-parse", "HEAD").stdout.strip().startswith(sha)
+
+
+def prepare_miles_context(job: dict, work_dir: Path, token: str | None = None) -> dict:
+    """Lay out what a Miles job's agent needs under ``.ci-context/miles``.
+
+    - ``EVIDENCE.md``: the dashboard's facts about this job's failure.
+    - ``src/``: radixark/miles at the commit the job's image was built from.
+
+    and moves ``work_dir`` (the sglang worktree) to the image's sglang commit.
+    Every step degrades: what could not be prepared is said in EVIDENCE.md.
+    Returns the paths and commits, relative to ``work_dir``.
+    """
+    _log = logging.getLogger("ci-monitor")
+    payload = fetch_miles_cause_fix()
+    rows = miles_rows_for_job(payload, job["id"])
+    image = miles_job_image(rows, job["id"])
+    commits, refs = image["commits"], image["refs"]
+
+    checkout: dict = {"miles_src": "", "sglang_src": ""}
+    sglang_sha = commits.get(REPO, "")
+    if sglang_sha and checkout_sglang_for_miles(
+        work_dir, sglang_sha, refs.get(REPO, ""), token,
+    ):
+        checkout["sglang_src"] = "."
+    elif sglang_sha:
+        _log.warning("Could not check out sglang %s for Miles job %s", sglang_sha, job["id"])
+
+    context_dir = work_dir / ".ci-context" / "miles"
+    if context_dir.exists():
+        shutil.rmtree(context_dir)
+    context_dir.mkdir(parents=True, exist_ok=True)
+
+    miles_sha = commits.get(MILES_REPO, "")
+    if miles_sha and add_miles_worktree(context_dir / "src", miles_sha):
+        checkout["miles_src"] = ".ci-context/miles/src"
+    elif miles_sha:
+        _log.warning("Could not check out %s %s for job %s", MILES_REPO, miles_sha, job["id"])
+
+    evidence = context_dir / "EVIDENCE.md"
+    evidence.write_text(
+        render_miles_evidence(job, rows, image, checkout, payload), encoding="utf-8",
+    )
+    _log.info(
+        "Prepared Miles context for job %s: %d row(s), miles %s, sglang %s",
+        job["id"], len(rows), checkout["miles_src"] or "-", checkout["sglang_src"] or "-",
+    )
+    return {
+        "evidence": ".ci-context/miles/EVIDENCE.md",
+        "image": image["image"],
+        "miles_commit": miles_sha if checkout["miles_src"] else "",
+        "sglang_commit": sglang_sha if checkout["sglang_src"] else "",
+        **checkout,
+    }
 
 
 def post_comment(
@@ -910,6 +1235,32 @@ def analyze_job_with_agent(
                 f"Artifact name prefix: {MI355X_ARTIFACT_PREFIX}\n"
                 f"Artifact context: {manifest}\n"
             )
+    elif is_miles_workflow(workflow_file):
+        try:
+            miles = prepare_miles_context(
+                job, repo_path,
+                github_token or os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN"),
+            )
+        except Exception as exc:  # the agent can still work from the job log
+            logging.getLogger("ci-monitor").warning(
+                "Miles context failed for job %s: %s", job_id, exc,
+            )
+            miles = {}
+        miles_src = (
+            f"{miles['miles_src']} ({MILES_REPO} @ {miles['miles_commit']})"
+            if miles.get("miles_src") else "unavailable (see the evidence file)"
+        )
+        sglang_src = (
+            f"current directory ({REPO} @ {miles['sglang_commit']}, the image's sglang)"
+            if miles.get("sglang_src")
+            else "current directory, at the run's commit — NOT the image's sglang"
+        )
+        artifact_lines = (
+            f"Miles evidence: {miles.get('evidence') or 'unavailable'}\n"
+            f"Miles image: {miles.get('image') or 'unknown'}\n"
+            f"Miles source: {miles_src}\n"
+            f"sglang source: {sglang_src}\n"
+        )
 
     event_line = f"Event filter: {event_filter}\n" if event_filter else ""
     prompt = (
@@ -1159,6 +1510,7 @@ _agent_log = logging.getLogger("claude-agent")
 
 AGENT_WORKSPACE = Path(os.environ.get("AGENT_WORKSPACE", "/workspace"))
 SGLANG_REPO_PATH = AGENT_WORKSPACE / "sglang"
+MILES_REPO_PATH = AGENT_WORKSPACE / "miles"
 
 
 def claude_code_available() -> bool:

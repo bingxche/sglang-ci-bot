@@ -252,6 +252,7 @@ def collect_daily_report_context(
         collect_workflow_analyses,
     )
     from monitor_ci import find_daily_issue
+    from utils import is_miles_workflow
 
     end = (
         datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -266,7 +267,13 @@ def collect_daily_report_context(
         if not issue_num:
             continue
         url = f"https://github.com/{bot_repo}/issues/{issue_num}"
-        analyses = collect_workflow_analyses(token, bot_repo, issue_num)
+        # Miles failures are radixark/miles' to triage, not SGLang AMD CI
+        # errors, so they stay out of the staging database.
+        analyses = {
+            wf: jas
+            for wf, jas in collect_workflow_analyses(token, bot_repo, issue_num).items()
+            if not is_miles_workflow(wf)
+        }
         reports.append({"date": date_str, "issue_number": issue_num, "url": url})
         blocks.extend(
             (
