@@ -101,6 +101,11 @@ runner-1 entrypoint.sh (sleep 3600) ─┐
                           the run's mi355x-* artifacts and unpack bundled
                           prefill/decode/router logs under
                           .ci-context/mi355x-artifacts
+                        - for the Miles workflows only, move the worktree to
+                          the image's sglang commit, check radixark/miles out
+                          at the image's commit under .ci-context/miles/src,
+                          and write .ci-context/miles/EVIDENCE.md from the
+                          sglang-ci dashboard's Miles cause-fix payload
                         - deploy /workspace/CLAUDE.md
                         - run claude -p "Task: Job Failure Analysis ..." (cwd=worktree)
                         - parse output, append to job_analyses
@@ -211,6 +216,7 @@ When a task is triggered (CI failure analysis, PR review, or CI status check), t
 2. Creates an **isolated git worktree** per agent (e.g. `/workspace/sglang-wt-{job_id}`)
 3. For CI analysis: **checks out the exact commit** that was tested in CI (`head_sha`), so the agent reads the correct source code
 4. For `nightly-amd-mi355x-disagg.yml` CI analysis: downloads the run's `mi355x-*` artifacts, extracts bundled `*_logs.tar.gz` server logs, and writes a manifest under `.ci-context/mi355x-artifacts/`
+   - For the Miles workflows (`MILES_WORKFLOWS` in `utils.py`): the code under test is not the run's commit but the image's, so `prepare_miles_context()` re-checks out the worktree at the image's sglang commit, adds radixark/miles at the image's commit as `.ci-context/miles/src`, and writes `.ci-context/miles/EVIDENCE.md` — the failing tests, traceback, first failure / last pass, commit ranges and candidate commits that the [sglang-ci dashboard](https://rocm.github.io/sglang-ci/miles/) parses from the job and build logs (`MILES_CAUSE_FIX_URL`). The agent verifies those candidates rather than trusting them; every piece degrades to a note in the evidence file when it is unavailable
 5. For PR tasks: **checks out the PR branch** in the worktree
    - For `PR CI Status Check`: builds the evidence pack (`ci_evidence.py`, see [CI Status Check](#ci-status-check)) and re-checks out the worktree at the **commit CI actually tested** (usually a merge commit, not the PR head)
    - For `PR CI Status Check` and `PR Correlation`: writes `.ci-context/ci-runtime-env.md`, the env vars AMD PR CI actually sets (`collect_ci_runtime_env()` reads `docker/rocm.Dockerfile` `ENV` lines, `scripts/ci/amd/amd_ci_start_container.sh`, `scripts/ci/amd/amd_ci_exec.sh`, and `-e` flags in `.github/workflows/pr-test-amd*.yml`), so the agent judges env-gated code paths against CI's real environment instead of the code default
@@ -461,7 +467,18 @@ release-docker-amd-rocm720-nightly.yml
 nightly-amd-mi355x-disagg.yml
 amd-aiter-scout.yml
 pr-test-amd.yml
+nightly-test-amd-miles-rocm10.yml
+nightly-test-amd-miles-rocm10-mi30x.yml
+release-docker-amd-miles-rocm10-nightly.yml
+release-docker-amd-miles-rocm724-nightly.yml
 ```
+
+The four Miles workflows test [radixark/miles](https://github.com/radixark/miles) in
+images built from radixark/miles and an sglang branch (`sglang-miles`). They are
+analysed against those images' commits (see [How Agent Mode Works](#how-agent-mode-works)),
+appear in the daily report and the Daily Cross-Workflow Summary like any other
+workflow, and are left out of Notion staging and the upstream Failure Trackers:
+their failures are radixark/miles' to triage.
 
 Upstream now expands ROCm 10, ROCm 7.2.4, and ROCm 7.2 as job matrices inside
 the unified `nightly-test-amd.yml` and `pr-test-amd.yml` runs. The workflow

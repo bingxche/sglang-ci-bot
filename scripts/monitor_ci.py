@@ -64,6 +64,12 @@ MONITORED_WORKFLOWS = [
     "nightly-amd-mi355x-disagg.yml",
     "amd-aiter-scout.yml",
     "pr-test-amd.yml",
+    # Miles: analysed against the image's radixark/miles and sglang commits
+    # (utils.prepare_miles_context), not the run's.
+    "nightly-test-amd-miles-rocm10.yml",
+    "nightly-test-amd-miles-rocm10-mi30x.yml",
+    "release-docker-amd-miles-rocm10-nightly.yml",
+    "release-docker-amd-miles-rocm724-nightly.yml",
 ]
 
 # Most monitored workflows are analyzed only when triggered by ``schedule``

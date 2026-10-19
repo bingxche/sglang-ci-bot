@@ -46,6 +46,8 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
   - Workflow run `<run_id>` → `` [<run_id>](https://github.com/sgl-project/sglang/actions/runs/<run_id>) ``
   - Workflow job `<job_id>` in run `<run_id>` → `` [<short label>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) ``
   - Log line: `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>#step:<step>:<line>`
+  - radixark/miles commit `<sha>` → `` [`<sha>`](https://github.com/radixark/miles/commit/<sha>) ``
+  - radixark/miles PR `#<num>` → `` [radixark/miles#<num>](https://github.com/radixark/miles/pull/<num>) `` (always repo-qualified, so it is never read as an sglang PR)
 
   When a PR number appears inside a commit message you are citing (e.g. `Revert "fix(car): graph capture err (#2638)"`), you MUST also turn that PR number into a link to the correct repo (aiter PR if the commit is an aiter commit, sglang PR if it's an sglang commit). Never leave `#<num>` as plain text in a report.
 - **Your final message MUST be plain text only.** Do NOT call any tools (including TodoWrite) in the same turn as your final report. The report text must be the very last thing you output, with no tool calls alongside it. If you need to update todos, do it in a prior turn before writing the report.
@@ -155,9 +157,90 @@ prefill/decode/router failure signal at the artifact-log level. Do not mark a
 historical run "passed for this failure" merely because its GitHub job page log
 does not contain the server-side error.
 
+### Miles workflows (REQUIRED for `nightly-test-amd-miles-*.yml` and `release-docker-amd-miles-*.yml`)
+
+These workflows test [radixark/miles](https://github.com/radixark/miles), an RL
+training framework built on sglang. Their runs sit on sglang `main`, but the
+code they execute is **not** the run's commit:
+
+- A **nightly** (`nightly-test-amd-miles-rocm10*.yml`) runs miles' own test
+  scripts (`tests/...`, `/root/miles/...` in tracebacks) inside a dated image,
+  `rocm/sgl-dev:miles-<track>-<gpu>-<YYYYMMDD>`. The log names it on a
+  `Using miles image:` line. A run may reuse an older image when that day's
+  build failed.
+- An **image build** (`release-docker-amd-miles-*-nightly.yml`) assembles that
+  image from radixark/miles `main` and an sglang branch (`sglang-miles`, or a
+  release branch such as `sglang-miles-v0.5.21-final`) with
+  `docker/Dockerfile.rocm`. Its log prints `Building from radixark/miles@main
+  (<sha>)` (or `Building from miles main @ <sha>`) and, in the sglang checkout
+  step, `HEAD is now at <sha>`.
+
+So the `Commit SHA` in the prompt is only the commit the workflow file came
+from. Never use it as the code under test or as a regression-window endpoint.
+
+**Read the evidence file first.** The prompt's `Miles evidence:` line points
+to `.ci-context/miles/EVIDENCE.md`, prepared by the sglang-ci dashboard from
+the job logs and build logs. It gives, per failure: the image and its
+radixark/miles + sglang commits, the failing test files and their error, the
+traceback frames inside miles / sglang, the run each test first failed and
+last passed in, the commit ranges between those two images, and **candidate**
+cause and fix commits. The candidates are mechanical (a commit in the window
+that changed the test, or a function or line on its traceback). They are
+leads, not causes: open each diff and decide whether it really changes the
+failing path, and say so either way in Hypothesised Causes. Look past them as
+well — model scripts, configs, dependency pins and the Dockerfile do not
+appear on a traceback.
+
+**Source trees.** `Miles source:` is radixark/miles checked out at the image's
+commit, with full history: use `git -C .ci-context/miles/src log
+<base>..<head> -- <path>`, `git -C .ci-context/miles/src show <sha>`. The
+current directory is sglang at the image's sglang commit when the
+`sglang source:` line says so. Both are read-only like `/workspace/sglang`.
+
+**What failed.** The suite runner prints `Begin (n/N):` then the test's
+command, `FAILED: <test> returned exit code N` or `TIMEOUT: <test> after N
+seconds` as each test ends, and at the end a `PASSED:` / `FAILED:` summary
+followed by `Last output of <test>:` excerpts. Most miles e2e tests are
+scripts rather than test functions: put `—` in the Test Function column when
+the file is the unit. A test killed by its timeout ends on whatever it last
+printed (a health check, a progress bar); report the timeout, not that line.
+
+**When it started.** Compare at the test-file level as for every workflow,
+but think in images, not commits: the regression window is between the last
+image the test passed on and the first image it failed on. Two runs on the
+same image tag (or on images built from the same commits) with different
+outcomes mean the code did not change — say flaky / runner / data, not
+regression. If the evidence file has no row for this job, or the dashboard
+payload was unavailable: take the image tag from the log, find that day's
+successful run of the matching `release-docker-amd-miles-*-nightly.yml`
+(same ROCm track and GPU), and read the commits from its log lines above.
+
+**Why.** Enumerate both windows: radixark/miles in `.ci-context/miles/src`,
+and sglang through the compare API on the image's sglang branch
+(`https://api.github.com/repos/sgl-project/sglang/compare/<base>...<head>`).
+For an image build failure, also check `docker/Dockerfile.rocm` and the
+workflow file in sglang between the last good and the first failed build, and
+cite the failing Dockerfile step (`#<n> [sglang k/N] RUN ...`).
+
+**In-flight fixes.** Search radixark/miles as well as sglang:
+`https://api.github.com/search/issues?q=repo:radixark/miles+is:pr+is:open+<keyword>`.
+A later commit on miles `main` that changes the failing code counts as a
+landed fix candidate; say whether the newest image already contains it.
+
+**Commit Info for these workflows** lists the code under test:
+
+```
+### Commit Info
+- **image**: `rocm/sgl-dev:miles-rocm10-mi35x-20261015`
+- **radixark/miles**: [`<sha>`](https://github.com/radixark/miles/commit/<sha>) (branch `main`)
+- **sglang**: [`<sha>`](https://github.com/sgl-project/sglang/commit/<sha>) (branch `sglang-miles`)
+- **workflow commit**: [`<head_sha>`](https://github.com/sgl-project/sglang/commit/<head_sha>) (where the workflow file came from; not tested)
+- **aiter**: per the rule below (`N/A` when the log has no `[CI-AITER-CHECK]` markers)
+```
+
 ### Commit info extraction (REQUIRED)
 
-Every analysis **must** begin with a `### Commit Info` section. The prompt will supply a `Commit SHA` — use it as the sglang commit.
+Every analysis **must** begin with a `### Commit Info` section. The prompt will supply a `Commit SHA` — use it as the sglang commit (except for Miles workflows: see **Miles workflows** above).
 
 For the **aiter commit**, download the job log and search for `[CI-AITER-CHECK]` markers emitted by `amd_ci_install_dependency.sh`. Determine the actual aiter version that ran using this priority:
 
