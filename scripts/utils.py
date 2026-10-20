@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import anthropic
@@ -505,8 +506,10 @@ def _miles_point(point: dict | None) -> str:
 
 def render_miles_evidence(
     job: dict, rows: list[dict], image: dict, checkout: dict, payload: dict | None,
+    docker: list[str] | None = None,
 ) -> str:
-    """The evidence file a Miles job's agent reads first."""
+    """The evidence file a Miles job's agent reads first. ``docker`` is what
+    Docker Hub said about the image (``check_miles_image``)."""
     lines = [
         "# Miles failure evidence",
         "",
@@ -542,6 +545,8 @@ def render_miles_evidence(
                 "the fork's own commits; it is not a regression in "
                 f"{repo} until it reproduces on an image built from main."
             )
+    if docker:
+        lines += ["", "## Docker Hub", "", *docker]
     if payload is None:
         lines += [
             "",
@@ -603,6 +608,180 @@ def render_miles_evidence(
         lines.append("- Candidate fixes (later commits on the image's branch, or open PRs naming the test):")
         lines += [f"  {_miles_pr_line(p)}" for p in fixes] or ["  - none"]
     return "\n".join(lines) + "\n"
+
+
+# Docker Hub, asked rather than guessed: whether the image a Miles job ran on
+# is still the one under its tag, and whether that day's image was published
+# at all (a nightly falls back to an older tag when the day's build failed).
+# The tag API needs no auth; it allows ~180 calls a window, and a job costs 3.
+MILES_IMAGE_REPO = "rocm/sgl-dev"
+DOCKERHUB_API = "https://hub.docker.com/v2"
+MILES_NIGHTLY_TRACKS = {
+    "nightly-test-amd-miles-rocm10.yml": "miles-rocm10-mi35x",
+    "nightly-test-amd-miles-rocm10-mi30x.yml": "miles-rocm10-mi30x",
+}
+_BUILD_LEG_RE = re.compile(r"\((rocm\w+-mi\d+x)\b")
+_DATED_TAG_RE = re.compile(r"^(.+)-(\d{8})$")
+_DOCKERHUB_RECENT = 5
+_dockerhub_cache: dict = {}
+_dockerhub_lock = threading.Lock()
+
+
+def _dockerhub_get(path: str, params: dict | None = None) -> tuple[int, dict]:
+    """``(status, json)`` for a Docker Hub API path; ``(0, {})`` if unreachable.
+    Answers are kept for the run: three jobs on one image ask once."""
+    key = (path, tuple(sorted((params or {}).items())))
+    with _dockerhub_lock:
+        if key in _dockerhub_cache:
+            return _dockerhub_cache[key]
+    try:
+        resp = requests.get(f"{DOCKERHUB_API}{path}", params=params, timeout=30)
+        out = (resp.status_code, resp.json() if resp.status_code == 200 else {})
+    except (requests.RequestException, ValueError):
+        return 0, {}
+    with _dockerhub_lock:
+        _dockerhub_cache[key] = out
+    return out
+
+
+def dockerhub_tag(repository: str, tag: str) -> dict | None:
+    """``{"exists", "pushed", "digest"}`` for one tag, or None if Docker Hub
+    could not be asked (which is not the same as the tag being missing)."""
+    ns, repo = repository.split("/", 1)
+    status, data = _dockerhub_get(f"/namespaces/{ns}/repositories/{repo}/tags/{tag}")
+    if status == 404:
+        return {"exists": False, "pushed": "", "digest": ""}
+    if status != 200:
+        return None
+    return {
+        "exists": True,
+        "pushed": data.get("tag_last_pushed") or data.get("last_updated") or "",
+        "digest": data.get("digest") or "",
+    }
+
+
+def dockerhub_recent_tags(repository: str, prefix: str, n: int = _DOCKERHUB_RECENT) -> list[dict] | None:
+    """The newest dated tags of one image track (``<prefix>-YYYYMMDD``)."""
+    ns, repo = repository.split("/", 1)
+    status, data = _dockerhub_get(
+        f"/namespaces/{ns}/repositories/{repo}/tags",
+        {"name": prefix, "page_size": 25, "ordering": "last_updated"},
+    )
+    if status != 200:
+        return None
+    out = []
+    for t in data.get("results") or []:
+        m = _DATED_TAG_RE.match(t.get("name", ""))
+        if m and m.group(1) == prefix:
+            out.append({
+                "tag": t["name"],
+                "pushed": t.get("tag_last_pushed") or t.get("last_updated") or "",
+                "digest": t.get("digest") or "",
+            })
+    return out[:n]
+
+
+def miles_image_track(workflow_file: str, job: dict, image: str) -> str:
+    """The job's image track, e.g. ``miles-rocm10-mi35x``: from the image it
+    ran on, else its workflow (nightlies) or job name (``publish (rocm724-mi35x)``)."""
+    m = _DATED_TAG_RE.match(image.split(":", 1)[-1]) if image else None
+    if m:
+        return m.group(1)
+    track = MILES_NIGHTLY_TRACKS.get(workflow_file.split("/")[-1])
+    if track:
+        return track
+    m = _BUILD_LEG_RE.search(job.get("name", ""))
+    return f"miles-{m.group(1)}" if m else ""
+
+
+def _hub_time(ts: str) -> str:
+    return ts[:16].replace("T", " ") + " UTC" if ts else "?"
+
+
+def check_miles_image(workflow_file: str, job: dict, image: str) -> list[str]:
+    """Evidence lines on what Docker Hub has for this job's image track."""
+    track = miles_image_track(workflow_file, job, image)
+    if not track:
+        return ["- Could not tell this job's image track; Docker Hub was not asked."]
+    repo = MILES_IMAGE_REPO
+    started = job.get("started_at") or ""
+    day = started[:10].replace("-", "")
+    building = workflow_file.split("/")[-1].startswith("release-docker-")
+    lines = []
+
+    ran_tag = image.split(":", 1)[-1] if image else ""
+    if ran_tag:
+        ran = dockerhub_tag(repo, ran_tag)
+        if ran is None:
+            lines.append(f"- `{repo}:{ran_tag}` (the image this job ran): Docker Hub did not answer.")
+        elif not ran["exists"]:
+            lines.append(f"- `{repo}:{ran_tag}` (the image this job ran): **no longer on Docker Hub**.")
+        else:
+            lines.append(
+                f"- `{repo}:{ran_tag}` (the image this job ran): pushed {_hub_time(ran['pushed'])}, "
+                f"digest `{ran['digest'][:19]}`."
+            )
+            if started and ran["pushed"] > started:
+                lines.append(
+                    "  - **Re-pushed after this job started**: the tag now names a different "
+                    "image than the job pulled. Compare the `Digest: sha256:...` the job's log "
+                    "printed before reading anything about this image off Docker Hub."
+                )
+
+    if day and (not ran_tag or not ran_tag.endswith(day)):
+        want = f"{track}-{day}"
+        found = dockerhub_tag(repo, want)
+        if found is None:
+            lines.append(f"- `{repo}:{want}` (this run's day): Docker Hub did not answer.")
+        elif found["exists"]:
+            lines.append(f"- `{repo}:{want}` (this run's day): pushed {_hub_time(found['pushed'])}.")
+            if ran_tag and not building:
+                lines.append(
+                    f"  - The job ran on `{ran_tag}` although that day's image exists: it was "
+                    "pushed after the job pulled, or the workflow pinned an older tag."
+                )
+        elif building:
+            lines.append(f"- `{repo}:{want}` (this build's image): **not on Docker Hub** — the build did not publish it.")
+        else:
+            lines.append(
+                f"- `{repo}:{want}` (this run's day): **not on Docker Hub** — that day's build did "
+                f"not publish, so the run fell back to an older image"
+                + (f" (`{ran_tag}`)." if ran_tag else ".")
+            )
+
+    recent = dockerhub_recent_tags(repo, track)
+    if recent is None:
+        lines.append(f"- Newest `{track}-*` tags: Docker Hub did not answer.")
+    elif not recent:
+        lines.append(f"- No `{track}-*` tags on Docker Hub.")
+    else:
+        lines.append(
+            f"- Newest `{track}-*` tags: "
+            + ", ".join(f"`{t['tag'].rsplit('-', 1)[-1]}` ({_hub_time(t['pushed'])})" for t in recent)
+        )
+        missing = _missing_days([t["tag"].rsplit("-", 1)[-1] for t in recent])
+        if missing:
+            lines.append(
+                f"  - **No image published on {', '.join(missing)}**: nightlies on those "
+                "days ran on the newest image before them."
+            )
+    return lines
+
+
+def _missing_days(days: list[str]) -> list[str]:
+    """``YYYY-MM-DD`` days with no tag between the newest and oldest of ``days``
+    (``YYYYMMDD`` strings)."""
+    have = {d for d in days if len(d) == 8}
+    if len(have) < 2:
+        return []
+    day = datetime.strptime(min(have), "%Y%m%d")
+    newest = datetime.strptime(max(have), "%Y%m%d")
+    out = []
+    while day < newest:
+        day += timedelta(days=1)
+        if day.strftime("%Y%m%d") not in have:
+            out.append(day.strftime("%Y-%m-%d"))
+    return out
 
 
 _miles_repo_lock = threading.Lock()
@@ -690,7 +869,9 @@ def checkout_sglang_for_miles(
     return git("rev-parse", "HEAD").stdout.strip().startswith(sha)
 
 
-def prepare_miles_context(job: dict, work_dir: Path, token: str | None = None) -> dict:
+def prepare_miles_context(
+    job: dict, work_dir: Path, token: str | None = None, workflow_file: str = "",
+) -> dict:
     """Lay out what a Miles job's agent needs under ``.ci-context/miles``.
 
     - ``EVIDENCE.md``: the dashboard's facts about this job's failure.
@@ -727,9 +908,16 @@ def prepare_miles_context(job: dict, work_dir: Path, token: str | None = None) -
     elif miles_sha:
         _log.warning("Could not check out %s %s for job %s", MILES_REPO, miles_sha, job["id"])
 
+    try:
+        docker = check_miles_image(workflow_file, job, image["image"])
+    except Exception as exc:  # the rest of the evidence still stands
+        _log.warning("Docker Hub check failed for job %s: %s", job["id"], exc)
+        docker = [f"- Docker Hub check failed: `{exc}`"]
+
     evidence = context_dir / "EVIDENCE.md"
     evidence.write_text(
-        render_miles_evidence(job, rows, image, checkout, payload), encoding="utf-8",
+        render_miles_evidence(job, rows, image, checkout, payload, docker),
+        encoding="utf-8",
     )
     _log.info(
         "Prepared Miles context for job %s: %d row(s), miles %s, sglang %s",
@@ -1283,6 +1471,7 @@ def analyze_job_with_agent(
             miles = prepare_miles_context(
                 job, repo_path,
                 github_token or os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN"),
+                workflow_file,
             )
         except Exception as exc:  # the agent can still work from the job log
             logging.getLogger("ci-monitor").warning(

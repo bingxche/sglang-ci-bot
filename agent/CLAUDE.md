@@ -87,6 +87,14 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
   Use 1-3 keywords from the failing test name, file name, error message, or library name. If a matching open PR exists, report it instead of duplicating the recommendation:
   - `In-flight fix: ✅ [#23072](url) (open since 2026-04-17, awaiting merge) — chase reviewers, do NOT open a duplicate`
   - `In-flight fix: ❌ none found in open PRs — needs new PR or investigation`
+- **Docker images: check Docker Hub, don't infer.** Any claim about an image — that it was or was not published, that a run fell back to an older tag, that a tag was re-pushed, that downstream jobs "may fail to pull" — must be checked against Docker Hub, which needs no auth for public repos:
+  ```
+  # One tag: 404 = not published; tag_last_pushed = when; digest = which image
+  curl -s https://hub.docker.com/v2/namespaces/<ns>/repositories/<repo>/tags/<tag>
+  # The newest tags of a track (name is a substring filter)
+  curl -s "https://hub.docker.com/v2/namespaces/<ns>/repositories/<repo>/tags?name=<prefix>&ordering=last_updated&page_size=10"
+  ```
+  A tag can be overwritten (a manual rebuild pushes the same dated tag), so compare the `Digest: sha256:...` the job's log printed when it pulled with the tag's current `digest` before reading anything about "the image" off Docker Hub. Cite what you found (`[FACT]` tag present / 404, pushed at, digest).
 - **Only completed runs count in trend analysis.** When computing trends, regression candidates, "latest run is greener" claims, or any per-run statistics, you MUST filter to runs with `status == "completed"`. In-progress / queued / waiting runs MUST be either excluded or explicitly labelled `[IN-FLIGHT, partial data]`. Drawing conclusions from in-flight runs (e.g. "failures dropped to 1") is forbidden — at the time of the snapshot, the remaining jobs may still produce failures. When in doubt, wait for completion or annotate the snapshot time and partial state.
 - **Recommendations are triage steps, not directives.** Bot output must use the form "Suggested triage: bisect A..B; if commit X is implicated, try reverting on a branch and re-running test Y" — NOT "Revert commit X" / "Pin peft<0.19". The maintainer makes the decision; the bot proposes investigation paths.
 
@@ -214,6 +222,24 @@ regression. If the evidence file has no row for this job, or the dashboard
 payload was unavailable: take the image tag from the log, find that day's
 successful run of the matching `release-docker-amd-miles-*-nightly.yml`
 (same ROCm track and GPU), and read the commits from its log lines above.
+
+**Image availability.** The evidence file's **Docker Hub** section is what
+Docker Hub said about this job's image track (`rocm/sgl-dev:miles-<track>-<gpu>-*`)
+when the analysis started:
+
+- the tag the job ran on — its push time and digest, and whether it was
+  **re-pushed after the job started** (then the tag names a different image
+  than the job pulled: compare the log's `Digest:` line);
+- the tag for the run's own day — if it is **not on Docker Hub**, that day's
+  build did not publish and the nightly ran on the older image, so the
+  regression window ends at that older image, not at the day's commits; for a
+  build job, it means the build did not publish its image;
+- the newest tags of the track, which show how long it has gone without a
+  new image.
+
+Use these as facts in Regression Status and Status (persistence, blocked
+work). When a section line says Docker Hub did not answer, query it yourself
+with the curl commands in the Ground Rules.
 
 **Images built from a fork.** A manual `workflow_dispatch` build can take
 miles from a fork (`Building from <owner>/miles@<branch> (<sha>)`), and its

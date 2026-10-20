@@ -351,5 +351,111 @@ class PromptTests(unittest.TestCase):
         self.assertNotIn("Miles", analyze.call_args.kwargs["prompt"])
 
 
+
+class DockerHubTests(unittest.TestCase):
+    """What Docker Hub says about a job's image, faked from real answers."""
+
+    HUB = {
+        "miles-rocm10-mi35x-20261019": ("2026-10-19T14:30:51Z", "sha256:47d17346146f0000"),
+        "miles-rocm10-mi35x-20261018": ("2026-10-18T12:40:00Z", "sha256:aaaa"),
+        "miles-rocm10-mi35x-20261015": ("2026-10-15T12:47:43Z", "sha256:bbbb"),
+        "miles-rocm724-mi35x-20261015": ("2026-10-15T12:47:43Z", "sha256:d8dc7d2b2b10"),
+        "miles-rocm724-mi35x-20261013": ("2026-10-13T13:08:07Z", "sha256:cccc"),
+    }
+
+    def setUp(self):
+        utils._dockerhub_cache.clear()
+
+    def fake_get(self, url, params=None, timeout=None):
+        resp = Mock()
+        tags_path = "/namespaces/rocm/repositories/sgl-dev/tags"
+        if url.endswith(tags_path):
+            prefix = params["name"]
+            results = [
+                {"name": name, "tag_last_pushed": pushed, "digest": digest}
+                for name, (pushed, digest) in sorted(
+                    self.HUB.items(), key=lambda kv: kv[1][0], reverse=True
+                )
+                if prefix in name
+            ] + [{"name": prefix, "tag_last_pushed": "2026-10-19T14:31:00Z"}]
+            resp.status_code, resp.json.return_value = 200, {"results": results}
+            return resp
+        tag = url.rsplit("/", 1)[-1]
+        if tag in self.HUB:
+            pushed, digest = self.HUB[tag]
+            resp.status_code = 200
+            resp.json.return_value = {"tag_last_pushed": pushed, "digest": digest}
+        else:
+            resp.status_code = 404
+        return resp
+
+    def check(self, workflow, job, image):
+        with patch("utils.requests.get", side_effect=self.fake_get):
+            return "\n".join(utils.check_miles_image(workflow, job, image))
+
+    def test_track_from_image_workflow_or_build_leg(self):
+        track = utils.miles_image_track
+        self.assertEqual(track("x.yml", {}, "rocm/sgl-dev:miles-rocm10-mi30x-20261015"), "miles-rocm10-mi30x")
+        self.assertEqual(track("nightly-test-amd-miles-rocm10.yml", {}, ""), "miles-rocm10-mi35x")
+        self.assertEqual(
+            track("release-docker-amd-miles-rocm724-nightly.yml", {"name": "publish (rocm724-mi35x)"}, ""),
+            "miles-rocm724-mi35x",
+        )
+        self.assertEqual(track("other.yml", {"name": "x"}, ""), "")
+
+    def test_a_tag_re_pushed_after_the_job_started(self):
+        text = self.check(
+            "nightly-test-amd-miles-rocm10.yml",
+            {"started_at": "2026-10-19T12:00:00Z"},
+            "rocm/sgl-dev:miles-rocm10-mi35x-20261019",
+        )
+        self.assertIn("pushed 2026-10-19 14:30 UTC, digest `sha256:47d17346146f`", text)
+        self.assertIn("**Re-pushed after this job started**", text)
+
+    def test_a_nightly_on_an_older_image_because_the_day_was_not_published(self):
+        text = self.check(
+            "nightly-test-amd-miles-rocm10.yml",
+            {"started_at": "2026-10-17T17:40:00Z"},
+            "rocm/sgl-dev:miles-rocm10-mi35x-20261015",
+        )
+        self.assertNotIn("Re-pushed", text)
+        self.assertIn(
+            "`rocm/sgl-dev:miles-rocm10-mi35x-20261017` (this run's day): **not on Docker Hub** "
+            "— that day's build did not publish, so the run fell back to an older image "
+            "(`miles-rocm10-mi35x-20261015`).",
+            text,
+        )
+        # The days between the newest tags with no image are named.
+        self.assertIn("**No image published on 2026-10-16, 2026-10-17**", text)
+        # Newest dated tags only: the undated alias is left out.
+        self.assertIn("Newest `miles-rocm10-mi35x-*` tags: `20261019` (2026-10-19 14:30 UTC), `20261018`", text)
+
+    def test_a_build_that_did_not_publish(self):
+        text = self.check(
+            "release-docker-amd-miles-rocm724-nightly.yml",
+            {"name": "publish (rocm724-mi35x)", "started_at": "2026-10-19T12:26:00Z"},
+            "",
+        )
+        self.assertIn("`rocm/sgl-dev:miles-rocm724-mi35x-20261019` (this build's image): **not on Docker Hub**", text)
+        self.assertIn("`20261015` (2026-10-15 12:47 UTC), `20261013`", text)
+
+    def test_docker_hub_down_is_said_not_taken_for_missing(self):
+        with patch("utils.requests.get", side_effect=utils.requests.ConnectionError("down")):
+            text = "\n".join(utils.check_miles_image(
+                "nightly-test-amd-miles-rocm10.yml",
+                {"started_at": "2026-10-17T17:40:00Z"},
+                "rocm/sgl-dev:miles-rocm10-mi35x-20261015",
+            ))
+        self.assertNotIn("not on Docker Hub", text)
+        self.assertEqual(text.count("Docker Hub did not answer"), 3)
+
+    def test_evidence_has_a_docker_hub_section(self):
+        text = utils.render_miles_evidence(
+            {"id": 1}, [], {"image": "", "commits": {}, "refs": {}}, {}, {"rows": []},
+            ["- `rocm/sgl-dev:x` (this run's day): **not on Docker Hub**"],
+        )
+        self.assertIn("## Docker Hub\n\n- `rocm/sgl-dev:x`", text)
+
+
 if __name__ == "__main__":
     unittest.main()
