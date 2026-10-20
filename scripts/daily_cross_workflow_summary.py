@@ -41,6 +41,7 @@ This script is a data-only harness.
 """
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -361,10 +362,251 @@ def run_api_fallback(
 
 
 # ---------------------------------------------------------------------------
+# Job -> cluster map
+# ---------------------------------------------------------------------------
+
+# The agent ends its report with a fenced ```json job-clusters``` block
+# mapping each cluster ID to the job IDs it covers. It is stripped from the
+# rendered summary and re-emitted as a hidden comment so the dashboard can
+# join jobs to clusters without scraping the prose tables, whose columns
+# drift from day to day.
+JOB_CLUSTERS_COMMENT_PREFIX = "<!-- ci-monitor-job-clusters:v1 "
+UNCLUSTERED_SECTION_MAX_CHARS = 8_000
+# GitHub rejects issue bodies over 65,536 chars; leave room for the footer.
+ISSUE_BODY_SAFE_CHARS = 62_000
+_JOB_CLUSTERS_BLOCK_RE = re.compile(
+    r"^```json[ \t]+job-clusters[ \t]*\n(.*?)^```[ \t]*\n?",
+    re.DOTALL | re.MULTILINE,
+)
+_JOB_LINK_RE = re.compile(r"/actions/runs/\d+/job/(\d+)")
+# `R25`, but not the model names `DeepSeek-R1` or `R1-MXFP4`.
+_CLUSTER_ID_RE = re.compile(r"(?<![\w-])R\d+(?![\w-])")
+_MD_LINK_TARGET_RE = re.compile(r"\]\([^)]*\)")
+_HOW_GENERATED_RE = re.compile(r"^##\s+How this report is generated", re.MULTILINE)
+
+
+def split_job_cluster_block(report: str) -> tuple[str, dict[int, list[str]] | None]:
+    """Pull the agent's ``job-clusters`` block out of the report.
+
+    Returns the report without the block and a ``{job_id: [cluster_id]}``
+    map, or ``None`` when the block is missing or not valid JSON. The
+    agent writes it cluster-first (``{"R25": [job_id, ...]}``) because
+    that is how it thinks about the day; it is inverted here.
+    """
+    matches = list(_JOB_CLUSTERS_BLOCK_RE.finditer(report))
+    if not matches:
+        return report, None
+    stripped = _JOB_CLUSTERS_BLOCK_RE.sub("", report).rstrip() + "\n"
+    try:
+        raw = json.loads(matches[-1].group(1))
+    except ValueError as exc:
+        log.warning("job-clusters block is not valid JSON (%s); ignoring it", exc)
+        return stripped, None
+    if not isinstance(raw, dict):
+        log.warning("job-clusters block is not a JSON object; ignoring it")
+        return stripped, None
+
+    by_job: dict[int, list[str]] = {}
+    for cluster_id, job_ids in raw.items():
+        if not _CLUSTER_ID_RE.fullmatch(str(cluster_id)) or not isinstance(job_ids, list):
+            continue
+        for job_id in job_ids:
+            try:
+                job_id = int(job_id)
+            except (TypeError, ValueError):
+                continue
+            ids = by_job.setdefault(job_id, [])
+            if cluster_id not in ids:
+                ids.append(cluster_id)
+    return stripped, by_job
+
+
+def job_clusters_from_markdown(report: str) -> dict[int, list[str]]:
+    """Best-effort job -> cluster map read from the report's own tables.
+
+    Fallback for jobs the agent left out of its ``job-clusters`` block. A
+    table row's job links belong to the cluster IDs written in that row
+    (the ``ID`` column, or a ``Cluster`` cell in a drill-down); a row
+    without any belongs to the ``###`` cluster section it sits under. Job
+    links outside a cluster section (TL;DR, run labels) are not assigned.
+    """
+    by_job: dict[int, list[str]] = {}
+    section_ids: list[str] = []
+    for line in report.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            section_ids = _CLUSTER_ID_RE.findall(_MD_LINK_TARGET_RE.sub("]", stripped))
+            continue
+        if stripped.startswith(("## ", "# ", "<details")):
+            section_ids = []
+            continue
+        job_ids = _JOB_LINK_RE.findall(stripped)
+        if not job_ids:
+            continue
+        ids = section_ids
+        if stripped.startswith("|"):
+            ids = _CLUSTER_ID_RE.findall(_MD_LINK_TARGET_RE.sub("]", stripped)) or section_ids
+        for job_id in job_ids:
+            entry = by_job.setdefault(int(job_id), [])
+            entry.extend(i for i in dict.fromkeys(ids) if i not in entry)
+    return {job_id: ids for job_id, ids in by_job.items() if ids}
+
+
+def _per_job_cluster_name(analysis: str) -> str:
+    """The first line under a per-job analysis's ``### Failure Cluster``."""
+    lines = (analysis or "").splitlines()
+    for i, line in enumerate(lines):
+        if re.match(r"^#{2,4}\s+Failure Cluster\b", line.strip()):
+            for follow in lines[i + 1:]:
+                text = follow.strip()
+                if text.startswith("#"):
+                    break
+                if text:
+                    return text
+    return ""
+
+
+def _job_url(ja: dict) -> str:
+    run_url = (ja.get("run_url") or "").rstrip("/")
+    return f"{run_url}/job/{ja['job_id']}" if run_url else ""
+
+
+def _table_cell(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def render_unclustered_section(
+    unclustered: list[tuple[str, dict]], max_chars: int = UNCLUSTERED_SECTION_MAX_CHARS,
+) -> str:
+    """List the analysed jobs the summary did not put in any cluster.
+
+    Jobs sharing a workflow and per-job cluster name share a row. Rows stop
+    at *max_chars* so a bad day cannot push the issue body past GitHub's
+    65,536-character limit; the hidden map still lists every job.
+    """
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for wf, ja in unclustered:
+        cluster = _table_cell(_per_job_cluster_name(ja.get("analysis", ""))) or "—"
+        groups.setdefault((wf.removesuffix(".yml"), cluster), []).append(ja)
+
+    lines = [
+        "<details><summary><b>⚠️ Not yet in a cluster</b> · "
+        f"{len(unclustered)} analysed failure(s) this summary did not assign "
+        "· click to expand</summary>",
+        "",
+        "| Workflow | Per-job failure cluster | Jobs |",
+        "|---|---|---|",
+    ]
+    size = sum(len(line) + 1 for line in lines)
+    shown = 0
+    for (wf, cluster), jas in groups.items():
+        row = f"| {wf} | {cluster} | "
+        jobs = []
+        for ja in jas:
+            name = _table_cell(ja.get("job_name") or str(ja["job_id"]))
+            url = _job_url(ja)
+            job = f"[{name}]({url})" if url else name
+            if size + len(row) + len(" · ".join(jobs + [job])) + 3 > max_chars:
+                break
+            jobs.append(job)
+        if not jobs:
+            break
+        row += " · ".join(jobs) + " |"
+        lines.append(row)
+        size += len(row) + 1
+        shown += len(jobs)
+        if len(jobs) < len(jas):
+            break
+    if shown < len(unclustered):
+        lines += [
+            "",
+            f"…and {len(unclustered) - shown} more; see the per-workflow comments below.",
+        ]
+    lines += ["", "</details>"]
+    return "\n".join(lines)
+
+
+def build_job_cluster_map(
+    report: str,
+    agent_map: dict[int, list[str]] | None,
+    wf_analyses: dict[str, list[dict]],
+) -> tuple[dict[int, list[str]], list[tuple[str, dict]]]:
+    """Join the report's clusters to every job analysed today.
+
+    The agent's block wins; the report's tables fill in what it left out.
+    A job ID is kept when it was analysed today or is linked from the
+    report (yesterday's late-finishing legs are), so a mistyped ID cannot
+    land on an unrelated job. Returns the map and the analysed jobs that
+    no cluster covers, in workflow order.
+    """
+    analysed = {
+        ja["job_id"]: (wf, ja) for wf, jas in wf_analyses.items() for ja in jas
+    }
+    linked = {int(j) for j in _JOB_LINK_RE.findall(report)}
+
+    mapping: dict[int, list[str]] = {}
+    for source in (agent_map or {}, job_clusters_from_markdown(report)):
+        for job_id, ids in source.items():
+            if job_id in mapping or not ids:
+                continue
+            if job_id in analysed or job_id in linked:
+                mapping[job_id] = ids
+
+    unclustered = [entry for job_id, entry in analysed.items() if job_id not in mapping]
+    return mapping, unclustered
+
+
+def render_job_cluster_comment(
+    mapping: dict[int, list[str]], unclustered: list[tuple[str, dict]],
+) -> str:
+    """Hidden, machine-readable copy of the job -> cluster join."""
+    clusters: dict[str, list[int]] = {}
+    for job_id in sorted(mapping):
+        for cluster_id in mapping[job_id]:
+            clusters.setdefault(cluster_id, []).append(job_id)
+    payload = {
+        "clusters": dict(sorted(clusters.items(), key=lambda kv: int(kv[0][1:]))),
+        "unclustered": sorted(ja["job_id"] for _, ja in unclustered),
+    }
+    return f"{JOB_CLUSTERS_COMMENT_PREFIX}{json.dumps(payload, separators=(',', ':'))} -->"
+
+
+def attach_job_cluster_map(report: str, wf_analyses: dict[str, list[dict]]) -> str:
+    """Strip the agent's block, list unassigned jobs, and embed the map."""
+    report, agent_map = split_job_cluster_block(report)
+    mapping, unclustered = build_job_cluster_map(report, agent_map, wf_analyses)
+    analysed = sum(len(jas) for jas in wf_analyses.values())
+    log.info(
+        "Job->cluster map: %d/%d analysed job(s) assigned (agent block %s), %d unassigned",
+        analysed - len(unclustered), analysed,
+        "present" if agent_map is not None else "missing", len(unclustered),
+    )
+
+    report = report.rstrip()
+    comment = render_job_cluster_comment(mapping, unclustered)
+    room = ISSUE_BODY_SAFE_CHARS - len(report) - len(comment)
+    if unclustered and room > 500:
+        section = render_unclustered_section(
+            unclustered, min(UNCLUSTERED_SECTION_MAX_CHARS, room)
+        )
+        m = _HOW_GENERATED_RE.search(report)
+        if m:
+            report = f"{report[:m.start()]}{section}\n\n{report[m.start():]}"
+        else:
+            report = f"{report}\n\n{section}"
+    return f"{report}\n\n{comment}"
+
+
+# ---------------------------------------------------------------------------
 # Publishing
 # ---------------------------------------------------------------------------
 
-def render_summary_body(snapshot_utc: str, agent_text: str, used_agent: bool) -> str:
+def render_summary_body(
+    snapshot_utc: str,
+    agent_text: str,
+    used_agent: bool,
+    wf_analyses: dict[str, list[dict]] | None = None,
+) -> str:
     """Wrap the agent output with the marker + footer.
 
     Defends against two LLM output failure modes:
@@ -377,12 +619,17 @@ def render_summary_body(snapshot_utc: str, agent_text: str, used_agent: bool) ->
        drafting → critiquing → re-writing — with every draft retained in
        stdout. Discarded via ``_keep_last_section`` keyed on the
        ``# Daily Cross-Workflow Summary`` anchor, leaving only the last draft.
+
+    With *wf_analyses*, the agent's ``job-clusters`` block is replaced by
+    the hidden job -> cluster map (see ``attach_job_cluster_map``).
     """
     method = "Claude Code CLI" if used_agent else "Claude API"
     body = agent_text.strip()
     if body.startswith(SUMMARY_CONTENT_MARKER):
         body = body[len(SUMMARY_CONTENT_MARKER):].lstrip()
     body = _extract_report(body, _DAILY_SUMMARY_ANCHOR_RE)
+    if wf_analyses is not None:
+        body = attach_job_cluster_map(body, wf_analyses)
     return (
         f"{SUMMARY_CONTENT_MARKER}\n"
         f"{body}\n"
@@ -550,7 +797,7 @@ def build_and_publish_summary(
         log.error("Both agent and API failed; cannot publish summary")
         return None
 
-    body = render_summary_body(snapshot_utc, agent_text, used_agent)
+    body = render_summary_body(snapshot_utc, agent_text, used_agent, wf_analyses)
     try:
         return publish_summary(token, bot_repo, issue_num, body, date_str)
     except Exception as exc:

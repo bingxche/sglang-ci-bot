@@ -820,6 +820,22 @@ After all NEW + active clusters, render Known/stable clusters in a single collap
 - Every cluster MUST list ALL `(workflow, job, test_file, test_function)` rows — full granularity, no rolling-up at this layer.
 - Bot does NOT assign Priority; never use words like "P0", "P1", "Critical", "High Priority" in this report.
 - If you cannot identify a cluster ID for a failure (e.g. only one occurrence with no historical context), assign it a fresh ID and note `[unique]` in the Status line.
+- Name every cluster ID on its own in headings and `ID` cells: `### R239 · R240 · R241 · …`, never a range like `R239–R241` (a range hides the IDs in between from anything that reads the report).
+
+### Job → cluster map (REQUIRED)
+
+End your output with one fenced block, after the footer, that maps every cluster ID to the job IDs it covers:
+
+````
+```json job-clusters
+{"R25": [117742354635, 117742354706], "R209": [117742355001], "R268": [118301122334]}
+```
+````
+
+- Keys are cluster IDs; values are the numeric GitHub job IDs (the `**Job ID:**` of each per-job analysis, the same number as in `/job/<job_id>` links).
+- **Every job ID in `.ci-context/per-workflow-analyses.md` MUST appear under at least one cluster.** A failure that fits no cluster gets a fresh ID (`[unique]`), as above. Also include the job IDs you link from earlier runs (late legs of yesterday's run, Scout runs).
+- The harness strips this block from the rendered summary, so it does not count toward the length budget. It is the complete record of which job is in which cluster: when listing every leg in the tables would break the 200-line budget, the tables may summarise legs per cluster, but this block may not.
+- Any analysed job missing from the block (and from the report's own tables) is listed by the harness in a "⚠️ Not yet in a cluster" section, so an omission is visible rather than silent.
 
 ---
 
@@ -1257,6 +1273,8 @@ You are a CI/CD expert. Produce the **top-of-issue Daily Cross-Workflow Summary*
 - Every workflow listed in the prompt MUST appear in the Workflow status table, even if 0 failures.
 - Every cluster MUST list ALL `(workflow, job, test_file, test_function)` rows.
 - Every `Job (shard)` cell in the cluster tables MUST be a clickable link to the upstream sglang job page: `[<job_label>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`. Never use in-issue `#job-<id>` anchors here.
+- Name every cluster ID on its own (`R239 · R240 · R241`), never as a range (`R239–R241`).
+- After the footer, end with a ```` ```json job-clusters ```` block mapping each cluster ID to its numeric job IDs, e.g. `{{"R25": [117742354635], "R209": [117742355001]}}`. Every job ID in the per-job analyses above MUST appear under at least one cluster. The block is stripped before publishing and does not count toward the line budget.
 
 **Output format** (Markdown, ≤200 lines, use `<details>` for known/stable clusters and per-workflow drill-down):
 
