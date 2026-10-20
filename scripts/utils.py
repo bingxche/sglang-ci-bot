@@ -446,16 +446,34 @@ def miles_rows_for_job(payload: dict | None, job_id: int) -> list[dict]:
 
 
 def miles_job_image(rows: list[dict], job_id: int) -> dict:
-    """``{"image", "commits", "refs"}`` of the image ``job_id`` ran on."""
+    """``{"image", "commits", "refs", "forks"}`` of the image ``job_id`` ran on.
+
+    A manual build can take miles from a fork (``<owner>/miles``). The
+    dashboard files that commit under radixark/miles and names the fork in
+    ``forks``; payloads from before it did key the commit by the fork, which
+    is mapped back here so the checkout still finds it.
+    """
     for row in rows:
         for job in row.get("jobs", []):
-            if job.get("id") == job_id:
-                return {
-                    "image": job.get("image") or "",
-                    "commits": job.get("commits") or {},
-                    "refs": job.get("refs") or {},
-                }
-    return {"image": "", "commits": {}, "refs": {}}
+            if job.get("id") != job_id:
+                continue
+            commits = dict(job.get("commits") or {})
+            refs = dict(job.get("refs") or {})
+            forks = dict(job.get("forks") or {})
+            if MILES_REPO not in commits:
+                fork = next((k for k in commits if k.lower().endswith("/miles")), "")
+                if fork:
+                    commits[MILES_REPO] = commits.pop(fork)
+                    if fork in refs:
+                        refs[MILES_REPO] = refs.pop(fork)
+                    forks[MILES_REPO] = fork
+            return {
+                "image": job.get("image") or "",
+                "commits": commits,
+                "refs": refs,
+                "forks": forks,
+            }
+    return {"image": "", "commits": {}, "refs": {}, "forks": {}}
 
 
 def _md_link(text: str, url: str) -> str:
@@ -504,16 +522,26 @@ def render_miles_evidence(
         "",
     ]
     commits, refs = image.get("commits") or {}, image.get("refs") or {}
+    forks = image.get("forks") or {}
     lines.append(f"- Image: `{image['image']}`" if image.get("image") else "- Image: unknown")
     for repo, where in ((MILES_REPO, checkout.get("miles_src")), (REPO, checkout.get("sglang_src"))):
         sha = commits.get(repo)
         if not sha:
-            lines.append(f"- {repo}: unknown (the dashboard has not read this image's build log)")
+            lines.append(f"- {repo}: unknown (the dashboard has no {repo} commit for this image)")
             continue
-        ref = f" (branch `{refs[repo]}`)" if refs.get(repo) else ""
+        fork = forks.get(repo)
+        ref = f"branch `{refs[repo]}`" if refs.get(repo) else ""
+        ref = f" ({f'fork `{fork}`, ' if fork else ''}{ref})" if ref or fork else ""
         url = f"https://github.com/{repo}/commit/{sha}"
         place = f" — checked out at `{where}`" if where else " — NOT checked out"
         lines.append(f"- {repo}: [`{sha[:12]}`]({url}){ref}{place}")
+        if fork:
+            lines.append(
+                f"  - **Built from the fork `{fork}`, not from {repo} main** (a manual "
+                "build replaced that day's nightly image). The failure may come from "
+                "the fork's own commits; it is not a regression in "
+                f"{repo} until it reproduces on an image built from main."
+            )
     if payload is None:
         lines += [
             "",
@@ -558,9 +586,16 @@ def render_miles_evidence(
                 lines.append("  - commit range unknown: a build log of one side was not readable")
             for w in s.get("windows", []):
                 span = _md_link(f"{w['base'][:10]}...{w['head'][:10]}", w.get("url", ""))
+                built = "; ".join(
+                    f"{side} built from fork `{w[key]}`"
+                    for side, key in (("last pass", "base_fork"), ("failure", "head_fork"))
+                    if w.get(key)
+                )
                 lines.append(
                     f"  - {w['repo']}: {span} — {w.get('commits', '?')} commit(s) "
-                    f"(branch `{w.get('ref', '')}`)"
+                    f"(branch `{w.get('ref', '')}`"
+                    + (f"; {built}, so the range includes the fork's own commits" if built else "")
+                    + ")"
                 )
         causes, fixes = row.get("cause_prs") or [], row.get("fix_prs") or []
         lines.append("- Candidate causes (in the window, touch the test or traceback):")
@@ -598,8 +633,12 @@ def ensure_miles_repo() -> Path | None:
     return MILES_REPO_PATH
 
 
-def add_miles_worktree(dest: Path, sha: str) -> bool:
-    """Check radixark/miles out at ``sha`` into ``dest`` (a detached worktree)."""
+def add_miles_worktree(dest: Path, sha: str, fork: str = "") -> bool:
+    """Check radixark/miles out at ``sha`` into ``dest`` (a detached worktree).
+
+    GitHub serves a fork's commits through the parent repo, so ``origin`` is
+    tried first; ``fork`` (``<owner>/miles``) is the fallback.
+    """
     repo = ensure_miles_repo()
     if repo is None:
         return False
@@ -610,6 +649,8 @@ def add_miles_worktree(dest: Path, sha: str) -> bool:
 
         if git("cat-file", "-t", sha).returncode != 0:
             git("fetch", "origin", sha)
+        if git("cat-file", "-t", sha).returncode != 0 and fork:
+            git("fetch", f"https://github.com/{fork}.git", sha)
         if dest.exists():
             shutil.rmtree(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -680,7 +721,8 @@ def prepare_miles_context(job: dict, work_dir: Path, token: str | None = None) -
     context_dir.mkdir(parents=True, exist_ok=True)
 
     miles_sha = commits.get(MILES_REPO, "")
-    if miles_sha and add_miles_worktree(context_dir / "src", miles_sha):
+    miles_fork = (image.get("forks") or {}).get(MILES_REPO, "")
+    if miles_sha and add_miles_worktree(context_dir / "src", miles_sha, miles_fork):
         checkout["miles_src"] = ".ci-context/miles/src"
     elif miles_sha:
         _log.warning("Could not check out %s %s for job %s", MILES_REPO, miles_sha, job["id"])
@@ -697,6 +739,7 @@ def prepare_miles_context(job: dict, work_dir: Path, token: str | None = None) -
         "evidence": ".ci-context/miles/EVIDENCE.md",
         "image": image["image"],
         "miles_commit": miles_sha if checkout["miles_src"] else "",
+        "miles_fork": miles_fork,
         "sglang_commit": sglang_sha if checkout["sglang_src"] else "",
         **checkout,
     }
@@ -1247,7 +1290,9 @@ def analyze_job_with_agent(
             )
             miles = {}
         miles_src = (
-            f"{miles['miles_src']} ({MILES_REPO} @ {miles['miles_commit']})"
+            f"{miles['miles_src']} ({MILES_REPO} @ {miles['miles_commit']}"
+            + (f", built from the fork {miles['miles_fork']}" if miles.get("miles_fork") else "")
+            + ")"
             if miles.get("miles_src") else "unavailable (see the evidence file)"
         )
         sglang_src = (

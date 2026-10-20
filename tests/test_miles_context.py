@@ -101,8 +101,23 @@ class MilesWorkflowTests(unittest.TestCase):
         self.assertEqual(image["image"], "rocm/sgl-dev:miles-rocm10-mi35x-20261015")
         self.assertEqual(image["commits"]["radixark/miles"], MILES_SHA)
         self.assertEqual(image["refs"]["sgl-project/sglang"], "sglang-miles")
+        self.assertEqual(image["forks"], {})
         self.assertEqual(utils.miles_rows_for_job(None, JOB_ID), [])
         self.assertEqual(utils.miles_job_image([], JOB_ID)["commits"], {})
+
+    def test_a_fork_built_image_in_either_payload_shape(self):
+        # The dashboard files a fork's commit under radixark/miles and names
+        # the fork; payloads from before that keyed the commit by the fork.
+        current = {"id": JOB_ID, "commits": {"radixark/miles": MILES_SHA},
+                   "refs": {"radixark/miles": "amd/x"},
+                   "forks": {"radixark/miles": "michaelzhang-ai/miles"}}
+        older = {"id": JOB_ID, "commits": {"michaelzhang-ai/miles": MILES_SHA},
+                 "refs": {"michaelzhang-ai/miles": "amd/x"}}
+        for job in (current, older):
+            image = utils.miles_job_image([{"jobs": [job]}], JOB_ID)
+            self.assertEqual(image["commits"], {"radixark/miles": MILES_SHA})
+            self.assertEqual(image["refs"], {"radixark/miles": "amd/x"})
+            self.assertEqual(image["forks"], {"radixark/miles": "michaelzhang-ai/miles"})
 
 
 class EvidenceTests(unittest.TestCase):
@@ -127,12 +142,29 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("(strong, merged): changed train_one_step()", text)
         self.assertNotIn("other.py", text)  # another job's row
 
+    def test_evidence_flags_a_fork_built_image(self):
+        payload = _payload()
+        row = payload["rows"][0]
+        row["jobs"][0]["refs"]["radixark/miles"] = "amd/lazy-lora-build-test"
+        row["jobs"][0]["forks"] = {"radixark/miles": "michaelzhang-ai/miles"}
+        row["since"][0]["windows"][0]["head_fork"] = "michaelzhang-ai/miles"
+        rows = utils.miles_rows_for_job(payload, JOB_ID)
+        text = utils.render_miles_evidence(
+            self.JOB, rows, utils.miles_job_image(rows, JOB_ID),
+            {"miles_src": ".ci-context/miles/src", "sglang_src": "."}, payload,
+        )
+        self.assertIn(
+            "(fork `michaelzhang-ai/miles`, branch `amd/lazy-lora-build-test`)", text
+        )
+        self.assertIn("**Built from the fork `michaelzhang-ai/miles`, not from radixark/miles main**", text)
+        self.assertIn("failure built from fork `michaelzhang-ai/miles`, so the range includes", text)
+
     def test_evidence_says_what_is_missing(self):
         text = utils.render_miles_evidence(
             self.JOB, [], {"image": "", "commits": {}, "refs": {}}, {}, None,
         )
         self.assertIn("Image: unknown", text)
-        self.assertIn("radixark/miles: unknown", text)
+        self.assertIn("radixark/miles: unknown (the dashboard has no radixark/miles commit", text)
         self.assertIn("payload could not be fetched", text)
         text = utils.render_miles_evidence(
             self.JOB, [], {"image": "", "commits": {}, "refs": {}}, {}, {"rows": []},
@@ -196,6 +228,25 @@ class CheckoutTests(unittest.TestCase):
             self.assertTrue(utils.add_miles_worktree(dest, shas[1]))
         self.assertEqual((dest / "f.txt").read_text(), "1")
 
+    def test_miles_worktree_falls_back_to_the_fork(self):
+        upstream, _ = self._repo("upstream", 1)
+        fork = self.root / "owner" / "miles"
+        fork.parent.mkdir()
+        _git(self.root, "clone", "-q", str(upstream), str(fork))
+        (fork / "f.txt").write_text("fork only")
+        _git(fork, "commit", "-q", "-am", "fork commit")
+        fork_sha = _git(fork, "rev-parse", "HEAD")
+        _git(fork, "config", "uploadpack.allowAnySHA1InWant", "true")
+        cache = self.root / "cache"
+        _git(self.root, "clone", "-q", str(upstream), str(cache))
+        # Let the "https://github.com/<fork>.git" URL resolve to the local fork.
+        _git(cache, "config", f"url.{fork.as_uri()}.insteadOf",
+             "https://github.com/owner/miles.git")
+        dest = self.root / "wt" / "src"
+        with patch("utils.ensure_miles_repo", return_value=cache):
+            self.assertTrue(utils.add_miles_worktree(dest, fork_sha, "owner/miles"))
+        self.assertEqual((dest / "f.txt").read_text(), "fork only")
+
     def test_sglang_moves_to_an_abbreviated_commit_on_its_branch(self):
         origin, _ = self._repo("origin", 1)
         _git(origin, "checkout", "-q", "-b", "sglang-miles")
@@ -254,6 +305,26 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Miles evidence: .ci-context/miles/EVIDENCE.md", prompt)
         self.assertIn(f"Miles source: .ci-context/miles/src (radixark/miles @ {MILES_SHA})", prompt)
         self.assertIn("sglang source: current directory (sgl-project/sglang @ 7b6993a310", prompt)
+
+    def test_prompt_names_the_fork(self):
+        job = {"id": JOB_ID, "name": "test-miles-mi35x", "steps": []}
+        context = {
+            "evidence": ".ci-context/miles/EVIDENCE.md", "image": "i",
+            "miles_src": ".ci-context/miles/src", "miles_commit": MILES_SHA,
+            "miles_fork": "michaelzhang-ai/miles", "sglang_src": "", "sglang_commit": "",
+        }
+        with (
+            patch("utils.prepare_miles_context", return_value=context),
+            patch("utils.claude_code_analyze", return_value="x") as analyze,
+        ):
+            utils.analyze_job_with_agent(
+                job, "https://example.test/run", Path("."),
+                "nightly-test-amd-miles-rocm10.yml",
+            )
+        self.assertIn(
+            f"(radixark/miles @ {MILES_SHA}, built from the fork michaelzhang-ai/miles)",
+            analyze.call_args.kwargs["prompt"],
+        )
 
     def test_a_failed_context_still_runs_the_agent(self):
         job = {"id": JOB_ID, "name": "test-miles-mi35x", "steps": []}

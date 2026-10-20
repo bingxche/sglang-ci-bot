@@ -215,6 +215,16 @@ payload was unavailable: take the image tag from the log, find that day's
 successful run of the matching `release-docker-amd-miles-*-nightly.yml`
 (same ROCm track and GPU), and read the commits from its log lines above.
 
+**Images built from a fork.** A manual `workflow_dispatch` build can take
+miles from a fork (`Building from <owner>/miles@<branch> (<sha>)`), and its
+image replaces that day's nightly tag. The evidence file says so under
+**Code under test** and on the commit range. Its commit is checked out like
+any other: GitHub serves a fork's commits through radixark/miles, and the
+range then includes the fork's own commits. Name the fork and branch in
+Commit Info and in Regression Status. A failure first seen on a fork-built
+image is **not** a radixark/miles regression until it reproduces on an image
+built from main; say which of the fork's own commits could explain it.
+
 **Why.** Enumerate both windows: radixark/miles in `.ci-context/miles/src`,
 and sglang through the compare API on the image's sglang branch
 (`https://api.github.com/repos/sgl-project/sglang/compare/<base>...<head>`).
@@ -232,7 +242,7 @@ landed fix candidate; say whether the newest image already contains it.
 ```
 ### Commit Info
 - **image**: `rocm/sgl-dev:miles-rocm10-mi35x-20261015`
-- **radixark/miles**: [`<sha>`](https://github.com/radixark/miles/commit/<sha>) (branch `main`)
+- **radixark/miles**: [`<sha>`](https://github.com/radixark/miles/commit/<sha>) (branch `main`; for a fork build: fork `<owner>/miles`, branch `<branch>`)
 - **sglang**: [`<sha>`](https://github.com/sgl-project/sglang/commit/<sha>) (branch `sglang-miles`)
 - **workflow commit**: [`<head_sha>`](https://github.com/sgl-project/sglang/commit/<head_sha>) (where the workflow file came from; not tested)
 - **aiter**: per the rule below (`N/A` when the log has no `[CI-AITER-CHECK]` markers)
