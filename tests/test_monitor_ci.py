@@ -404,6 +404,28 @@ class JobReportOrderTests(unittest.TestCase):
             "unknown-job (rocm10)",
         ])
 
+    def test_pr_test_jobs_group_by_rocm_with_default_first(self):
+        names = [
+            "stage-a-test-1-gpu-small-amd (rocm720, linux-mi300-1gpu-sglang)",
+            "multimodal-gen-test-1-gpu-amd (rocm724, linux-mi300-1gpu-sglang, 0)",
+            "stage-a-test-1-gpu-small-amd (rocm724, linux-mi300-1gpu-sglang)",
+            "multimodal-gen-test-1-gpu-amd (rocm10, linux-mi300-1gpu-sglang, 0)",
+            "stage-c-test-large-8-gpu-amd-mi35x (rocm10, linux-mi35x-gpu-8, 2)",
+            "stage-b-test-1-gpu-small-amd (rocm720, linux-mi300-1gpu-sglang, 1)",
+        ]
+        jobs = [_analysis(i, "x", job_name=n) for i, n in enumerate(names)]
+
+        ordered = monitor_ci.sort_job_analyses("pr-test-amd.yml", jobs)
+
+        self.assertEqual([ja["job_name"] for ja in ordered], [
+            "stage-c-test-large-8-gpu-amd-mi35x (rocm10, linux-mi35x-gpu-8, 2)",
+            "multimodal-gen-test-1-gpu-amd (rocm10, linux-mi300-1gpu-sglang, 0)",
+            "stage-a-test-1-gpu-small-amd (rocm724, linux-mi300-1gpu-sglang)",
+            "multimodal-gen-test-1-gpu-amd (rocm724, linux-mi300-1gpu-sglang, 0)",
+            "stage-a-test-1-gpu-small-amd (rocm720, linux-mi300-1gpu-sglang)",
+            "stage-b-test-1-gpu-small-amd (rocm720, linux-mi300-1gpu-sglang, 1)",
+        ])
+
     def test_other_workflows_keep_their_order(self):
         jobs = [_analysis(1, "x", job_name="b"), _analysis(2, "x", job_name="a")]
         ordered = monitor_ci.sort_job_analyses("nightly-test-amd.yml", jobs)

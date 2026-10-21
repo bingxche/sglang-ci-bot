@@ -76,8 +76,13 @@ MONITORED_WORKFLOWS = [
     "amd-aiter-scout.yml",
 ]
 
-# Order of the jobs within a workflow's report, by job-name prefix. Jobs that
-# match no prefix come last; ties keep name order.
+# Order of the jobs within a workflow's report: first by the ROCm version in
+# the job name, then by job-name prefix. Versions and prefixes not listed come
+# last; ties keep name order. pr-test-amd.yml's default ``rocm_version``
+# (what PRs run) goes first, so update this when upstream changes it.
+ROCM_REPORT_ORDER = {
+    "pr-test-amd.yml": ["rocm10", "rocm724", "rocm720"],
+}
 JOB_REPORT_ORDER = {
     "pr-test-amd.yml": [
         ("stage-a-",),
@@ -640,14 +645,25 @@ def _natural_key(text: str) -> list:
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", text)]
 
 
-def sort_job_analyses(workflow_file: str, job_analyses: list[dict]) -> list[dict]:
-    """Order a workflow's jobs for its report per ``JOB_REPORT_ORDER``.
+_ROCM_IN_JOB_NAME_RE = re.compile(r"\((rocm\d+)\b")
 
-    Workflows without an entry keep their existing order.
+
+def sort_job_analyses(workflow_file: str, job_analyses: list[dict]) -> list[dict]:
+    """Order a workflow's jobs for its report.
+
+    Uses ``ROCM_REPORT_ORDER`` then ``JOB_REPORT_ORDER``. Workflows in
+    neither keep their existing order.
     """
-    order = JOB_REPORT_ORDER.get(workflow_file)
-    if not order:
+    rocm_order = ROCM_REPORT_ORDER.get(workflow_file, [])
+    order = JOB_REPORT_ORDER.get(workflow_file, [])
+    if not rocm_order and not order:
         return list(job_analyses)
+
+    def rocm_rank(name: str) -> int:
+        m = _ROCM_IN_JOB_NAME_RE.search(name)
+        if m and m.group(1) in rocm_order:
+            return rocm_order.index(m.group(1))
+        return len(rocm_order)
 
     def rank(name: str) -> int:
         for i, prefixes in enumerate(order):
@@ -658,6 +674,7 @@ def sort_job_analyses(workflow_file: str, job_analyses: list[dict]) -> list[dict
     return sorted(
         job_analyses,
         key=lambda ja: (
+            rocm_rank(ja["job_name"]),
             rank(ja["job_name"]),
             _natural_key(ja["job_name"]),
             ja.get("started_at") or "",

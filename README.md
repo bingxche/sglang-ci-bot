@@ -486,10 +486,13 @@ stray duplicates stay where they are. Because a body can move to another
 comment, `publish_workflow_report()` finds a workflow's comments by their
 markers on every run and never reuses a comment ID cached from an earlier run.
 
-Within the `pr-test-amd.yml` report, jobs are listed by stage
-(`JOB_REPORT_ORDER`): `stage-a`, `stage-b`, `stage-c`, the kernel jobs
-(`sgl-kernel-*`, `jit-kernel-*`), `multimodal-*`, then anything else.
-Other workflows keep the order their analyses finished in.
+Within the `pr-test-amd.yml` report, jobs are grouped by ROCm version
+(`ROCM_REPORT_ORDER`): the workflow's default `rocm_version` first, since
+that is what PRs run (currently `rocm10`), then `rocm724`, `rocm720`. Update
+the list when upstream changes the default. Inside each version, jobs are
+listed by stage (`JOB_REPORT_ORDER`): `stage-a`, `stage-b`, `stage-c`, the
+kernel jobs (`sgl-kernel-*`, `jit-kernel-*`), `multimodal-*`, then anything
+else. Other workflows keep the order their analyses finished in.
 
 The four Miles workflows test [radixark/miles](https://github.com/radixark/miles) in
 images built from radixark/miles and an sglang branch (`sglang-miles`). They are
