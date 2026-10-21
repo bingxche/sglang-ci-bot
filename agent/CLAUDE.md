@@ -873,6 +873,26 @@ End your output with one fenced block, after the footer, that maps every cluster
 - The harness strips this block from the rendered summary, so it does not count toward the length budget. It is the complete record of which job is in which cluster: when listing every leg in the tables would break the 200-line budget, the tables may summarise legs per cluster, but this block may not.
 - Any analysed job missing from the block (and from the report's own tables) is listed by the harness in a "⚠️ Not yet in a cluster" section, so an omission is visible rather than silent.
 
+### Suspect PRs (REQUIRED)
+
+After the `job-clusters` block, end with a second fenced block listing every cluster whose top hypothesis names a **merged sglang PR**:
+
+````
+```json suspect-prs
+[{"cluster": "R281", "pr": 42229, "sha": "956b9a24eecae92f935672224f8a9561135ebc2b", "confidence": "HIGH",
+  "evidence": "Imports _check/_hip_lib/_hipcc/_Kernel, which #45112 removed; every gfx950 FP8 block-scale model fails with that ImportError.",
+  "last_pass_sha": "<sha>", "first_fail_sha": "<sha>", "fix_pr": null, "related_prs": [45112]}]
+```
+````
+
+- One entry per (cluster, PR). Write `[]` when no cluster's top hypothesis names a merged sglang PR. Leave out aiter, Docker, and infrastructure causes.
+- `confidence` is the same label as the cluster's **Top hypothesis**. Do not raise it here.
+- `sha` is the commit the PR landed as on `main`. `last_pass_sha` / `first_fail_sha` are the sglang commits of the last completed run where the cluster's tests passed and the first completed run where they failed. Use `null` when you could not establish one. Verify every SHA as the Ground Rules require.
+- `fix_pr` is the open or merged sglang PR that fixes the cluster, if the In-flight Fix Check found one; else `null`.
+- `related_prs` lists other PRs the failure depends on, e.g. the PR that removed a symbol the suspect PR still imports.
+- `evidence` is one or two plain sentences a PR author can check: what fails and how it traces to their change. No `@`-mentions, no links to this bot repo or other internal pages, no priority words.
+- The harness strips this block from the summary. Separate code decides whether to comment on the PR (FACT/HIGH only, no fix PR, ≥2 failed jobs, commit verified to be between `last_pass_sha` and `first_fail_sha`), so state the confidence you actually have.
+
 ---
 
 ## Failure Tracker Data
@@ -1311,6 +1331,7 @@ You are a CI/CD expert. Produce the **top-of-issue Daily Cross-Workflow Summary*
 - Every `Job (shard)` cell in the cluster tables MUST be a clickable link to the upstream sglang job page: `[<job_label>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`. Never use in-issue `#job-<id>` anchors here.
 - Name every cluster ID on its own (`R239 · R240 · R241`), never as a range (`R239–R241`).
 - After the footer, end with a ```` ```json job-clusters ```` block mapping each cluster ID to its numeric job IDs, e.g. `{{"R25": [117742354635], "R209": [117742355001]}}`. Every job ID in the per-job analyses above MUST appear under at least one cluster. The block is stripped before publishing and does not count toward the line budget.
+- Then end with a ```` ```json suspect-prs ```` block: a list with one entry per cluster whose top hypothesis names a merged sglang PR, e.g. `[{{"cluster": "R281", "pr": 42229, "sha": "<sha>", "confidence": "HIGH", "evidence": "<one or two plain sentences>", "last_pass_sha": "<sha or null>", "first_fail_sha": "<sha or null>", "fix_pr": null, "related_prs": []}}]`, or `[]` if none. Use the same confidence as the cluster's top hypothesis, no `@`-mentions in `evidence`, and `null` for any SHA you could not establish.
 
 **Output format** (Markdown, ≤200 lines, use `<details>` for known/stable clusters and per-workflow drill-down):
 

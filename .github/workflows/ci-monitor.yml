@@ -172,6 +172,14 @@ jobs:
           BOT_REPO: ${{ github.repository }}
         run: python scripts/order_daily_comments.py
 
+      # dry-run unless the SUSPECT_PR_COMMENTS repository variable is "post".
+      - name: Comment on suspect PRs
+        continue-on-error: true
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          SUSPECT_PR_COMMENTS: ${{ vars.SUSPECT_PR_COMMENTS || 'dry-run' }}
+        run: python scripts/suspect_pr_comments.py --bot-repo ${{ github.repository }}
+
       - name: Update upstream Failure Trackers
         env:
           GH_PAT: ${{ secrets.GH_PAT }}

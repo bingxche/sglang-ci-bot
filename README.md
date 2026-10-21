@@ -15,6 +15,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 | Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` hourly | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 8, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. For `nightly-amd-mi355x-disagg.yml`, per-job analysis pre-downloads the run's `mi355x-*` artifacts and unpacks bundled prefill/decode/router logs into `.ci-context/mi355x-artifacts` before invoking the agent. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
 | Daily Cross-Workflow Summary | `daily_cross_workflow_summary.py` | Auto-invoked by each `monitor_ci.py` matrix job that produced new failures (gated by `BUILD_DAILY_SUMMARY` env, default enabled); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling **Daily Cross-Workflow Summary** **pinned in the daily issue's body** (above all per-workflow comments) between `<!-- daily-cross-workflow-summary:start -->` / `<!-- daily-cross-workflow-summary:end -->` placeholder markers. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes the issue body in place, replacing only the content between the placeholders (matching the legacy `ci-monitor-daily-status-board` markers too, so older issues migrate in place). Legacy summary *comments* from before this move are auto-deleted by `_cleanup_legacy_summary_comments`. |
 | Failure Trackers (per workflow) | `failure_tracker.py` | A `finalize` job in `ci-monitor.yml` (`needs: monitor`), once per hourly tick after the whole matrix completes | Maintains **one long-lived issue per tracked workflow on the upstream `sgl-project/sglang` repo** (`[Failure Tracker] <workflow>`), each a persistent fact record of every test failure that workflow has shown — one unified, transparent place to see every AMD CI failure and how long it has been red. **Content** (which tests failed, error, cluster, regression status) is found by a small, dedicated agent task (`Task: Failure Tracker Data`) reading the SAME per-job analyses the daily report is built from — kept consistent with the daily report, and decoupled from the giant Daily Cross-Workflow Summary prose (the earlier "append JSON to the summary output" approach was observed to silently drop the block). A deterministic fallback parses the per-job `### Failed Tests` tables if the agent is unavailable. **State** (each failure's `first_seen` date, duration, dedup-by-test) is owned by deterministic Python — a hidden JSON blob in the issue body, NEVER recomputed — so a test red for months keeps an accurate "Broken since" date independent of the daily report's short lookback or GitHub's log retention. Config-driven via `TRACKED_WORKFLOWS`: add a workflow → it gets its own ledger issue. |
+| Suspect PR comments | `suspect_pr_comments.py` | The `finalize` job in `ci-monitor.yml`, once per hourly tick | Reads the suspect PRs the Daily Cross-Workflow Summary names for each cluster, checks them in code (FACT/HIGH confidence, no fix PR, ≥2 failed jobs, PR merged in the last 14 days, commit verified between the last passing and first failing commit), and comments on the merged sglang PR. **Dry run by default**: records what it would post in one comment on the daily issue until the `SUSPECT_PR_COMMENTS` repository variable is set to `post`. See [Suspect PR comments](#suspect-pr-comments). |
 | Notion Staging (daily) | `stage_notion.py` | Independent `notion-staging.yml` schedule at **20:00 Asia/Shanghai daily**; manual `dry-run` / `write` | Uses the existing Claude Code agent to canonicalize failures from recent Daily Reports, then applies a deterministic two-completed-run/no-later-pass gate. Analysis and writing are separate steps: the agent never receives Notion credentials. The sync phase reads the official and isolated staging data sources, skips known/staged matches, appends only new rows to `SGLang AMD CI Staging Errors` with a blank `Status`, and verifies both the new pages and that the official data source is unchanged. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
@@ -134,7 +135,7 @@ runner-1 entrypoint.sh (sleep 3600) ─┐
 
 **Why a `prepare` step?** Without it, multiple matrix jobs racing `find_or_create_daily_issue()` would create duplicate issues for the same day. `ensure_daily_issue.py` runs once before fan-out so the issue (and its `:start`/`:end` placeholder block) exists by the time the matrix fires.
 
-After the matrix completes, `finalize` puts the daily issue's report comments in priority order (`order_daily_comments.py`, see [Report order](#report-order)) and always refreshes the Failure Trackers. Notion staging runs in its own `notion-staging.yml` workflow, so the hourly monitor has no staging steps and keeps its original execution sequence.
+After the matrix completes, `finalize` puts the daily issue's report comments in priority order (`order_daily_comments.py`, see [Report order](#report-order)), checks the summary's suspect PRs (`suspect_pr_comments.py`, see [Suspect PR comments](#suspect-pr-comments)), and always refreshes the Failure Trackers. Notion staging runs in its own `notion-staging.yml` workflow, so the hourly monitor has no staging steps and keeps its original execution sequence.
 
 ### Loop 2 — PR command dispatch (continuous, two redundant paths)
 
@@ -322,6 +323,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 | Variable | Value |
 |----------|-------|
 | `USE_AGENT` | `true` to enable agent mode in workflow-triggered reviews and CI checks |
+| `SUSPECT_PR_COMMENTS` | `dry-run` (default when unset), `post`, or `off`. See [Suspect PR comments](#suspect-pr-comments). |
 
 ### Deploy self-hosted runners
 
@@ -533,7 +535,7 @@ Each workflow report includes the sglang commit (`head_sha`) in the header, and 
 | `pr-review.yml` | Per comment ID | Duplicate dispatches cancelled |
 | `ci-status-check.yml` | Per comment ID | Duplicate dispatches cancelled |
 | `comment-watcher.yml` | Single instance | One watcher at a time |
-| `ci-monitor.yml` | Single instance at workflow level (`group: ci-monitor`); inside each dispatch, `prepare` job runs once → `monitor` matrix (max-parallel 8, one per workflow file) → `finalize` job runs once (`needs: monitor`, `if: always()`) | Only one monitor *dispatch* runs at a time; within it, the prepare step seeds the daily issue once, then up to 8 per-workflow analyses run in parallel (each producing failures independently rebuilds the Daily Cross-Workflow Summary — last writer wins, convergent). After all matrix jobs finish, the single `finalize` job updates the upstream per-workflow Failure Trackers (`failure_tracker.py`) once, seeing the fully-populated daily issue. |
+| `ci-monitor.yml` | Single instance at workflow level (`group: ci-monitor`); inside each dispatch, `prepare` job runs once → `monitor` matrix (max-parallel 8, one per workflow file) → `finalize` job runs once (`needs: monitor`, `if: always()`) | Only one monitor *dispatch* runs at a time; within it, the prepare step seeds the daily issue once, then up to 8 per-workflow analyses run in parallel (each producing failures independently rebuilds the Daily Cross-Workflow Summary — last writer wins, convergent). After all matrix jobs finish, the single `finalize` job checks the suspect PRs (`suspect_pr_comments.py`) and updates the upstream per-workflow Failure Trackers (`failure_tracker.py`) once, seeing the fully-populated daily issue. |
 | `analyze-ci.yml` | Per run ID | Independent analyses run concurrently |
 
 The comment watcher uses **reaction-based idempotency**: before dispatching, it checks if amd-bot has already added a `rocket` reaction to the comment. Both daemon and cron watcher share this mechanism, so running both simultaneously is safe.
@@ -666,6 +668,44 @@ Legacy summary *comments* from the pre-body code path (carrying the older `<!-- 
 If no daily issue exists yet for the date, or if no per-workflow comments have been posted, the script logs and exits cleanly without creating an empty summary.
 
 Methodology and output format live in `agent/CLAUDE.md` under `## Daily Cross-Workflow Summary`. The Python script is a data-only harness.
+
+The agent ends the report with two fenced JSON blocks that the script strips before publishing: `job-clusters` (cluster → job IDs, kept as the hidden `<!-- ci-monitor-job-clusters:v1 … -->` comment) and `suspect-prs` (per cluster, the merged sglang PR its top hypothesis names, with confidence and the last-passing / first-failing commits). Valid `suspect-prs` entries are kept as the hidden `<!-- ci-monitor-suspect-prs:v1 … -->` comment for `suspect_pr_comments.py`. If the agent leaves the block out, no PR gets a comment.
+
+### Suspect PR comments
+
+When the daily summary attributes a cluster to a merged sglang PR, `suspect_pr_comments.py` (run once per tick by the `finalize` job) can tell the PR's author on the PR. The agent only names the suspect; whether to comment is decided in code. A suspect is commented on only if all of these hold, checked in this order:
+
+1. Confidence is `FACT` or `HIGH`.
+2. No fix PR is linked for the cluster.
+3. The cluster has at least 2 failed jobs in today's job → cluster map.
+4. The agent gave both the last passing and the first failing commit.
+5. The PR is merged, within the last 14 days, and the cited commit is the PR's (its merge commit, or GitHub lists the PR for that commit).
+6. The compare API puts the commit after the last passing commit and at or before the first failing commit.
+7. The PR has no earlier comment carrying the same `<!-- amd-bot-suspect-pr:<cluster> -->` marker, so a cluster is reported once per PR, however many days it stays red.
+
+At most 3 comments are posted per tick, strongest confidence and most failed jobs first. The comment says what fails and why the PR is suspected, gives the commit window and up to 8 failing job links, and asks the author to say so if the PR is not the cause. It has no `@`-mentions (any in the agent's evidence are put in code spans) and no links to this repo.
+
+Every tick also writes one comment on the daily issue (marker `<!-- ci-monitor-suspect-pr-log -->`, edited in place) with a row per suspect: would comment / commented / already commented / skipped and why. In dry-run mode it includes the full text of each comment that would be posted.
+
+| `SUSPECT_PR_COMMENTS` | Behavior |
+|---|---|
+| `dry-run` (default) | Nothing is posted upstream; only the daily-issue log comment is written |
+| `post` | Comments are posted on sglang PRs as amd-bot |
+| `off` | The step does nothing |
+
+Set it as a repository variable (Settings > Secrets and variables > Actions > Variables); the workflow defaults to `dry-run` when it is unset. The step is `continue-on-error`, so it cannot hold back the Failure Trackers.
+
+```bash
+python scripts/suspect_pr_comments.py --bot-repo bingxche/sglang-ci-bot               # SUSPECT_PR_COMMENTS or dry-run
+python scripts/suspect_pr_comments.py --bot-repo bingxche/sglang-ci-bot --mode dry-run --date 2026-10-21
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bot-repo` | required | Bot repo hosting the daily issue |
+| `--date` | today (UTC) | Daily issue date `YYYY-MM-DD` to read suspects from |
+| `--mode` | `SUSPECT_PR_COMMENTS` or `dry-run` | `off` / `dry-run` / `post` |
+| `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token (posts as amd-bot in production) |
 
 ### Failure Trackers (per workflow)
 
@@ -884,7 +924,8 @@ sglang-ci-bot/
                               - Cross-Job Summary (one workflow's many jobs, grouped by cluster)
                               - Cross-Run Pattern Analysis (one workflow across runs)
                               - Daily Cross-Workflow Summary (rendered into the daily
-                                  issue body between :start --> / :end --> placeholders)
+                                  issue body between :start --> / :end --> placeholders;
+                                  ends with job-clusters and suspect-prs JSON blocks)
                               - SGLang AMD CI Staging Candidates (strict JSON for
                                   the isolated Notion staging gate)
                               - PR CI Status Check methodology + output format
@@ -968,6 +1009,11 @@ sglang-ci-bot/
     order_daily_comments.py Rewrites the daily issue's report comments into
                               MONITORED_WORKFLOWS (priority) order. Run once
                               per tick by ci-monitor.yml's `finalize` job.
+    suspect_pr_comments.py  Checks the summary's suspect PRs in code and
+                              comments on the merged sglang PR (dry run by
+                              default; SUSPECT_PR_COMMENTS=post to post). Logs
+                              every decision in one daily-issue comment. Run
+                              once per tick by the `finalize` job.
     analyze_url.py          On-demand analysis of a run/job URL
     check_ci_for_pr.py      PR CI status checker
     ci_evidence.py          Evidence pack for PR CI status (runs, failed-job facts,
@@ -987,7 +1033,8 @@ sglang-ci-bot/
                               ensure_daily_issue.py) → monitor matrix job
                               (max-parallel 8, one entry per workflow file
                               from MONITORED_WORKFLOWS) → finalize job
-                              (order_daily_comments.py, failure_tracker.py).
+                              (order_daily_comments.py, suspect_pr_comments.py,
+                              failure_tracker.py).
     notion-staging.yml      Independent daily Notion staging workflow. GitHub
                               schedules it for 12:00 UTC / 20:00 Asia/Shanghai;
                               scheduled runs write, while manual runs offer
@@ -1014,6 +1061,9 @@ sglang-ci-bot/
     test_ci_verdicts.py     Tests for the verdict check, report annotation, and
                               agent env / session archive.
     test_eval_ci_status.py  Tests for ci-status eval scoring.
+    test_suspect_pr_comments.py
+                            Tests for the suspect-prs block round trip, each
+                              comment check, rendering, and the per-tick cap.
   evals/ci_status/cases/    Hand-labeled ci-status cases (PR head, as-of time,
                               truth + basis per failure; "proposed" until a
                               reviewer confirms)
@@ -1048,6 +1098,7 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py'
 | `DAILY_SUMMARY_TIMEOUT_SECS` | `daily_cross_workflow_summary.py` | Agent timeout for the cross-workflow synthesis (default: `1200` = 20 min) |
 | `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Max turns for the `Task: Failure Tracker Data` extraction agent (default: `80`) |
 | `TRACKER_AGENT_TIMEOUT_SECS` | `failure_tracker.py` | Agent timeout for the Failure Tracker extraction (default: `900` = 15 min) |
+| `SUSPECT_PR_COMMENTS` | `suspect_pr_comments.py` | `dry-run` (default), `post`, or `off`; same as `--mode`. Set from the repository variable of the same name in `ci-monitor.yml`. |
 | `STAGING_AGENT_MAX_TURNS` | `stage_notion.py analyze` | Max turns for the machine-readable staging-candidate agent (default: `120`) |
 | `STAGING_AGENT_TIMEOUT_SECS` | `stage_notion.py analyze` | Timeout for the staging-candidate agent (default: `1200` = 20 min) |
 | `NOTION_TOKEN` | `stage_notion.py sync` | Single Notion token with Read + Insert but no Update capability, shared only with the official and isolated staging databases; never present in the agent step |
