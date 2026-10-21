@@ -363,18 +363,193 @@ class WorkflowConfigurationTests(unittest.TestCase):
             matrix_defaults.append(line.strip())
 
         expected = [
-            "nightly-test-amd.yml",
             "release-docker-amd-rocm720-nightly.yml",
-            "nightly-amd-mi355x-disagg.yml",
-            "amd-aiter-scout.yml",
-            "pr-test-amd.yml",
-            "nightly-test-amd-miles-rocm10.yml",
-            "nightly-test-amd-miles-rocm10-mi30x.yml",
             "release-docker-amd-miles-rocm10-nightly.yml",
             "release-docker-amd-miles-rocm724-nightly.yml",
+            "pr-test-amd.yml",
+            "nightly-test-amd.yml",
+            "nightly-amd-mi355x-disagg.yml",
+            "nightly-test-amd-miles-rocm10.yml",
+            "nightly-test-amd-miles-rocm10-mi30x.yml",
+            "amd-aiter-scout.yml",
         ]
         self.assertEqual(monitor_ci.MONITORED_WORKFLOWS, expected)
         self.assertEqual(matrix_defaults, expected)
+
+
+class JobReportOrderTests(unittest.TestCase):
+    def test_pr_test_jobs_follow_stage_order(self):
+        names = [
+            "multimodal-gen-test-1-gpu-amd (rocm10, linux-mi300-1gpu-sglang, 0)",
+            "stage-c-test-large-8-gpu-amd (rocm10, linux-mi300-8gpu-sglang, 2)",
+            "unknown-job (rocm10)",
+            "jit-kernel-unit-test-amd (rocm10, linux-mi300-1gpu-sglang)",
+            "stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 10)",
+            "stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 2)",
+            "sgl-kernel-unit-test-amd (rocm10, linux-mi300-1gpu-sglang)",
+            "stage-a-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang)",
+        ]
+        jobs = [_analysis(i, "x", job_name=n) for i, n in enumerate(names)]
+
+        ordered = monitor_ci.sort_job_analyses("pr-test-amd.yml", jobs)
+
+        self.assertEqual([ja["job_name"] for ja in ordered], [
+            "stage-a-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang)",
+            "stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 2)",
+            "stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 10)",
+            "stage-c-test-large-8-gpu-amd (rocm10, linux-mi300-8gpu-sglang, 2)",
+            "jit-kernel-unit-test-amd (rocm10, linux-mi300-1gpu-sglang)",
+            "sgl-kernel-unit-test-amd (rocm10, linux-mi300-1gpu-sglang)",
+            "multimodal-gen-test-1-gpu-amd (rocm10, linux-mi300-1gpu-sglang, 0)",
+            "unknown-job (rocm10)",
+        ])
+
+    def test_other_workflows_keep_their_order(self):
+        jobs = [_analysis(1, "x", job_name="b"), _analysis(2, "x", job_name="a")]
+        ordered = monitor_ci.sort_job_analyses("nightly-test-amd.yml", jobs)
+        self.assertEqual([ja["job_id"] for ja in ordered], [1, 2])
+
+    def test_rendered_pr_test_report_lists_stage_a_first(self):
+        jobs = [
+            _analysis(1, "x", job_name="multimodal-gen-test-1-gpu-amd (rocm10)"),
+            _analysis(2, "x", job_name="stage-a-test-1-gpu-small-amd (rocm10)"),
+        ]
+        body = monitor_ci.render_workflow_comment("pr-test-amd.yml", jobs)
+        self.assertLess(
+            body.index("stage-a-test-1-gpu-small-amd"),
+            body.index("multimodal-gen-test-1-gpu-amd"),
+        )
+
+
+def _report_comment(cid: int, wf: str, part: int = 1, total: int = 1) -> dict:
+    return {
+        "id": cid,
+        "body": f"<!-- processed_job_ids: {cid} -->\n"
+                f"<!-- ci-monitor-part: {part}/{total} -->\n"
+                f"## `{wf}` — part {part}\n",
+    }
+
+
+def _cross_run_comment(cid: int, wf: str) -> dict:
+    return {
+        "id": cid,
+        "body": monitor_ci.CROSS_RUN_MARKER_TMPL.format(wf=wf)
+        + f"\n## `{wf}` — Cross-Run Pattern Summary\n",
+    }
+
+
+class CommentOrderTests(unittest.TestCase):
+    def test_reports_are_rewritten_into_priority_order(self):
+        miles = _report_comment(10, "nightly-test-amd-miles-rocm10.yml")
+        nightly = _report_comment(11, "nightly-test-amd.yml")
+        human = {"id": 12, "body": "looking at R281"}
+        pr1 = _report_comment(13, "pr-test-amd.yml", 1, 2)
+        pr_cross = _cross_run_comment(14, "pr-test-amd.yml")
+        pr2 = _report_comment(15, "pr-test-amd.yml", 2, 2)
+        docker = _report_comment(16, "release-docker-amd-rocm720-nightly.yml")
+
+        edits = monitor_ci.plan_comment_order(
+            [miles, nightly, human, pr1, pr_cross, pr2, docker]
+        )
+
+        layout = {c["id"]: c["body"] for c in (miles, nightly, human, pr1, pr_cross, pr2, docker)}
+        layout.update(dict(edits))
+        self.assertEqual([layout[i] for i in sorted(layout)], [
+            docker["body"], pr1["body"], human["body"], pr2["body"],
+            pr_cross["body"], nightly["body"], miles["body"],
+        ])
+        self.assertNotIn(12, dict(edits))
+
+    def test_ordered_issue_needs_no_edits(self):
+        comments = [
+            _report_comment(1, "pr-test-amd.yml"),
+            _cross_run_comment(2, "pr-test-amd.yml"),
+            _report_comment(3, "nightly-test-amd.yml"),
+            {"id": 4, "body": "human reply"},
+            _report_comment(5, "amd-aiter-scout.yml"),
+        ]
+        self.assertEqual(monitor_ci.plan_comment_order(comments), [])
+
+    @patch.object(monitor_ci.time, "sleep")
+    @patch.object(monitor_ci, "update_comment")
+    @patch.object(monitor_ci, "get_issue_comments")
+    def test_order_workflow_comments_applies_the_plan(self, get_comments, update, _sleep):
+        get_comments.return_value = [
+            _report_comment(1, "nightly-test-amd.yml"),
+            _report_comment(2, "pr-test-amd.yml"),
+        ]
+        edited = monitor_ci.order_workflow_comments("token", "owner/bot", 7)
+        self.assertEqual(edited, 2)
+        self.assertEqual(
+            [c.args[2] for c in update.call_args_list], [1, 2],
+        )
+        self.assertIn("pr-test-amd.yml", update.call_args_list[0].args[3])
+
+
+class PublishAfterReorderTests(unittest.TestCase):
+    @patch.object(monitor_ci, "maybe_publish_cross_run_summary")
+    @patch.object(monitor_ci, "post_comment", return_value={"id": 99})
+    @patch.object(monitor_ci, "update_comment")
+    def test_cached_id_is_not_reused_when_comment_holds_other_report(
+        self, update, post, _cross,
+    ):
+        today = "2026-10-21"
+        state = {"daily_comments": {today: {"issue_number": 7, "workflows": {
+            "pr-test-amd.yml": {"comment_id": 1, "owned": True, "overflow_ids": [],
+                                "job_analyses": []},
+        }}}}
+        # Comment 1 was rewritten by order_workflow_comments to another report.
+        comments = [_report_comment(1, "release-docker-amd-rocm720-nightly.yml")]
+
+        monitor_ci.publish_workflow_report(
+            "token", "owner/bot", "pr-test-amd.yml",
+            [_analysis(5, "fresh", job_name="stage-a-test")], [], state,
+            gh_comments=comments, use_agent=False, date_str=today,
+        )
+
+        update.assert_not_called()
+        post.assert_called_once()
+        wf_state = state["daily_comments"][today]["workflows"]["pr-test-amd.yml"]
+        self.assertEqual(wf_state["comment_id"], 99)
+        self.assertNotIn("unpublished", wf_state)
+
+    @patch.object(monitor_ci, "post_comment")
+    @patch.object(monitor_ci, "get_issue_comments", side_effect=monitor_ci.requests.HTTPError("502"))
+    def test_failed_comment_fetch_keeps_analyses_for_next_run(self, _get, post):
+        today = "2026-10-21"
+        state = {"daily_comments": {today: {"issue_number": 7, "workflows": {}}}}
+
+        with self.assertRaises(monitor_ci.requests.HTTPError):
+            monitor_ci.publish_workflow_report(
+                "token", "owner/bot", "pr-test-amd.yml",
+                [_analysis(5, "fresh")], [], state,
+                gh_comments=None, use_agent=False, date_str=today,
+            )
+
+        post.assert_not_called()
+        wf_state = state["daily_comments"][today]["workflows"]["pr-test-amd.yml"]
+        self.assertTrue(wf_state["unpublished"])
+        self.assertEqual([ja["job_id"] for ja in wf_state["job_analyses"]], [5])
+
+
+class IssueCommentPaginationTests(unittest.TestCase):
+    @patch.object(monitor_ci.requests, "get")
+    def test_reads_every_page(self, get):
+        pages = [
+            [{"id": i} for i in range(100)],
+            [{"id": i} for i in range(100, 130)],
+        ]
+        responses = []
+        for page in pages:
+            resp = Mock()
+            resp.json.return_value = page
+            responses.append(resp)
+        get.side_effect = responses
+
+        comments = monitor_ci.get_issue_comments("token", "owner/bot", 7)
+
+        self.assertEqual(len(comments), 130)
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["page"], 2)
 
 
 class RunOneshotReuseTests(unittest.TestCase):
