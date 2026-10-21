@@ -363,7 +363,9 @@ class WorkflowConfigurationTests(unittest.TestCase):
             matrix_defaults.append(line.strip())
 
         expected = [
+            "release-docker-amd-rocm10.yml",
             "release-docker-amd-rocm720-nightly.yml",
+            "release-docker-amd-gfx1151-nightly.yml",
             "release-docker-amd-miles-rocm10-nightly.yml",
             "release-docker-amd-miles-rocm724-nightly.yml",
             "pr-test-amd.yml",

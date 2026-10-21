@@ -63,7 +63,9 @@ log = logging.getLogger("ci-monitor")
 # daily issue (see order_workflow_comments): Docker image builds, PR test,
 # nightly, disagg, Miles, then AITER Scout.
 MONITORED_WORKFLOWS = [
+    "release-docker-amd-rocm10.yml",
     "release-docker-amd-rocm720-nightly.yml",
+    "release-docker-amd-gfx1151-nightly.yml",
     "release-docker-amd-miles-rocm10-nightly.yml",
     "release-docker-amd-miles-rocm724-nightly.yml",
     "pr-test-amd.yml",

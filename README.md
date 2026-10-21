@@ -462,7 +462,9 @@ docker logs -f amd-ci-bot-runner-1    # watcher + CI monitor active
 Configured in `MONITORED_WORKFLOWS` in `monitor_ci.py`:
 
 ```
+release-docker-amd-rocm10.yml
 release-docker-amd-rocm720-nightly.yml
+release-docker-amd-gfx1151-nightly.yml
 release-docker-amd-miles-rocm10-nightly.yml
 release-docker-amd-miles-rocm724-nightly.yml
 pr-test-amd.yml
@@ -506,7 +508,11 @@ the unified `nightly-test-amd.yml` and `pr-test-amd.yml` runs. The workflow
 files `nightly-test-amd-rocm720.yml`, `pr-test-amd-rocm720.yml`, and
 `release-docker-amd-nightly.yml` are retired from the upstream default branch
 and therefore are not dispatched by the monitor.
-`release-docker-amd-rocm720-nightly.yml` remains active and monitored; the
+`release-docker-amd-rocm10.yml` (the ROCm 10 nightly image build, daily at
+12:00 UTC), `release-docker-amd-rocm720-nightly.yml` and
+`release-docker-amd-gfx1151-nightly.yml` (daily at 14:00 UTC) are active and
+monitored. `amd-ci-job-monitor.yml` is also scheduled on AMD runners but is
+CI housekeeping, not a build or test, so it is not monitored. The
 unified `release-docker-amd.yml` is tag/manual-only and has no scheduled runs,
 so it is not part of this schedule-only monitor. Run job listings are fetched
 across every GitHub API page, so unified runs with more than 100 jobs are fully
