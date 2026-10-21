@@ -44,12 +44,18 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
   - sglang PR `#<num>` → `` [#<num>](https://github.com/sgl-project/sglang/pull/<num>) ``
   - aiter PR `#<num>` → `` [#<num>](https://github.com/ROCm/aiter/pull/<num>) ``
   - Workflow run `<run_id>` → `` [<run_id>](https://github.com/sgl-project/sglang/actions/runs/<run_id>) ``
-  - Workflow job `<job_id>` in run `<run_id>` → `` [<short label>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) ``
+  - Workflow job `<job_id>` in run `<run_id>` → `` [`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) `` (see **Job names** below for `<job label>`)
   - Log line: `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>#step:<step>:<line>`
   - radixark/miles commit `<sha>` → `` [`<sha>`](https://github.com/radixark/miles/commit/<sha>) ``
   - radixark/miles PR `#<num>` → `` [radixark/miles#<num>](https://github.com/radixark/miles/pull/<num>) `` (always repo-qualified, so it is never read as an sglang PR)
 
   When a PR number appears inside a commit message you are citing (e.g. `Revert "fix(car): graph capture err (#2638)"`), you MUST also turn that PR number into a link to the correct repo (aiter PR if the commit is an aiter commit, sglang PR if it's an sglang commit). Never leave `#<num>` as plain text in a report.
+- **Job names (REQUIRED).** Write every job the same way, everywhere in a report (prose, tables, TL;DR), so a reader can search the page for a job and find all of it:
+  - The **job label** is the job's name as GitHub shows it, minus the runner label and minus a reusable-workflow caller prefix: `nightly-8-gpu-mi35x-deepseek-v4-pro (rocm10, linux-mi35x-gpu-8)` → `nightly-8-gpu-mi35x-deepseek-v4-pro (rocm10)`; `Nightly AMD (all ROCm versions) / nightly-test-1-gpu-kernel (rocm720, linux-mi300-1gpu-sglang)` → `nightly-test-1-gpu-kernel (rocm720)`; `stage-b-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang, 11)` → `stage-b-test-1-gpu-small-amd (rocm10, 11)`. Keep every other matrix value, in GitHub's order.
+  - Always in backticks, and linked to the job page when one job is meant: `` [`nightly-test-1-gpu-kernel (rocm720)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) ``.
+  - Several legs of one job: the job name once, in backticks, then one link per leg labelled with its matrix values: `` `nightly-8-gpu-mi35x-deepseek-v4-pro` [rocm10](…/job/<id>) · [rocm720](…/job/<id>) · [rocm724](…/job/<id>) ``; `` `stage-b-test-1-gpu-small-amd-mi35x (rocm10)` [0](…/job/<id>) · [1](…/job/<id>) ``. A different job in the same cell starts again with its own backticked name.
+  - Never shorten or nickname a job (`v4-pro`, `r1-hicache`, `mmgen-1-gpu`, `mi35x small`, `2n: flash-fp4`, `-mtp`), and never label a job link with only a lane, a shard or a run label (`720`, `(1)`, `H (1)`, `N21 724`). Run labels (`N21`, `M`, `ML30b`) belong in the Workflow column or the surrounding prose, not in the job's link text.
+- **Name the suspected change first (REQUIRED).** When a hypothesis blames a change, open the hypothesis with it, the PR and its commit side by side, before the explanation: `` `[HIGH]` [#45112](https://github.com/sgl-project/sglang/pull/45112) ([`693d3333`](https://github.com/sgl-project/sglang/commit/693d3333)) moved the helpers that … `` (`` [radixark/miles#4053](…) ([`2766ab0ac1`](…)) `` for Miles). A hypothesis that blames two changes names both up front. Do not cite the change only inside its quoted commit title, or after two sentences of mechanism. A hypothesis that blames no change (flaky, infrastructure, never-passed, threshold) links no PR in its first sentence, and a change you are ruling out goes under **Disconfirming**, never in the hypothesis itself. The dashboards read the first PR/commit pair of the top hypothesis as the suspected cause.
 - **Your final message MUST be plain text only.** Do NOT call any tools (including TodoWrite) in the same turn as your final report. The report text must be the very last thing you output, with no tool calls alongside it. If you need to update todos, do it in a prior turn before writing the report.
 - **Your report MUST start directly with its first heading or `**Counts**:` line — no preamble.** Do NOT prefix the report with "thinking aloud" prose like "Now I have all the data, let me compose the final report." or "Let me extract the failure clusters first." Such prose belongs in earlier turns (or nowhere at all). The harness will programmatically strip everything before the first markdown heading, so any preamble you emit is wasted tokens AND risks corrupting the rendered output if the strip fails. Concrete examples of the required first line per report type:
   - Per-job Job Failure Analysis → `### Commit Info`
@@ -459,7 +465,7 @@ For each candidate cause, provide:
   - **How to verify**: concrete next step (bisect, revert + rerun, local repro command)
 
 Example:
-- `[MEDIUM]` Commit [`6760c790b`](url) modifies `radix_attention.py:127` (`out_cache_loc` slicing)
+- `[MEDIUM]` [#23001](url) ([`6760c790b`](url)) modifies `radix_attention.py:127` (`out_cache_loc` slicing)
   - **Supporting**: lands in regression window 2026-04-14; the modified line appears in the failing stack trace
   - **Disconfirming**: `test_lora_load_from_tensor` was Never-passed before this commit too, so this commit cannot fully explain that test
   - **How to verify**: `git revert 6760c790b` on a branch, run `test_llada2_mini_amd.py` on AMD MI325 in container `amd-bot-runner`
@@ -642,10 +648,10 @@ The `#` column is the 1-based row index in this SORTED order. Bot does NOT assig
 
 The `Job` cell MUST be a clickable markdown link to the **actual sglang workflow job page** on github.com — not an in-issue anchor — so that one click takes the maintainer straight to the failing CI log:
 ```
-[<job_name>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)
+[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)
 ```
-where `<run_id>` and `<job_id>` are the numeric IDs from the per-job analysis header. Example:
-`[call-nightly-amd / nightly-test-1-gpu-unit](https://github.com/sgl-project/sglang/actions/runs/24635222311/job/71716987472)`.
+where `<run_id>` and `<job_id>` are the numeric IDs from the per-job analysis header, and `<job label>` follows **Job names** in the Ground Rules. Example:
+``[`nightly-test-1-gpu-unit (rocm10)`](https://github.com/sgl-project/sglang/actions/runs/24635222311/job/71716987472)``.
 
 Do NOT use `[name](#job-<job_id>)` in the Job column — those in-issue anchors merely scroll the reader to the bot's own analysis block, not to the underlying CI failure. (The `<a id="job-<job_id>">` anchors above each per-job detail block still exist and may be linked from prose like "see analysis below" if useful, but the Summary Table's Job column is reserved for the upstream sglang job URL.)
 
@@ -665,14 +671,14 @@ Do NOT use `[name](#job-<job_id>)` in the Job column — those in-issue anchors 
 
    Column rules:
    - **Cluster**: short noun phrase (e.g. "GPU mem fault during warmup"). Repeat the same cluster name across all rows that belong to it — this is what makes grouping visible. Each unique cluster also gets a `### Cluster: <name>` subsection below the table.
-   - **Job**: `[name](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` — link to the actual sglang job page, NOT an in-issue anchor. See "Job column link (MUST follow)" above.
+   - **Job**: ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`` — link to the actual sglang job page, NOT an in-issue anchor. See "Job column link (MUST follow)" above.
    - **Test File / Test Function**: from the per-job's `Failed Tests` table. Test-file granularity is REQUIRED — never report at job-only level.
    - **Origin** (scout only): `aiter-caused` | `pre-existing (sglang)` | `unclear`.
    - **Status**: factual one-liner — e.g. "5 days persistent" / "new today" / "1/7 runs (flaky)" / "Never-passed". NOT priority.
-   - **Hypothesis (confidence)**: top hypothesis from the per-job analysis with its confidence label, e.g. ``[MEDIUM] commit [`6760c790b`](url) — narrows out_cache_loc``. If the per-job has no hypothesis ≥ MEDIUM, write `[no candidate ≥ MEDIUM]`.
+   - **Hypothesis (confidence)**: top hypothesis from the per-job analysis with its confidence label, e.g. ``[MEDIUM] [#23001](url) ([`6760c790b`](url)) — narrows out_cache_loc`` (suspected change first, per the Ground Rules). If the per-job has no hypothesis ≥ MEDIUM, write `[no candidate ≥ MEDIUM]`.
 
 3. **Cluster details** (one `### Cluster: <name>` subsection per unique cluster). Each subsection contains:
-   - **Affected**: list of `(job, test_file, test_function)` rows from the table (each job rendered as `[name](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` linking to the upstream sglang job page).
+   - **Affected**: list of `(job, test_file, test_function)` rows from the table (each job rendered as ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`` linking to the upstream sglang job page).
    - **Shared facts**: what the per-jobs agree on (stack-trace overlap, common version, common runner).
    - **Top hypothesis**: best candidate cause with confidence label and disconfirming evidence.
    - **In-flight fix**: ✅ PR #N or ❌ none — copy from per-job In-flight Fix Check; if multiple per-jobs cite the same PR, list it once.
@@ -724,7 +730,7 @@ Markdown report under 80 lines (no top-level heading; the harness adds its own):
 
 2. **Persistent clusters** (top 3 by job count): for each cluster, give:
    - Cluster name (one line)
-   - Affected jobs (each rendered as `[name](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` linking to the upstream sglang job page; never use `[name](#job-<job_id>)` in-issue anchors here)
+   - Affected jobs (each rendered as ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`` linking to the upstream sglang job page; never use `[name](#job-<job_id>)` in-issue anchors here)
    - Number of consecutive runs failed and first observed date
    - Top hypothesis with confidence label and disconfirming evidence (one sentence)
    - In-flight fix status
@@ -797,18 +803,17 @@ For each unique cluster (sorted: 🆕 NEW first, then by total job count DESC, t
 
 ### <ID> · <🆕 if new> · <Cluster name> — <STATUS line>
 - **Status**: e.g. "first seen 2026-04-19 12:15 UTC (1 run)" or "5 days persistent, 6 jobs across 3 workflows"
-- **Top hypothesis**: `[<CONFIDENCE>]` <hypothesis>; **disconfirming**: <one line> (or `(none found)`)
+- **Top hypothesis**: `[<CONFIDENCE>]` <suspected change first, if any: [#<num>](pr-url) ([`<sha>`](commit-url))> <hypothesis>; **disconfirming**: <one line> (or `(none found)`)
 - **In-flight fix**: ✅ [#<num>](url) (open since <date>) — <action> | ❌ none found
 - **Suggested triage**: <one or two concrete steps>
 
 | Workflow | Job (shard) | Test File | Test Function | Error (one line) | Log |
 |---|---|---|---|---|---|
-| pr-test-amd | [stage-b-1gpu-small (2)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/rl/test_lora_load_from_tensor.py` | `TestLoRALoadFromTensor.setUpClass` | `Memory access fault → exit -6` | [link](url) |
-| pr-test-amd | [stage-b-1gpu-small (4)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/dllm/test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault → exit -9` | [link](url) |
-| pr-test-amd | [stage-b-1gpu-small (rocm720, 4)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault` | [link](url) |
-| nightly-test-amd | [nightly-1-gpu-lora](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_lora_e2e.py` | `test_lora_full_pipeline` | same | [link](url) |
+| pr-test-amd (M) | [`stage-b-test-1-gpu-small-amd (rocm10, 2)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/rl/test_lora_load_from_tensor.py` | `TestLoRALoadFromTensor.setUpClass` | `Memory access fault → exit -6` | [link](url) |
+| pr-test-amd (M) | `stage-b-test-1-gpu-small-amd` [rocm10, 4](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) · [rocm720, 4](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/dllm/test_llada2_mini_amd.py` | `setUpClass` | `Memory access fault → exit -9` | [link](url) |
+| nightly-test-amd (N21) | `nightly-test-1-gpu-lora` [rocm10](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) · [rocm720](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) · [rocm724](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/lora/test_lora_e2e.py` | `test_lora_full_pipeline` | same | [link](url) |
 
-(Test File + Test Function granularity is REQUIRED. Group rows by cluster, not by workflow. Same cluster across workflows lives in ONE table. The `Job (shard)` cell MUST be a clickable link to the actual sglang job page — `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>` — never an in-issue `#job-<id>` anchor.)
+(Test File + Test Function granularity is REQUIRED. Group rows by cluster, not by workflow. Same cluster across workflows lives in ONE table. The `Job (shard)` cell MUST be a clickable link to the actual sglang job page — `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>` — never an in-issue `#job-<id>` anchor. Name jobs per **Job names** in the Ground Rules: the backticked job label, or for several legs of one job the backticked job name followed by one link per leg labelled with its matrix values. The run label goes in the Workflow column, never in the job's link text.)
 
 After all NEW + active clusters, render Known/stable clusters in a single collapsed `<details>` block:
 
@@ -827,9 +832,9 @@ After all NEW + active clusters, render Known/stable clusters in a single collap
 
 | Job (shard) | Test File | Test Function | Cluster | Error |
 |---|---|---|---|---|
-| [stage-b-1gpu-small (2)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_lora_load_from_tensor.py` | `setUpClass` | R2 | mem fault |
-| [stage-b-1gpu-small (4)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_llada2_mini_amd.py` | `setUpClass` | R2 | mem fault |
-| [stage-b-1gpu-small (11)](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_multi_lora_backend.py` | `test_ci_lora_models_multi_batch` | R3 | torchao ImportError |
+| [`stage-b-test-1-gpu-small-amd (rocm10, 2)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_lora_load_from_tensor.py` | `setUpClass` | R2 | mem fault |
+| [`stage-b-test-1-gpu-small-amd (rocm10, 4)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_llada2_mini_amd.py` | `setUpClass` | R2 | mem fault |
+| [`stage-b-test-1-gpu-small-amd (rocm10, 11)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test_multi_lora_backend.py` | `test_ci_lora_models_multi_batch` | R3 | torchao ImportError |
 ...
 </details>
 
@@ -1112,7 +1117,7 @@ A short noun phrase naming the failure pattern (e.g. "GPU memory access fault du
 
 ### Hypothesised Causes (with confidence)
 For each candidate cause:
-- `[<CONFIDENCE>]` Hypothesis. Use the scale `FACT` / `HIGH` / `MEDIUM` / `LOW` / `SPECULATION`. Default `LOW` in API mode (no source-code access).
+- `[<CONFIDENCE>]` Hypothesis. Use the scale `FACT` / `HIGH` / `MEDIUM` / `LOW` / `SPECULATION`. Default `LOW` in API mode (no source-code access). When the hypothesis blames a change, open it with the PR and commit side by side (`` [#<num>](pr-url) ([`<sha>`](commit-url)) ``) before the explanation; a change you rule out goes under Disconfirming evidence, not in the hypothesis.
   - **Supporting evidence** (from log): one line
   - **Disconfirming evidence**: one line, or `(none found in this log)`
 
@@ -1163,7 +1168,7 @@ Write a SHORT cross-job summary (under 80 lines) that GROUPS jobs by Failure Clu
 
 **Summary Table sort order**: Cluster size DESC (largest cluster first), then Persistence DESC, then for `amd-aiter-scout.yml` by Origin (`aiter-caused` → `pre-existing (sglang)` → `unclear`), then Job name ASC. The `#` column reflects this sorted order. Bot does NOT assign Priority — engineers infer urgency from cluster size + persistence.
 
-**Job column rule**: the `Job` cell MUST be `[<job_name>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` — link to the upstream sglang job page on github.com so a single click jumps to the failing CI log. Each per-job section above provides both `Run` (run URL) and `Job ID`; combine them to build the link. Do NOT use `[name](#job-<job_id>)` in this column — those in-issue anchors are reserved for "see analysis below" prose, not for the Job column.
+**Job column rule**: the `Job` cell MUST be ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`` — link to the upstream sglang job page on github.com so a single click jumps to the failing CI log. Each per-job section above provides both `Run` (run URL) and `Job ID`; combine them to build the link. Do NOT use `[name](#job-<job_id>)` in this column — those in-issue anchors are reserved for "see analysis below" prose, not for the Job column. The job label is the job's GitHub name without the runner label or a reusable-workflow caller prefix (`nightly-test-1-gpu-kernel (rocm720, linux-mi300-1gpu-sglang)` → `nightly-test-1-gpu-kernel (rocm720)`), always in backticks; never a nickname (`v4-pro`, `mmgen-1-gpu`) or a bare lane/shard/run label (`720`, `(1)`, `N21`). Write jobs in prose the same way.
 
 **Confidence labels**: any causal claim (e.g. cited commit) MUST include a confidence label `[FACT]` / `[HIGH]` / `[MEDIUM]` / `[LOW]` / `[SPECULATION]`. Default `[LOW]` in API mode.
 
@@ -1179,11 +1184,11 @@ Write a SHORT cross-job summary (under 80 lines) that GROUPS jobs by Failure Clu
 
    Column rules:
    - **Cluster**: short noun phrase. Repeat the same cluster name across all rows that belong to it — this is what makes grouping visible.
-   - **Job**: `[name](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)` — link to the actual sglang job page (NOT an in-issue `#job-<id>` anchor). See "Job column rule" above.
+   - **Job**: ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`` — link to the actual sglang job page (NOT an in-issue `#job-<id>` anchor). See "Job column rule" above.
    - **Test File / Test Function**: test-file granularity REQUIRED.
    - **Origin** (scout only): `aiter-caused` | `pre-existing (sglang)` | `unclear`.
    - **Status**: factual one-liner — e.g. "5 days persistent" / "new today" / "Never-passed". NOT priority.
-   - **Hypothesis (confidence)**: top hypothesis with confidence label, e.g. ``[MEDIUM] commit [`abc1234`](url) — short why``. If none ≥ MEDIUM, write `[no candidate ≥ MEDIUM]`.
+   - **Hypothesis (confidence)**: top hypothesis with confidence label, e.g. ``[MEDIUM] [#23001](url) ([`abc1234`](url)) — short why`` (the suspected change first). If none ≥ MEDIUM, write `[no candidate ≥ MEDIUM]`.
 
 3. **Cluster details**: one `### Cluster: <name>` subsection per unique cluster. Each subsection contains:
    - **Affected**: list of `(job, test_file, test_function)` rows.
@@ -1308,7 +1313,8 @@ You are a CI/CD expert. Produce the **top-of-issue Daily Cross-Workflow Summary*
 - Bot does NOT assign Priority — no "P0/P1/Critical/High" anywhere.
 - Every workflow listed in the prompt MUST appear in the Workflow status table, even if 0 failures.
 - Every cluster MUST list ALL `(workflow, job, test_file, test_function)` rows.
-- Every `Job (shard)` cell in the cluster tables MUST be a clickable link to the upstream sglang job page: `[<job_label>](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`. Never use in-issue `#job-<id>` anchors here.
+- Every `Job (shard)` cell in the cluster tables MUST be a clickable link to the upstream sglang job page: ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)``, or for several legs of one job the backticked job name followed by one link per leg labelled with its matrix values (`` `nightly-8-gpu-mi35x-deepseek-v4-pro` [rocm10](url) · [rocm720](url) ``). Never use in-issue `#job-<id>` anchors here. The job label is the job's GitHub name without the runner label or a reusable-workflow caller prefix (`nightly-test-1-gpu-kernel (rocm720, linux-mi300-1gpu-sglang)` → `nightly-test-1-gpu-kernel (rocm720)`), always in backticks; never a nickname (`v4-pro`, `mmgen-1-gpu`) or a bare lane/shard/run label (`720`, `(1)`, `N21`). Run labels go in the Workflow column. Write jobs in prose the same way.
+- When a hypothesis blames a change, open it with the PR and commit side by side (`` [#<num>](pr-url) ([`<sha>`](commit-url)) ``) before the explanation; a change you rule out goes under disconfirming, not in the hypothesis.
 - Name every cluster ID on its own (`R239 · R240 · R241`), never as a range (`R239–R241`).
 - After the footer, end with a ```` ```json job-clusters ```` block mapping each cluster ID to its numeric job IDs, e.g. `{{"R25": [117742354635], "R209": [117742355001]}}`. Every job ID in the per-job analyses above MUST appear under at least one cluster. The block is stripped before publishing and does not count toward the line budget.
 
@@ -1331,7 +1337,7 @@ You are a CI/CD expert. Produce the **top-of-issue Daily Cross-Workflow Summary*
 
 ### R1 · 🆕 · <Cluster name> — <Status>
 - **Status**: facts only
-- **Top hypothesis**: `[CONFIDENCE]` <hypothesis>; **disconfirming**: <one line> or `(none found)`
+- **Top hypothesis**: `[CONFIDENCE]` <suspected change first, if any> <hypothesis>; **disconfirming**: <one line> or `(none found)`
 - **In-flight fix**: ✅ [#N](url) | ❌ none
 - **Suggested triage**: <one or two concrete steps>
 
