@@ -134,7 +134,7 @@ runner-1 entrypoint.sh (sleep 3600) ─┐
 
 **Why a `prepare` step?** Without it, multiple matrix jobs racing `find_or_create_daily_issue()` would create duplicate issues for the same day. `ensure_daily_issue.py` runs once before fan-out so the issue (and its `:start`/`:end` placeholder block) exists by the time the matrix fires.
 
-After the matrix completes, `finalize` always refreshes the Failure Trackers. Notion staging runs in its own `notion-staging.yml` workflow, so the hourly monitor has no staging steps and keeps its original execution sequence.
+After the matrix completes, `finalize` puts the daily issue's report comments in priority order (`order_daily_comments.py`, see [Report order](#report-order)) and always refreshes the Failure Trackers. Notion staging runs in its own `notion-staging.yml` workflow, so the hourly monitor has no staging steps and keeps its original execution sequence.
 
 ### Loop 2 — PR command dispatch (continuous, two redundant paths)
 
@@ -462,16 +462,39 @@ docker logs -f amd-ci-bot-runner-1    # watcher + CI monitor active
 Configured in `MONITORED_WORKFLOWS` in `monitor_ci.py`:
 
 ```
-nightly-test-amd.yml
+release-docker-amd-rocm10.yml
 release-docker-amd-rocm720-nightly.yml
-nightly-amd-mi355x-disagg.yml
-amd-aiter-scout.yml
-pr-test-amd.yml
-nightly-test-amd-miles-rocm10.yml
-nightly-test-amd-miles-rocm10-mi30x.yml
+release-docker-amd-gfx1151-nightly.yml
 release-docker-amd-miles-rocm10-nightly.yml
 release-docker-amd-miles-rocm724-nightly.yml
+pr-test-amd.yml
+nightly-test-amd.yml
+nightly-amd-mi355x-disagg.yml
+nightly-test-amd-miles-rocm10.yml
+nightly-test-amd-miles-rocm10-mi30x.yml
+amd-aiter-scout.yml
 ```
+
+### Report order
+
+The list is in priority order, and the daily issue shows the reports in the
+same order: Docker image builds, PR test, nightly, disagg, Miles, then AITER
+Scout. The matrix jobs post each workflow's first comment whenever its
+analysis finishes, and GitHub cannot reorder comments, so the `finalize` job
+runs `order_daily_comments.py`: it treats the report comments (each
+workflow's part 1, overflow parts, then cross-run summary) as slots, oldest
+first, and rewrites the bodies into them in this order. People's replies and
+stray duplicates stay where they are. Because a body can move to another
+comment, `publish_workflow_report()` finds a workflow's comments by their
+markers on every run and never reuses a comment ID cached from an earlier run.
+
+Within the `pr-test-amd.yml` report, jobs are grouped by ROCm version
+(`ROCM_REPORT_ORDER`): the workflow's default `rocm_version` first, since
+that is what PRs run (currently `rocm10`), then `rocm724`, `rocm720`. Update
+the list when upstream changes the default. Inside each version, jobs are
+listed by stage (`JOB_REPORT_ORDER`): `stage-a`, `stage-b`, `stage-c`, the
+kernel jobs (`sgl-kernel-*`, `jit-kernel-*`), `multimodal-*`, then anything
+else. Other workflows keep the order their analyses finished in.
 
 The four Miles workflows test [radixark/miles](https://github.com/radixark/miles) in
 images built from radixark/miles and an sglang branch (`sglang-miles`). They are
@@ -485,7 +508,11 @@ the unified `nightly-test-amd.yml` and `pr-test-amd.yml` runs. The workflow
 files `nightly-test-amd-rocm720.yml`, `pr-test-amd-rocm720.yml`, and
 `release-docker-amd-nightly.yml` are retired from the upstream default branch
 and therefore are not dispatched by the monitor.
-`release-docker-amd-rocm720-nightly.yml` remains active and monitored; the
+`release-docker-amd-rocm10.yml` (the ROCm 10 nightly image build, daily at
+12:00 UTC), `release-docker-amd-rocm720-nightly.yml` and
+`release-docker-amd-gfx1151-nightly.yml` (daily at 14:00 UTC) are active and
+monitored. `amd-ci-job-monitor.yml` is also scheduled on AMD runners but is
+CI housekeeping, not a build or test, so it is not monitored. The
 unified `release-docker-amd.yml` is tag/manual-only and has no scheduled runs,
 so it is not part of this schedule-only monitor. Run job listings are fetched
 across every GitHub API page, so unified runs with more than 100 jobs are fully
@@ -938,6 +965,9 @@ sglang-ci-bot/
                               Notion access. Write-mode reads both data sources,
                               deduplicates, writes only to the isolated staging
                               source, and verifies the official source is intact.
+    order_daily_comments.py Rewrites the daily issue's report comments into
+                              MONITORED_WORKFLOWS (priority) order. Run once
+                              per tick by ci-monitor.yml's `finalize` job.
     analyze_url.py          On-demand analysis of a run/job URL
     check_ci_for_pr.py      PR CI status checker
     ci_evidence.py          Evidence pack for PR CI status (runs, failed-job facts,
@@ -956,7 +986,8 @@ sglang-ci-bot/
                               Layout: prepare job (resolve workflow list +
                               ensure_daily_issue.py) → monitor matrix job
                               (max-parallel 8, one entry per workflow file
-                              from MONITORED_WORKFLOWS) → finalize job.
+                              from MONITORED_WORKFLOWS) → finalize job
+                              (order_daily_comments.py, failure_tracker.py).
     notion-staging.yml      Independent daily Notion staging workflow. GitHub
                               schedules it for 12:00 UTC / 20:00 Asia/Shanghai;
                               scheduled runs write, while manual runs offer

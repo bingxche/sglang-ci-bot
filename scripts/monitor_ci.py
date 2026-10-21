@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import sys
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -58,19 +59,41 @@ from utils import (
 
 log = logging.getLogger("ci-monitor")
 
+# Listed in priority order, which is also the order the reports appear in the
+# daily issue (see order_workflow_comments): Docker image builds, PR test,
+# nightly, disagg, Miles, then AITER Scout.
 MONITORED_WORKFLOWS = [
-    "nightly-test-amd.yml",
+    "release-docker-amd-rocm10.yml",
     "release-docker-amd-rocm720-nightly.yml",
-    "nightly-amd-mi355x-disagg.yml",
-    "amd-aiter-scout.yml",
+    "release-docker-amd-gfx1151-nightly.yml",
+    "release-docker-amd-miles-rocm10-nightly.yml",
+    "release-docker-amd-miles-rocm724-nightly.yml",
     "pr-test-amd.yml",
+    "nightly-test-amd.yml",
+    "nightly-amd-mi355x-disagg.yml",
     # Miles: analysed against the image's radixark/miles and sglang commits
     # (utils.prepare_miles_context), not the run's.
     "nightly-test-amd-miles-rocm10.yml",
     "nightly-test-amd-miles-rocm10-mi30x.yml",
-    "release-docker-amd-miles-rocm10-nightly.yml",
-    "release-docker-amd-miles-rocm724-nightly.yml",
+    "amd-aiter-scout.yml",
 ]
+
+# Order of the jobs within a workflow's report: first by the ROCm version in
+# the job name, then by job-name prefix. Versions and prefixes not listed come
+# last; ties keep name order. pr-test-amd.yml's default ``rocm_version``
+# (what PRs run) goes first, so update this when upstream changes it.
+ROCM_REPORT_ORDER = {
+    "pr-test-amd.yml": ["rocm10", "rocm724", "rocm720"],
+}
+JOB_REPORT_ORDER = {
+    "pr-test-amd.yml": [
+        ("stage-a-",),
+        ("stage-b-",),
+        ("stage-c-",),
+        ("sgl-kernel-", "jit-kernel-"),
+        ("multimodal-",),
+    ],
+}
 
 # Most monitored workflows are analyzed only when triggered by ``schedule``
 # so the daily report is not polluted by ad-hoc / debug runs. AITER Scout is
@@ -250,11 +273,20 @@ def get_pending_job_info(token: str, run_id: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def get_issue_comments(token: str, bot_repo: str, issue_number: int) -> list[dict]:
-    """Fetch all comments on an issue."""
+    """Fetch all comments on an issue, oldest first, across every page."""
     url = f"https://api.github.com/repos/{bot_repo}/issues/{issue_number}/comments"
-    resp = requests.get(url, headers=gh_headers(token), params={"per_page": 100})
-    resp.raise_for_status()
-    return resp.json()
+    comments: list[dict] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            url, headers=gh_headers(token), params={"per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        comments.extend(batch)
+        if len(batch) < 100:
+            return comments
+        page += 1
 
 
 def extract_processed_ids_from_comments(
@@ -610,6 +642,48 @@ def _render_per_job_block(ja: dict) -> str:
     )
 
 
+def _natural_key(text: str) -> list:
+    """Sort key that orders "part 2" before "part 10"."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", text)]
+
+
+_ROCM_IN_JOB_NAME_RE = re.compile(r"\((rocm\d+)\b")
+
+
+def sort_job_analyses(workflow_file: str, job_analyses: list[dict]) -> list[dict]:
+    """Order a workflow's jobs for its report.
+
+    Uses ``ROCM_REPORT_ORDER`` then ``JOB_REPORT_ORDER``. Workflows in
+    neither keep their existing order.
+    """
+    rocm_order = ROCM_REPORT_ORDER.get(workflow_file, [])
+    order = JOB_REPORT_ORDER.get(workflow_file, [])
+    if not rocm_order and not order:
+        return list(job_analyses)
+
+    def rocm_rank(name: str) -> int:
+        m = _ROCM_IN_JOB_NAME_RE.search(name)
+        if m and m.group(1) in rocm_order:
+            return rocm_order.index(m.group(1))
+        return len(rocm_order)
+
+    def rank(name: str) -> int:
+        for i, prefixes in enumerate(order):
+            if name.startswith(prefixes):
+                return i
+        return len(order)
+
+    return sorted(
+        job_analyses,
+        key=lambda ja: (
+            rocm_rank(ja["job_name"]),
+            rank(ja["job_name"]),
+            _natural_key(ja["job_name"]),
+            ja.get("started_at") or "",
+        ),
+    )
+
+
 def render_workflow_comment_parts(
     workflow_file: str,
     job_analyses: list[dict],
@@ -630,6 +704,7 @@ def render_workflow_comment_parts(
     GitHub's 65 536-char comment limit).
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    job_analyses = sort_job_analyses(workflow_file, job_analyses)
 
     started_ats = [ja.get("started_at") for ja in job_analyses if ja.get("started_at")]
     run_started = (
@@ -1028,13 +1103,15 @@ def maybe_publish_cross_run_summary(
         workflow_file, runs, patterns, agent_text=agent_text, use_agent=use_agent,
     )
 
+    # Located by marker only: order_workflow_comments moves report bodies
+    # between comments, so an ID cached from an earlier run may now hold
+    # another workflow's report.
     cross_marker = CROSS_RUN_MARKER_TMPL.format(wf=workflow_file)
     existing = next(
         (c for c in gh_comments if cross_marker in c.get("body", "")),
         None,
     )
-    cached_id = wf_state.get("cross_run_comment_id")
-    target_id = (existing or {}).get("id") or cached_id
+    target_id = (existing or {}).get("id")
 
     if target_id:
         try:
@@ -1279,11 +1356,21 @@ def publish_workflow_report(
     wf_state = get_workflow_state(daily, workflow_file)
     wf_state.setdefault("overflow_ids", [])
 
+    # Keep the new analyses in state before touching GitHub, so a failure
+    # below leaves them to be published by the next run.
+    existing = wf_state.get("job_analyses", [])
+    existing_ids = {ja["job_id"] for ja in existing}
+    for ja in new_analyses:
+        if ja["job_id"] not in existing_ids:
+            existing.append(ja)
+    wf_state["job_analyses"] = existing
+    wf_state["unpublished"] = True
+
+    # The live comments are the only source for this workflow's comment IDs:
+    # order_workflow_comments moves report bodies between comments, so IDs
+    # cached from an earlier run may now hold another workflow's report.
     if gh_comments is None:
-        try:
-            gh_comments = get_issue_comments(token, bot_repo, issue_num)
-        except Exception:
-            gh_comments = []
+        gh_comments = get_issue_comments(token, bot_repo, issue_num)
 
     main_comment, overflow_comments = find_workflow_comment_parts(
         gh_comments, workflow_file,
@@ -1311,14 +1398,10 @@ def publish_workflow_report(
                 "  Recovered %d analyses from %d comment part(s) for %s",
                 len(recovered), 1 + len(overflow_comments), workflow_file,
             )
+    else:
+        wf_state["comment_id"] = None
+        wf_state["owned"] = False
     wf_state["overflow_ids"] = [c["id"] for c in overflow_comments]
-
-    existing = wf_state.get("job_analyses", [])
-    existing_ids = {ja["job_id"] for ja in existing}
-    for ja in new_analyses:
-        if ja["job_id"] not in existing_ids:
-            existing.append(ja)
-    wf_state["job_analyses"] = existing
 
     all_analyses = wf_state["job_analyses"]
 
@@ -1394,6 +1477,7 @@ def publish_workflow_report(
             )
 
     wf_state["overflow_ids"] = new_overflow_ids
+    wf_state.pop("unpublished", None)
 
     if workflow_file in CROSS_RUN_SUMMARY_WORKFLOWS:
         try:
@@ -1405,6 +1489,70 @@ def publish_workflow_report(
         except Exception as exc:
             log.warning("  Cross-run summary publish failed for %s: %s",
                         workflow_file, exc)
+
+
+def workflow_report_comments(comments: list[dict], workflow_file: str) -> list[dict]:
+    """A workflow's report comments in reading order.
+
+    Part 1, the overflow parts, then the cross-run summary.
+    """
+    cross_marker = CROSS_RUN_MARKER_TMPL.format(wf=workflow_file)
+    cross = [c for c in comments if cross_marker in c.get("body", "")]
+    main, overflow = find_workflow_comment_parts(
+        [c for c in comments if cross_marker not in c.get("body", "")],
+        workflow_file,
+    )
+    return [c for c in [main, *overflow, *cross[:1]] if c is not None]
+
+
+def plan_comment_order(comments: list[dict]) -> list[tuple[int, str]]:
+    """Return the (comment_id, body) edits that put the reports in order.
+
+    GitHub shows comments in creation order and cannot reorder them, and the
+    matrix jobs post each workflow's first comment whenever its analysis
+    finishes. So the report comments are treated as slots, oldest first, and
+    the bodies are rewritten into them in ``MONITORED_WORKFLOWS`` order.
+    Other comments (people's replies, stray duplicates) are left alone.
+    """
+    desired: list[dict] = []
+    seen: set[int] = set()
+    for wf in MONITORED_WORKFLOWS:
+        for c in workflow_report_comments(comments, wf):
+            if c["id"] not in seen:
+                seen.add(c["id"])
+                desired.append(c)
+
+    by_id = {c["id"]: c for c in desired}
+    slots = sorted(by_id)
+    return [
+        (slot, c["body"])
+        for slot, c in zip(slots, desired)
+        if by_id[slot]["body"] != c["body"]
+    ]
+
+
+def order_workflow_comments(token: str, bot_repo: str, issue_num: int) -> int:
+    """Rewrite the daily issue's report comments into priority order.
+
+    Run once per tick after every workflow has published (the ``finalize``
+    job), never alongside the matrix jobs, which would race on the bodies.
+    Returns the number of comments edited.
+    """
+    edits = plan_comment_order(get_issue_comments(token, bot_repo, issue_num))
+    for i, (comment_id, body) in enumerate(edits):
+        if i:
+            time.sleep(1)  # GitHub asks for >= 1s between content writes
+        for attempt in range(3):
+            try:
+                update_comment(token, bot_repo, comment_id, body)
+                break
+            except requests.RequestException as exc:
+                if attempt == 2:
+                    raise
+                log.warning("Edit of comment %d failed (%s); retrying", comment_id, exc)
+                time.sleep(5)
+    log.info("Reordered issue #%d: %d comment(s) edited", issue_num, len(edits))
+    return len(edits)
 
 
 # ---------------------------------------------------------------------------
@@ -1445,7 +1593,9 @@ def run_oneshot(
         except Exception:
             pass
 
-    gh_comments: list[dict] = []
+    # None (not []) when unknown, so publish_workflow_report fetches the
+    # comments itself instead of treating the issue as empty.
+    gh_comments: list[dict] | None = None
     if bot_repo and daily.get("issue_number"):
         try:
             gh_comments = get_issue_comments(token, bot_repo, daily["issue_number"])
@@ -1474,7 +1624,9 @@ def run_oneshot(
                 event=workflow_event_filter(wf),
             )
 
-            if not new_analyses:
+            # "unpublished": an earlier run analysed jobs but failed to post them.
+            retry_publish = output == "daily-issue" and wf_state.get("unpublished")
+            if not new_analyses and not retry_publish:
                 continue
 
             total_reports += 1

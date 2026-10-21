@@ -35,15 +35,17 @@ concurrency:
 
 env:
   DEFAULT_WORKFLOWS: |
-    nightly-test-amd.yml
+    release-docker-amd-rocm10.yml
     release-docker-amd-rocm720-nightly.yml
-    nightly-amd-mi355x-disagg.yml
-    amd-aiter-scout.yml
-    pr-test-amd.yml
-    nightly-test-amd-miles-rocm10.yml
-    nightly-test-amd-miles-rocm10-mi30x.yml
+    release-docker-amd-gfx1151-nightly.yml
     release-docker-amd-miles-rocm10-nightly.yml
     release-docker-amd-miles-rocm724-nightly.yml
+    pr-test-amd.yml
+    nightly-test-amd.yml
+    nightly-amd-mi355x-disagg.yml
+    nightly-test-amd-miles-rocm10.yml
+    nightly-test-amd-miles-rocm10-mi30x.yml
+    amd-aiter-scout.yml
 
 jobs:
   prepare:
@@ -161,6 +163,14 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Display only, so a failure here must not hold back the trackers.
+      - name: Order daily issue comments
+        continue-on-error: true
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          BOT_REPO: ${{ github.repository }}
+        run: python scripts/order_daily_comments.py
 
       - name: Update upstream Failure Trackers
         env:
