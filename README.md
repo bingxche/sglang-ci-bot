@@ -257,6 +257,8 @@ The Job Failure Analysis / Cross-Job Summary / Cross-Run Pattern Analysis / Dail
 - **Only completed runs count in trends**: in-progress / queued runs are excluded or labelled `[IN-FLIGHT]`. Drawing "trend dropped" / "regression candidate" conclusions from in-flight runs is forbidden.
 - **Recommendations are triage steps, not directives**: bot output uses "Suggested triage: bisect A..B; if commit X is implicated, try reverting on a branch", NOT "Revert commit X".
 - **Test-file granularity preserved**: every cluster table lists `(workflow, job, test_file, test_function)` — never collapsed to job-only level.
+- **One way to write a job**: a job is always its GitHub name without the runner label or caller prefix, in backticks (`` `nightly-test-1-gpu-kernel (rocm720)` ``), linked to the job page. Several legs of one job are the backticked name followed by one link per leg labelled with its matrix values. No nicknames (`v4-pro`), and no links labelled only `720` or `(1)`, so searching the page for a job finds every mention of it.
+- **Suspected change first**: a hypothesis that blames a change opens with the PR and its commit side by side (`` [#45112](…) ([`693d3333`](…)) moved … ``), and a change being ruled out goes under Disconfirming. Downstream dashboards read that first pair as the suspected cause.
 
 ### Fallback to API mode
 
