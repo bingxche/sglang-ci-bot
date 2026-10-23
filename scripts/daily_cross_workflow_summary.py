@@ -556,6 +556,20 @@ def build_job_cluster_map(
     return mapping, unclustered
 
 
+def parse_job_cluster_comment(body: str) -> dict[str, list[int]] | None:
+    """Read the ``clusters`` map back out of a published summary."""
+    start = (body or "").rfind(JOB_CLUSTERS_COMMENT_PREFIX)
+    if start < 0:
+        return None
+    end = body.find(" -->", start)
+    try:
+        payload = json.loads(body[start + len(JOB_CLUSTERS_COMMENT_PREFIX):end])
+    except ValueError:
+        return None
+    clusters = payload.get("clusters") if isinstance(payload, dict) else None
+    return clusters if isinstance(clusters, dict) else None
+
+
 def render_job_cluster_comment(
     mapping: dict[int, list[str]], unclustered: list[tuple[str, dict]],
 ) -> str:
@@ -598,6 +612,109 @@ def attach_job_cluster_map(report: str, wf_analyses: dict[str, list[dict]]) -> s
 
 
 # ---------------------------------------------------------------------------
+# Suspect PRs
+# ---------------------------------------------------------------------------
+
+# The agent also ends its report with a fenced ```json suspect-prs``` block:
+# one entry per cluster it attributes to a merged sglang PR. It is stripped
+# from the rendered summary and kept, validated, as a hidden comment that
+# ``suspect_pr_comments.py`` reads in the ``finalize`` job. Deciding whether
+# to comment on the PR is left to that script's checks, not to the agent.
+SUSPECT_PRS_COMMENT_PREFIX = "<!-- ci-monitor-suspect-prs:v1 "
+CONFIDENCE_LABELS = ("FACT", "HIGH", "MEDIUM", "LOW", "SPECULATION")
+SUSPECT_EVIDENCE_MAX_CHARS = 400
+_SUSPECT_PRS_BLOCK_RE = re.compile(
+    r"^```json[ \t]+suspect-prs[ \t]*\n(.*?)^```[ \t]*\n?",
+    re.DOTALL | re.MULTILINE,
+)
+_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+
+
+def _sha(value) -> str | None:
+    value = str(value or "").strip().lower()
+    return value if _SHA_RE.fullmatch(value) else None
+
+
+def _pr_number(value) -> int | None:
+    try:
+        number = int(str(value).lstrip("#"))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def normalize_suspect(entry) -> dict | None:
+    """Validate one ``suspect-prs`` entry; ``None`` if it is unusable."""
+    if not isinstance(entry, dict):
+        return None
+    cluster = str(entry.get("cluster") or "").strip()
+    pr = _pr_number(entry.get("pr"))
+    sha = _sha(entry.get("sha"))
+    confidence = str(entry.get("confidence") or "").strip().strip("[]`").upper()
+    if not _CLUSTER_ID_RE.fullmatch(cluster) or not pr or not sha:
+        return None
+    if confidence not in CONFIDENCE_LABELS:
+        return None
+    evidence = " ".join(str(entry.get("evidence") or "").split())
+    # It is embedded in an HTML comment, so it must not close one.
+    evidence = evidence.replace("-->", "->")[:SUSPECT_EVIDENCE_MAX_CHARS]
+    related = entry.get("related_prs") if isinstance(entry.get("related_prs"), list) else []
+    return {
+        "cluster": cluster,
+        "pr": pr,
+        "sha": sha,
+        "confidence": confidence,
+        "evidence": evidence,
+        "last_pass_sha": _sha(entry.get("last_pass_sha")),
+        "first_fail_sha": _sha(entry.get("first_fail_sha")),
+        "fix_pr": _pr_number(entry.get("fix_pr")) if entry.get("fix_pr") else None,
+        "related_prs": [n for n in map(_pr_number, related) if n and n != pr],
+    }
+
+
+def split_suspect_prs_block(report: str) -> tuple[str, list[dict] | None]:
+    """Pull the agent's ``suspect-prs`` block out of the report.
+
+    Returns the report without the block and the valid entries, or ``None``
+    when the block is missing or not a JSON list. A missing block only
+    means no PR gets a comment.
+    """
+    matches = list(_SUSPECT_PRS_BLOCK_RE.finditer(report))
+    if not matches:
+        return report, None
+    stripped = _SUSPECT_PRS_BLOCK_RE.sub("", report).rstrip() + "\n"
+    try:
+        raw = json.loads(matches[-1].group(1))
+    except ValueError as exc:
+        log.warning("suspect-prs block is not valid JSON (%s); ignoring it", exc)
+        return stripped, None
+    if not isinstance(raw, list):
+        log.warning("suspect-prs block is not a JSON list; ignoring it")
+        return stripped, None
+    suspects = [s for s in map(normalize_suspect, raw) if s]
+    if len(suspects) < len(raw):
+        log.warning("Dropped %d invalid suspect-prs entr(ies)", len(raw) - len(suspects))
+    return stripped, suspects
+
+
+def render_suspect_prs_comment(suspects: list[dict]) -> str:
+    return f"{SUSPECT_PRS_COMMENT_PREFIX}{json.dumps(suspects, separators=(',', ':'))} -->"
+
+
+def parse_suspect_prs_comment(body: str) -> list[dict]:
+    """Read the suspect PRs back out of a published summary."""
+    start = (body or "").rfind(SUSPECT_PRS_COMMENT_PREFIX)
+    if start < 0:
+        return []
+    end = body.find(" -->", start)
+    try:
+        raw = json.loads(body[start + len(SUSPECT_PRS_COMMENT_PREFIX):end])
+    except ValueError:
+        return []
+    return [s for s in map(normalize_suspect, raw) if s] if isinstance(raw, list) else []
+
+
+# ---------------------------------------------------------------------------
 # Publishing
 # ---------------------------------------------------------------------------
 
@@ -621,15 +738,19 @@ def render_summary_body(
        ``# Daily Cross-Workflow Summary`` anchor, leaving only the last draft.
 
     With *wf_analyses*, the agent's ``job-clusters`` block is replaced by
-    the hidden job -> cluster map (see ``attach_job_cluster_map``).
+    the hidden job -> cluster map (see ``attach_job_cluster_map``). The
+    agent's ``suspect-prs`` block is always replaced by its hidden copy.
     """
     method = "Claude Code CLI" if used_agent else "Claude API"
     body = agent_text.strip()
     if body.startswith(SUMMARY_CONTENT_MARKER):
         body = body[len(SUMMARY_CONTENT_MARKER):].lstrip()
     body = _extract_report(body, _DAILY_SUMMARY_ANCHOR_RE)
+    body, suspects = split_suspect_prs_block(body)
     if wf_analyses is not None:
         body = attach_job_cluster_map(body, wf_analyses)
+    if suspects:
+        body = f"{body.rstrip()}\n{render_suspect_prs_comment(suspects)}"
     return (
         f"{SUMMARY_CONTENT_MARKER}\n"
         f"{body}\n"
