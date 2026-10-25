@@ -295,7 +295,7 @@ The bot uses **two GitHub accounts**:
 | Daemon comment watcher + CI monitor (runner-1) | `BOT_PAT` env var (amd-bot's PAT) | amd-bot |
 | Claude Code agent (all containers) | `GH_PAT` env var | amd-bot |
 | Runner registration (`entrypoint.sh`) | `GH_PAT` env var (bingxche's PAT) | bingxche |
-| Coverage Exclusion Audit (`coverage-audit.yml`) | `secrets.SGLANG_CI_TOKEN` (a ROCm/sglang-ci admin's PAT) | that admin, on ROCm/sglang-ci only |
+| Coverage Exclusion Audit (`coverage-audit.yml`) | `secrets.GH_PAT` (amd-bot's PAT), or `secrets.SGLANG_CI_TOKEN` if set | amd-bot (admin collaborator on ROCm/sglang-ci) |
 
 ---
 
@@ -321,7 +321,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 | `GH_PAT` | amd-bot's GitHub PAT |
 | `LLM_GATEWAY_KEY` | AMD LLM Gateway subscription key |
 | `LLM_GATEWAY_URL` | AMD LLM Gateway endpoint (e.g. `https://llm-api.amd.com/Anthropic`) |
-| `SGLANG_CI_TOKEN` | PAT for `coverage-audit.yml`: contents + pull requests write on ROCm/sglang-ci. Its `main` ruleset requires a review only repo admins can bypass, so it must be an admin's token for the merge to go through |
+| `SGLANG_CI_TOKEN` | Optional. Overrides `GH_PAT` for `coverage-audit.yml` with another ROCm/sglang-ci admin's PAT |
 
 **Variables:**
 
@@ -544,6 +544,14 @@ agent prompt next to it, and the ledger of already-audited files
 (`upstream_ci/coverage_audit/reviewed.json` on that repo's `log` branch).
 Its documentation lives with that code, in ROCm/sglang-ci's
 `sglang-ci-dashboard` skill.
+
+It acts on ROCm/sglang-ci as amd-bot, through the existing `GH_PAT` (or
+`SGLANG_CI_TOKEN`, if set). amd-bot has to be an **admin** collaborator there,
+because that repo's `main` ruleset requires a review only admins can bypass,
+and in the ROCm org only org owners can invite an outside collaborator. Once
+one has, the job's first step accepts the pending invitation with the same
+token. Until then it stops at that step with an error saying so. Commits are
+authored by the token's owner.
 
 Each run: builds the gap list with `main`'s rules; picks the files the ledger
 has not seen, plus kept files upstream changed since; splits them into shards
@@ -1154,7 +1162,7 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py'
 | `NOTION_STAGING_DATA_SOURCE_ID` | `stage_notion.py sync` | Isolated data source titled `SGLang AMD CI Staging Errors`; the only write destination |
 | `AGENT_WORKSPACE` | Agent mode | Base directory for sglang clone (default: `/workspace`) |
 | `AGENT_GH_TOKEN` | Agent mode | Optional read-only GitHub token; replaces `GH_PAT` / `GH_TOKEN` in the agent's env (the scripts keep the posting token) |
-| `SGLANG_CI_TOKEN` | `coverage-audit.yml` | ROCm/sglang-ci token for checkout, ledger, PR and merge; never present in the agent step |
+| `SGLANG_CI_TOKEN` | `coverage-audit.yml` | Optional ROCm/sglang-ci token for checkout, ledger, PR and merge, used instead of `GH_PAT`; neither is present in the agent step |
 | `AGENT_ARCHIVE_DIR` | Agent mode | If set, the prompt and agent session log (secrets redacted) of every agent run are copied here; `ci-status-check.yml` uploads it as an artifact (30 days; the repo is public, so artifacts are too) |
 | `CI_STATUS_OUT_DIR` | `check_ci_for_pr.py` | Same as `--out-dir` |
 | `CI_STATUS_AGENT_TIMEOUT` | `check_ci_for_pr.py` | PR CI Status Check agent timeout in seconds (default: `2400` = 40 min) |

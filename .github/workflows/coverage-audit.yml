@@ -23,10 +23,12 @@ name: Coverage Exclusion Audit
 # before/after coverage check must move exactly the excluded files. Every
 # write (commit, push, PR, merge, ledger) happens in later steps.
 #
-# Secrets: LLM_GATEWAY_KEY / LLM_GATEWAY_URL (existing) and SGLANG_CI_TOKEN, a
-# PAT that can push to, open PRs on and merge PRs in ROCm/sglang-ci. Its main
-# ruleset requires an approving review that only repo admins can bypass, so
-# the token has to belong to an admin there for the merge to go through.
+# Token for ROCm/sglang-ci: secrets.SGLANG_CI_TOKEN if set, else the bot's
+# own GH_PAT (amd-bot). That account must be an admin collaborator there:
+# the main ruleset requires an approving review only repo admins can bypass.
+# ROCm/sglang-ci is in the ROCm org, where only org owners can invite an
+# outside collaborator; once one has, the first step accepts the invitation
+# with the same token, so nobody has to log in as amd-bot.
 
 on:
   schedule:
@@ -69,12 +71,8 @@ jobs:
       # the job: nothing here outlives the run on a shared, long-lived runner.
       - name: Set up the work directory
         env:
-          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN || secrets.GH_PAT }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::secrets.SGLANG_CI_TOKEN is not set; see the header of this workflow."
-            exit 1
-          fi
           W="$RUNNER_TEMP/covaudit"
           rm -rf "$W" && mkdir -p "$W/out" "$W/tools" "$W/claude-config"
           echo "W=$W" >> "$GITHUB_ENV"
@@ -88,13 +86,31 @@ jobs:
             echo "$W/tools/bin" >> "$GITHUB_PATH"
           fi
           python3 -m pip install -q flask flask-caching requests
+          GH=$(command -v gh || echo "$W/tools/bin/gh")
+
+          # Accept a pending invitation to the target repo, then require admin.
+          INV=$("$GH" api /user/repository_invitations \
+                  --jq ".[] | select(.repository.full_name == \"$TARGET_REPO\") | .id" || true)
+          INV=${INV%%$'\n'*}
+          if [ -n "$INV" ]; then
+            "$GH" api -X PATCH "/user/repository_invitations/$INV" --silent && echo "accepted the $TARGET_REPO invitation"
+          fi
+          LOGIN=$("$GH" api user --jq .login)
+          ADMIN=$("$GH" api "repos/$TARGET_REPO" --jq .permissions.admin 2>/dev/null || echo none)
+          if [ "$ADMIN" != "true" ]; then
+            echo "::error::$LOGIN is not an admin on $TARGET_REPO. A ROCm org owner has to invite $LOGIN there with the admin role, or set secrets.SGLANG_CI_TOKEN to an admin's PAT. See the header of this workflow."
+            exit 1
+          fi
+          # Commits are authored by whoever owns the token.
+          echo "AUTHOR_NAME=$LOGIN" >> "$GITHUB_ENV"
+          echo "AUTHOR_EMAIL=$("$GH" api user --jq '"\(.id)+\(.login)@users.noreply.github.com"')" >> "$GITHUB_ENV"
 
       # A PR an earlier run opened but could not merge (main moved under it,
       # or the merge was refused). Merge it first so this run builds on it.
       - name: Merge a leftover audit PR
         if: env.DRY_RUN != 'true'
         env:
-          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN || secrets.GH_PAT }}
         run: |
           gh pr list -R "$TARGET_REPO" --state open --json number,headRefName,mergeable \
             --jq '.[] | select(.headRefName | startswith("amd/coverage-exclusion-")) | "\(.number) \(.mergeable)"' |
@@ -110,7 +126,7 @@ jobs:
       # so nothing on disk the agent can read holds it.
       - name: Clone ROCm/sglang-ci and upstream sglang
         env:
-          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN || secrets.GH_PAT }}
         run: |
           cd "$W"
           AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
@@ -126,7 +142,7 @@ jobs:
       - name: Pick files to audit
         id: prepare
         env:
-          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN || secrets.GH_PAT }}
         run: |
           cd "$W"
           gh api "repos/$TARGET_REPO/contents/$LEDGER_PATH?ref=log" \
@@ -197,7 +213,7 @@ jobs:
       - name: Measure before / after
         if: steps.apply.outputs.excluded > 0
         env:
-          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN || secrets.GH_PAT }}
         run: |
           cd "$W"
           for attempt in 1 2; do
@@ -213,7 +229,7 @@ jobs:
       - name: Check the coverage pages render
         if: steps.apply.outputs.excluded > 0
         env:
-          GITHUB_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.SGLANG_CI_TOKEN || secrets.GH_PAT }}
           USE_DATABASE: 'false'
         run: |
           cd "$W/sglang-ci/dashboard"
@@ -234,7 +250,7 @@ jobs:
         id: pr
         if: steps.apply.outputs.excluded > 0 && env.DRY_RUN != 'true'
         env:
-          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN || secrets.GH_PAT }}
           N: ${{ steps.apply.outputs.excluded }}
         run: |
           cd "$W"
@@ -248,7 +264,7 @@ jobs:
           cd sglang-ci
           git checkout -q -b "$BRANCH"
           git add upstream_ci/compare_suites.py
-          git -c user.name=Michael -c user.email=13900043+michaelzhang-ai@users.noreply.github.com \
+          git -c user.name="$AUTHOR_NAME" -c user.email="$AUTHOR_EMAIL" \
             commit -q -F - <<EOF
           $TITLE
 
@@ -267,7 +283,7 @@ jobs:
           if gh pr merge "$NUM" -R "$TARGET_REPO" --admin --squash; then
             echo "status=merged" >> "$GITHUB_OUTPUT"
           else
-            echo "status=open; merge refused (is SGLANG_CI_TOKEN an admin's?)" >> "$GITHUB_OUTPUT"
+            echo "status=open; merge refused (is $AUTHOR_NAME still an admin there?)" >> "$GITHUB_OUTPUT"
             echo "::warning::$URL is open: the admin merge was refused"
           fi
 
@@ -277,7 +293,7 @@ jobs:
       - name: Update the ledger
         if: env.DRY_RUN != 'true'
         env:
-          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN || secrets.GH_PAT }}
           PR_REF: ${{ steps.pr.outputs.ref }}
         run: |
           cd "$W"
