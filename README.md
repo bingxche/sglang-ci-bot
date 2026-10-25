@@ -545,13 +545,14 @@ agent prompt next to it, and the ledger of already-audited files
 Its documentation lives with that code, in ROCm/sglang-ci's
 `sglang-ci-dashboard` skill.
 
-It acts on ROCm/sglang-ci as amd-bot, through the existing `GH_PAT` (or
-`SGLANG_CI_TOKEN`, if set). amd-bot has to be an **admin** collaborator there,
-because that repo's `main` ruleset requires a review only admins can bypass,
-and in the ROCm org only org owners can invite an outside collaborator. Once
-one has, the job's first step accepts the pending invitation with the same
-token. Until then it stops at that step with an error saying so. Commits are
-authored by the token's owner.
+It acts on ROCm/sglang-ci as the owner of the token it uses: `SGLANG_CI_TOKEN`
+if set, otherwise `GH_PAT`. That account has to be an **admin** collaborator
+there, because that repo's `main` ruleset requires a review only admins can
+bypass. The token also has to be authorized for the ROCm org's SSO. In the
+ROCm org only org owners can invite an outside collaborator; once one has,
+the job's first step accepts the pending invitation with the same token.
+When access is missing, that step stops and quotes GitHub's reason. Commits
+are authored by the token's owner.
 
 Each run: builds the gap list with `main`'s rules; picks the files the ledger
 has not seen, plus kept files upstream changed since; splits them into shards

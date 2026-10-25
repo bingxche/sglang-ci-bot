@@ -23,12 +23,13 @@ name: Coverage Exclusion Audit
 # before/after coverage check must move exactly the excluded files. Every
 # write (commit, push, PR, merge, ledger) happens in later steps.
 #
-# Token for ROCm/sglang-ci: secrets.SGLANG_CI_TOKEN if set, else the bot's
-# own GH_PAT (amd-bot). That account must be an admin collaborator there:
-# the main ruleset requires an approving review only repo admins can bypass.
-# ROCm/sglang-ci is in the ROCm org, where only org owners can invite an
-# outside collaborator; once one has, the first step accepts the invitation
-# with the same token, so nobody has to log in as amd-bot.
+# Token for ROCm/sglang-ci: secrets.SGLANG_CI_TOKEN if set, else this repo's
+# GH_PAT. The job acts as that token's owner, who must be an admin
+# collaborator there (the main ruleset requires an approving review only
+# repo admins can bypass), and the token must be authorized for the ROCm
+# org's SSO. Only ROCm org owners can invite an outside collaborator; once one
+# has, the first step accepts the invitation with the same token. It stops
+# with GitHub's own message when access is missing.
 
 on:
   schedule:
@@ -96,9 +97,14 @@ jobs:
             "$GH" api -X PATCH "/user/repository_invitations/$INV" --silent && echo "accepted the $TARGET_REPO invitation"
           fi
           LOGIN=$("$GH" api user --jq .login)
-          ADMIN=$("$GH" api "repos/$TARGET_REPO" --jq .permissions.admin 2>/dev/null || echo none)
+          # gh prints the response body on errors too; its message (e.g. a SAML
+          # SSO enforcement notice) says why access failed. It holds no secret.
+          RESP=$("$GH" api "repos/$TARGET_REPO" 2>/dev/null || true)
+          ADMIN=$(printf '%s' "$RESP" | jq -r '.permissions.admin // empty' 2>/dev/null || true)
           if [ "$ADMIN" != "true" ]; then
-            echo "::error::$LOGIN is not an admin on $TARGET_REPO. A ROCm org owner has to invite $LOGIN there with the admin role, or set secrets.SGLANG_CI_TOKEN to an admin's PAT. See the header of this workflow."
+            MSG=$(printf '%s' "$RESP" | jq -r '.message // empty' 2>/dev/null | head -c 300 || true)
+            MSG=${MSG%.}
+            echo "::error::$LOGIN (the owner of this token) has no admin access to $TARGET_REPO${MSG:+; GitHub says: $MSG}. If $LOGIN is already an admin there, the token is probably not authorized for the ROCm org's SSO. Otherwise a ROCm org owner has to invite $LOGIN with the admin role, or set secrets.SGLANG_CI_TOKEN to an admin's PAT. See the header of this workflow."
             exit 1
           fi
           # Commits are authored by whoever owns the token.
