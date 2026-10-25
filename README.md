@@ -21,6 +21,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 | PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, separates CI completeness from executed failure attribution, determines if executed failures are PR-related, and warns when required downstream jobs were fast-fail skipped or when the AMD test covering a changed code path did not run |
 | Comment Watcher | `watch_comments.py` | Daemon (15s poll) + Cron (5min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches workflows |
+| Coverage Exclusion Audit (weekly) | `upstream_ci/coverage_audit/audit.py` in [ROCm/sglang-ci](https://github.com/ROCm/sglang-ci) | `coverage-audit.yml` schedule, **Mondays 16:07 UTC**; manual dry run | Keeps the AMD-vs-NVIDIA coverage number on ROCm/sglang-ci's `/coverage` page honest: finds NVIDIA tests that newly joined its "NVIDIA tests not run on AMD" gap list, has Claude Code decide which can never run on ROCm, and opens and merges a ROCm/sglang-ci PR adding those to `AMD_EXCLUSION_REASONS`. It runs here only because these runners can reach the AMD LLM Gateway; the code, prompt and ledger live in ROCm/sglang-ci. The agent gets no token and no shell (`--tools Read,Grep,Glob --restricted`, under `env -i`, in the job's temp directory), and its answer is validated before any step writes. See [Coverage exclusion audit](#coverage-exclusion-audit). |
 
 ### Supported commands
 
@@ -294,6 +295,7 @@ The bot uses **two GitHub accounts**:
 | Daemon comment watcher + CI monitor (runner-1) | `BOT_PAT` env var (amd-bot's PAT) | amd-bot |
 | Claude Code agent (all containers) | `GH_PAT` env var | amd-bot |
 | Runner registration (`entrypoint.sh`) | `GH_PAT` env var (bingxche's PAT) | bingxche |
+| Coverage Exclusion Audit (`coverage-audit.yml`) | `secrets.SGLANG_CI_TOKEN` (a ROCm/sglang-ci admin's PAT) | that admin, on ROCm/sglang-ci only |
 
 ---
 
@@ -319,6 +321,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 | `GH_PAT` | amd-bot's GitHub PAT |
 | `LLM_GATEWAY_KEY` | AMD LLM Gateway subscription key |
 | `LLM_GATEWAY_URL` | AMD LLM Gateway endpoint (e.g. `https://llm-api.amd.com/Anthropic`) |
+| `SGLANG_CI_TOKEN` | PAT for `coverage-audit.yml`: contents + pull requests write on ROCm/sglang-ci. Its `main` ruleset requires a review only repo admins can bypass, so it must be an admin's token for the merge to go through |
 
 **Variables:**
 
@@ -326,6 +329,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 |----------|-------|
 | `USE_AGENT` | `true` to enable agent mode in workflow-triggered reviews and CI checks |
 | `SUSPECT_PR_COMMENTS` | `dry-run` (default when unset), `post`, or `off`. See [Suspect PR comments](#suspect-pr-comments). |
+| `COVERAGE_AUDIT_MODEL` | Optional `--model` for `coverage-audit.yml` (default `opus`, resolved through the runner's `ANTHROPIC_DEFAULT_OPUS_MODEL`) |
 
 ### Deploy self-hosted runners
 
@@ -530,6 +534,43 @@ Each workflow report includes the sglang commit (`head_sha`) in the header, and 
 
 ---
 
+## Coverage exclusion audit
+
+`coverage-audit.yml` is a guest here: it maintains the exclusion list behind
+ROCm/sglang-ci's `/coverage` page and needs these runners only because the AMD
+LLM Gateway does not resolve on GitHub-hosted ones. Everything it runs comes
+from a fresh ROCm/sglang-ci clone: `upstream_ci/coverage_audit/audit.py`, the
+agent prompt next to it, and the ledger of already-audited files
+(`upstream_ci/coverage_audit/reviewed.json` on that repo's `log` branch).
+Its documentation lives with that code, in ROCm/sglang-ci's
+`sglang-ci-dashboard` skill.
+
+Each run: builds the gap list with `main`'s rules; picks the files the ledger
+has not seen, plus kept files upstream changed since; splits them into shards
+of 35 and runs one Claude Code agent per shard in parallel; refuses the
+answer if it contains a credential; applies the verdicts to
+`compare_suites.py`; runs that repo's `upstream_ci/test_*.py`; checks the
+before/after gap lists differ by exactly the excluded files and that
+`/coverage` still renders; then opens the PR, merges it with `--admin`, and
+writes the ledger back.
+
+Isolation, because the agent reads upstream sglang test files anyone can land
+text in:
+
+- The job works in `$RUNNER_TEMP`, never the shared workspace that holds this
+  repo's checkout and `agent/CLAUDE.md`, and the runner deletes it afterwards.
+- Clones are made with a one-off auth header, so no `.git/config` holds a token.
+- The agent starts under `env -i` with only `PATH`, a throwaway `HOME` /
+  `CLAUDE_CONFIG_DIR`, and the gateway variables, so the container's `GH_PAT`
+  and `BOT_PAT` are not in its environment; `--tools Read,Grep,Glob
+  --restricted --strict-mcp-config` leaves it those three tools inside the
+  temp directory, with no settings files or MCP servers.
+- Only validated outputs are uploaded as artifacts (this repo is public), never
+  the agent transcripts.
+
+Manual dry run (no PR, ledger untouched): Actions > Coverage Exclusion Audit >
+Run workflow with `dry_run` checked, optionally `max_files` to cap cost.
+
 ## Concurrency and idempotency
 
 | Workflow | Concurrency group | Behavior |
@@ -539,6 +580,7 @@ Each workflow report includes the sglang commit (`head_sha`) in the header, and 
 | `comment-watcher.yml` | Single instance | One watcher at a time |
 | `ci-monitor.yml` | Single instance at workflow level (`group: ci-monitor`); inside each dispatch, `prepare` job runs once → `monitor` matrix (max-parallel 8, one per workflow file) → `finalize` job runs once (`needs: monitor`, `if: always()`) | Only one monitor *dispatch* runs at a time; within it, the prepare step seeds the daily issue once, then up to 8 per-workflow analyses run in parallel (each producing failures independently rebuilds the Daily Cross-Workflow Summary — last writer wins, convergent). After all matrix jobs finish, the single `finalize` job checks the suspect PRs (`suspect_pr_comments.py`) and updates the upstream per-workflow Failure Trackers (`failure_tracker.py`) once, seeing the fully-populated daily issue. |
 | `analyze-ci.yml` | Per run ID | Independent analyses run concurrently |
+| `coverage-audit.yml` | Single instance (`group: coverage-audit`) | One audit at a time; a PR an earlier run could not merge is merged at the start of the next |
 
 The comment watcher uses **reaction-based idempotency**: before dispatching, it checks if amd-bot has already added a `rocket` reaction to the comment. Both daemon and cron watcher share this mechanism, so running both simultaneously is safe.
 
@@ -1046,6 +1088,10 @@ sglang-ci-bot/
     pr-review.yml           PR review (repository_dispatch + workflow_dispatch)
     comment-watcher.yml     Comment poller (cron every 5min, fallback for the
                               runner-1 daemon)
+    coverage-audit.yml      Weekly coverage exclusion audit for ROCm/sglang-ci
+                              (cron Mondays 16:07 UTC + workflow_dispatch dry run).
+                              Runs ROCm/sglang-ci's upstream_ci/coverage_audit/;
+                              works entirely in $RUNNER_TEMP.
   runner/
     Dockerfile              Runner image: Python 3.12, Node.js 22, Claude Code CLI, GitHub Actions runner
     setup.sh                Multi-runner deployment (default 10 containers)
@@ -1108,6 +1154,7 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py'
 | `NOTION_STAGING_DATA_SOURCE_ID` | `stage_notion.py sync` | Isolated data source titled `SGLang AMD CI Staging Errors`; the only write destination |
 | `AGENT_WORKSPACE` | Agent mode | Base directory for sglang clone (default: `/workspace`) |
 | `AGENT_GH_TOKEN` | Agent mode | Optional read-only GitHub token; replaces `GH_PAT` / `GH_TOKEN` in the agent's env (the scripts keep the posting token) |
+| `SGLANG_CI_TOKEN` | `coverage-audit.yml` | ROCm/sglang-ci token for checkout, ledger, PR and merge; never present in the agent step |
 | `AGENT_ARCHIVE_DIR` | Agent mode | If set, the prompt and agent session log (secrets redacted) of every agent run are copied here; `ci-status-check.yml` uploads it as an artifact (30 days; the repo is public, so artifacts are too) |
 | `CI_STATUS_OUT_DIR` | `check_ci_for_pr.py` | Same as `--out-dir` |
 | `CI_STATUS_AGENT_TIMEOUT` | `check_ci_for_pr.py` | PR CI Status Check agent timeout in seconds (default: `2400` = 40 min) |
@@ -1160,3 +1207,4 @@ CI monitor dispatch: `entrypoint.sh` dispatches `ci-monitor.yml` via `workflow_d
 
 - `ci-monitor.yml`: triggered hourly by runner-1 via `workflow_dispatch`
 - `comment-watcher.yml`: `'*/5 * * * *'` (every 5 minutes)
+- `coverage-audit.yml`: `'7 16 * * 1'` (Mondays 16:07 UTC)

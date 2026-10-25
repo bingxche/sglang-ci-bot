@@ -1,0 +1,330 @@
+name: Coverage Exclusion Audit
+
+# Weekly audit for the ROCm/sglang-ci /coverage page: find NVIDIA tests that
+# newly joined its "NVIDIA tests not run on AMD" gap list, decide which can
+# never run on ROCm, and open and merge a ROCm/sglang-ci PR adding those to
+# AMD_EXCLUSION_REASONS in upstream_ci/compare_suites.py.
+#
+# It runs here only because these runners can reach the AMD LLM gateway; on
+# GitHub-hosted runners llm-api.amd.com does not resolve. The code it runs
+# lives in ROCm/sglang-ci (upstream_ci/coverage_audit/: audit.py and the agent
+# prompt), next to the file it edits, and so does its state: the ledger of
+# audited files, upstream_ci/coverage_audit/reviewed.json on that repo's `log`
+# branch.
+#
+# The agent reads upstream sglang test files, which anyone who lands an
+# upstream PR controls. So it gets no token and no shell: it runs in this
+# job's temp directory (never the shared workspace, which holds the bot
+# checkout and agent/CLAUDE.md), under `env -i` with only the gateway
+# variables, with `--tools Read,Grep,Glob --restricted`: those three tools
+# are all it has, confined to that directory, with no settings files or MCP
+# servers. Its answer is data: audit.py
+# refuses it if it contains a credential, validates every verdict, and the
+# before/after coverage check must move exactly the excluded files. Every
+# write (commit, push, PR, merge, ledger) happens in later steps.
+#
+# Secrets: LLM_GATEWAY_KEY / LLM_GATEWAY_URL (existing) and SGLANG_CI_TOKEN, a
+# PAT that can push to, open PRs on and merge PRs in ROCm/sglang-ci. Its main
+# ruleset requires an approving review that only repo admins can bypass, so
+# the token has to belong to an admin there for the merge to go through.
+
+on:
+  schedule:
+    - cron: '7 16 * * 1'  # Mondays 16:07 UTC (9:07 AM US Pacific)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Audit and validate, but open no PR and leave the ledger alone'
+        type: boolean
+        default: false
+      max_files:
+        description: 'Audit at most this many files (0 = all due)'
+        required: false
+        default: '0'
+      model:
+        description: 'Claude Code --model (empty = opus)'
+        required: false
+        default: ''
+
+concurrency:
+  group: coverage-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: [self-hosted, amd-internal]
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    env:
+      TARGET_REPO: ROCm/sglang-ci
+      LEDGER_PATH: upstream_ci/coverage_audit/reviewed.json
+      DRY_RUN: ${{ github.event.inputs.dry_run == 'true' }}
+      MAX_FILES: ${{ github.event.inputs.max_files || '0' }}
+      MODEL: ${{ github.event.inputs.model || vars.COVERAGE_AUDIT_MODEL || 'opus' }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      # Everything happens under $RUNNER_TEMP, which the runner deletes after
+      # the job: nothing here outlives the run on a shared, long-lived runner.
+      - name: Set up the work directory
+        env:
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::secrets.SGLANG_CI_TOKEN is not set; see the header of this workflow."
+            exit 1
+          fi
+          W="$RUNNER_TEMP/covaudit"
+          rm -rf "$W" && mkdir -p "$W/out" "$W/tools" "$W/claude-config"
+          echo "W=$W" >> "$GITHUB_ENV"
+          echo "AUDIT=$W/sglang-ci/upstream_ci/coverage_audit/audit.py" >> "$GITHUB_ENV"
+          echo "COVERAGE_CACHE_PATH=$W/out/coverage_cache.json" >> "$GITHUB_ENV"
+          if ! command -v gh > /dev/null; then
+            V=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  https://api.github.com/repos/cli/cli/releases/latest | jq -r .tag_name)
+            curl -fsSL "https://github.com/cli/cli/releases/download/${V}/gh_${V#v}_linux_amd64.tar.gz" \
+              | tar xz -C "$W/tools" --strip-components=1
+            echo "$W/tools/bin" >> "$GITHUB_PATH"
+          fi
+          python3 -m pip install -q flask flask-caching requests
+
+      # A PR an earlier run opened but could not merge (main moved under it,
+      # or the merge was refused). Merge it first so this run builds on it.
+      - name: Merge a leftover audit PR
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+        run: |
+          gh pr list -R "$TARGET_REPO" --state open --json number,headRefName,mergeable \
+            --jq '.[] | select(.headRefName | startswith("amd/coverage-exclusion-")) | "\(.number) \(.mergeable)"' |
+          while read -r num mergeable; do
+            if [ "$mergeable" = "MERGEABLE" ] && gh pr merge "$num" -R "$TARGET_REPO" --admin --squash; then
+              echo "merged leftover #$num"
+            else
+              echo "::warning::Audit PR $TARGET_REPO#$num is $mergeable; leaving it for a human"
+            fi
+          done
+
+      # The token goes in a one-off header, never into a clone's .git/config,
+      # so nothing on disk the agent can read holds it.
+      - name: Clone ROCm/sglang-ci and upstream sglang
+        env:
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+        run: |
+          cd "$W"
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c http.https://github.com/.extraheader="$AUTH" clone -q --depth 1 \
+            "https://github.com/$TARGET_REPO" sglang-ci
+          git -C sglang-ci worktree add -q --detach ../base HEAD
+          # Blobless: full history for "changed since it was kept", contents
+          # only for main's tree and the diffs prepare writes.
+          git clone -q --filter=blob:none https://github.com/sgl-project/sglang upstream
+          git -C sglang-ci log -1 --format="$TARGET_REPO %h %s"
+          git -C upstream log -1 --format='sgl-project/sglang %h %cs %s'
+
+      - name: Pick files to audit
+        id: prepare
+        env:
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+        run: |
+          cd "$W"
+          gh api "repos/$TARGET_REPO/contents/$LEDGER_PATH?ref=log" \
+            -H "Accept: application/vnd.github.raw" > out/ledger.json
+          python3 "$AUDIT" report --rules-dir base --out out/gap.json
+          python3 "$AUDIT" prepare --report out/gap.json --ledger out/ledger.json \
+            --upstream upstream --max-files "$MAX_FILES" --diff-dir out/diffs --out out/todo.json
+          python3 "$AUDIT" prompt --todo out/todo.json --out-dir out
+
+      - name: Audit with Claude Code
+        if: steps.prepare.outputs.count != '0'
+        timeout-minutes: 90
+        env:
+          LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
+          LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
+          SHARDS: ${{ steps.prepare.outputs.shards }}
+        run: |
+          cd "$W"
+          claude --version
+          # Model aliases from the runner's claude.env (ANTHROPIC_DEFAULT_*),
+          # if present, are passed through so `opus` resolves as it does for
+          # the bot's own agents.
+          PASS=()
+          for v in ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL; do
+            [ -n "${!v:-}" ] && PASS+=("$v=${!v}")
+          done
+          for i in $SHARDS; do
+            env -i PATH="$PATH" HOME="$W/claude-config" LANG=C.UTF-8 \
+              CLAUDE_CONFIG_DIR="$W/claude-config" \
+              ANTHROPIC_BASE_URL="$LLM_GATEWAY_URL" ANTHROPIC_API_KEY=dummy \
+              ANTHROPIC_CUSTOM_HEADERS="Ocp-Apim-Subscription-Key: $LLM_GATEWAY_KEY" \
+              CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \
+              "${PASS[@]}" \
+              claude -p "$(cat "out/prompt_$i.md")" \
+                --model "$MODEL" \
+                --output-format stream-json --verbose \
+                --max-turns 400 \
+                --tools Read,Grep,Glob --restricted --strict-mcp-config \
+                --permission-mode dontAsk --setting-sources "" --disable-slash-commands \
+                < /dev/null > "out/agent_$i.jsonl" &
+          done
+          wait
+          python3 "$AUDIT" parse-agent --agent out/agent_*.jsonl --out out/result.json
+
+      - name: Apply verdicts
+        id: apply
+        if: steps.prepare.outputs.count != '0'
+        run: |
+          cd "$W"
+          python3 "$AUDIT" apply --todo out/todo.json --result out/result.json \
+            --upstream upstream --compare-suites sglang-ci/upstream_ci/compare_suites.py \
+            --out out/applied.json
+          git -C sglang-ci diff --stat
+
+      - name: Run upstream_ci tests
+        if: steps.apply.outputs.excluded > 0
+        run: |
+          cd "$W"
+          fail=0
+          for t in sglang-ci/upstream_ci/test_*.py; do
+            python3 "$t" > "out/$(basename "$t").log" 2>&1 && echo "ok   $t" \
+              || { echo "FAIL $t"; tail -20 "out/$(basename "$t").log"; fail=1; }
+          done
+          exit $fail
+
+      # Back to back on a warm cache, so both read the same upstream tree. One
+      # retry covers upstream main moving between the two.
+      - name: Measure before / after
+        if: steps.apply.outputs.excluded > 0
+        env:
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+        run: |
+          cd "$W"
+          for attempt in 1 2; do
+            python3 "$AUDIT" report --rules-dir base --out out/before.json
+            python3 "$AUDIT" report --rules-dir sglang-ci --out out/after.json
+            if python3 "$AUDIT" compare --before out/before.json --after out/after.json \
+                 --applied out/applied.json --out out/numbers.json; then
+              exit 0
+            fi
+          done
+          exit 1
+
+      - name: Check the coverage pages render
+        if: steps.apply.outputs.excluded > 0
+        env:
+          GITHUB_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          USE_DATABASE: 'false'
+        run: |
+          cd "$W/sglang-ci/dashboard"
+          SGL_BENCHMARK_CI_DIR="$W/sglang-ci" python3 - <<'EOF'
+          import sys
+          import app
+          client = app.app.test_client()
+          bad = []
+          for url in ("/coverage", "/api/coverage/overview"):
+              code = client.get(url).status_code
+              print(url, code)
+              if code != 200:
+                  bad.append(url)
+          sys.exit(1 if bad else 0)
+          EOF
+
+      - name: Open and merge the PR
+        id: pr
+        if: steps.apply.outputs.excluded > 0 && env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          N: ${{ steps.apply.outputs.excluded }}
+        run: |
+          cd "$W"
+          python3 "$AUDIT" pr-body --todo out/todo.json --applied out/applied.json \
+            --numbers out/numbers.json --run-url "$RUN_URL" --out out/pr_body.md
+          s=$([ "$N" = 1 ] && echo "" || echo "s")
+          TITLE="coverage: exclude $N more NVIDIA-only test$s from AMD coverage"
+          BRANCH="amd/coverage-exclusion-$(date -u +%Y%m%d)"
+          BATCH=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['batch'])" out/applied.json)
+
+          cd sglang-ci
+          git checkout -q -b "$BRANCH"
+          git add upstream_ci/compare_suites.py
+          git -c user.name=Michael -c user.email=13900043+michaelzhang-ai@users.noreply.github.com \
+            commit -q -F - <<EOF
+          $TITLE
+
+          Batch $BATCH of the weekly coverage-exclusion audit; the PR lists each blocker.
+
+          Co-Authored-By: Claude <noreply@anthropic.com>
+          EOF
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c http.https://github.com/.extraheader="$AUTH" push -q origin "HEAD:refs/heads/$BRANCH"
+
+          URL=$(gh pr create -R "$TARGET_REPO" --base main --head "$BRANCH" --title "$TITLE" \
+                  --body-file "$W/out/pr_body.md")
+          NUM=${URL##*/}
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "ref=$TARGET_REPO#$NUM" >> "$GITHUB_OUTPUT"
+          if gh pr merge "$NUM" -R "$TARGET_REPO" --admin --squash; then
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=open; merge refused (is SGLANG_CI_TOKEN an admin's?)" >> "$GITHUB_OUTPUT"
+            echo "::warning::$URL is open: the admin merge was refused"
+          fi
+
+      # Excluded verdicts are recorded only once their PR exists (this step is
+      # skipped if opening it failed), so a lost PR gets re-audited rather
+      # than silently counted as done.
+      - name: Update the ledger
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN }}
+          PR_REF: ${{ steps.pr.outputs.ref }}
+        run: |
+          cd "$W"
+          APPLIED=()
+          [ -f out/applied.json ] && APPLIED=(--applied out/applied.json)
+          python3 "$AUDIT" ledger --ledger out/ledger.json "${APPLIED[@]}" \
+            --report out/gap.json --upstream upstream --pr "$PR_REF" --out out/ledger.new.json
+          if cmp -s out/ledger.json out/ledger.new.json; then
+            echo "ledger unchanged"; exit 0
+          fi
+          # Request body from a file: the base64 ledger outgrows one argv entry.
+          SHA=$(gh api "repos/$TARGET_REPO/contents/$LEDGER_PATH?ref=log" --jq .sha)
+          python3 - out/ledger.new.json "$SHA" > out/ledger_put.json <<'EOF'
+          import base64, json, sys, time
+          print(json.dumps({
+              "message": "coverage audit: ledger " + time.strftime("%Y-%m-%d", time.gmtime()),
+              "content": base64.b64encode(open(sys.argv[1], "rb").read()).decode(),
+              "branch": "log",
+              "sha": sys.argv[2],
+          }))
+          EOF
+          gh api -X PUT "repos/$TARGET_REPO/contents/$LEDGER_PATH" --input out/ledger_put.json --jq .commit.sha
+
+      - name: Summary
+        if: always()
+        env:
+          PR_URL: ${{ steps.pr.outputs.url }}
+          PR_STATUS: ${{ steps.pr.outputs.status }}
+        run: |
+          [ -n "${W:-}" ] && [ -f "${AUDIT:-}" ] || exit 0
+          cd "$W"
+          NOTE=""
+          [ "$DRY_RUN" = "true" ] && NOTE="Dry run: no PR opened, ledger not written."
+          python3 "$AUDIT" summary --todo out/todo.json --applied out/applied.json \
+            --numbers out/numbers.json --pr "$PR_URL" --merge-status "$PR_STATUS" \
+            --note "$NOTE" --out out/summary.md && cat out/summary.md >> "$GITHUB_STEP_SUMMARY"
+          # This repo is public: keep only the validated outputs for upload,
+          # never the agent transcripts.
+          rm -rf "$GITHUB_WORKSPACE/coverage-audit-out" && mkdir -p "$GITHUB_WORKSPACE/coverage-audit-out"
+          cp out/todo.json out/result.json out/applied.json out/numbers.json out/pr_body.md out/summary.md \
+            "$GITHUB_WORKSPACE/coverage-audit-out/" 2>/dev/null || true
+
+      - name: Upload audit outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-audit-${{ github.run_id }}
+          path: coverage-audit-out/
+          if-no-files-found: ignore
+          retention-days: 30
