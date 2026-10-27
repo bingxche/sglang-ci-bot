@@ -13,6 +13,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 | Feature | Script | Trigger | What it does |
 |---------|--------|---------|--------------|
 | Cron CI Monitor | `ensure_daily_issue.py` (prepare step) + `monitor_ci.py` (per-workflow matrix) | Runner-1 dispatches `ci-monitor.yml` hourly | `ci-monitor.yml` first runs a `prepare` job that calls `ensure_daily_issue.py` (idempotently creates today's daily issue with the Daily Cross-Workflow Summary placeholder seeded in its body), then fans out a `monitor` matrix job — **max-parallel 8, one entry per workflow file** in `MONITORED_WORKFLOWS`. Each matrix job analyses its workflow's failures with historical comparison and regression detection, then posts/PATCHes a per-workflow comment on the daily issue. Gate/finish jobs are automatically skipped. For `nightly-amd-mi355x-disagg.yml`, per-job analysis pre-downloads the run's `mi355x-*` artifacts and unpacks bundled prefill/decode/router logs into `.ci-context/mi355x-artifacts` before invoking the agent. Reports group failures into **symptom clusters** with **confidence-labeled hypotheses** rather than asserted root causes. After its workflow has any new failure analysed, the matrix job auto-invokes `daily_cross_workflow_summary.build_and_publish_summary()` to refresh the Daily Cross-Workflow Summary pinned in the issue body. |
+| Auto-rerun of transient failures | `auto_rerun.py` | Called by each `monitor_ci.py` matrix job (`--output daily-issue` only) for every failed run | Re-runs **only the failed jobs** of a scheduled run when their logs end in a transient infrastructure error (network reset, DNS, timeout, upstream 5xx), once per run. The decision is deterministic (log patterns, no agent) and shown in an **Auto-rerun** table in the workflow's daily report. Controlled by the `AUTO_RERUN` variable and needs the `AUTO_RERUN_TOKEN` secret. See [Auto-rerun](#auto-rerun). |
 | Daily Cross-Workflow Summary | `daily_cross_workflow_summary.py` | Auto-invoked by each `monitor_ci.py` matrix job that produced new failures (gated by `BUILD_DAILY_SUMMARY` env, default enabled); also CLI | Aggregates per-job analyses from ALL monitored workflows into a single rolling **Daily Cross-Workflow Summary** **pinned in the daily issue's body** (above all per-workflow comments) between `<!-- daily-cross-workflow-summary:start -->` / `<!-- daily-cross-workflow-summary:end -->` placeholder markers. Deduplicates symptom clusters across workflows (same cluster spanning `pr-test-amd` + `nightly-test-amd` is one entry, not two). PATCHes the issue body in place, replacing only the content between the placeholders (matching the legacy `ci-monitor-daily-status-board` markers too, so older issues migrate in place). Legacy summary *comments* from before this move are auto-deleted by `_cleanup_legacy_summary_comments`. |
 | Failure Trackers (per workflow) | `failure_tracker.py` | A `finalize` job in `ci-monitor.yml` (`needs: monitor`), once per hourly tick after the whole matrix completes | Maintains **one long-lived issue per tracked workflow on the upstream `sgl-project/sglang` repo** (`[Failure Tracker] <workflow>`), each a persistent fact record of every test failure that workflow has shown — one unified, transparent place to see every AMD CI failure and how long it has been red. **Content** (which tests failed, error, cluster, regression status) is found by a small, dedicated agent task (`Task: Failure Tracker Data`) reading the SAME per-job analyses the daily report is built from — kept consistent with the daily report, and decoupled from the giant Daily Cross-Workflow Summary prose (the earlier "append JSON to the summary output" approach was observed to silently drop the block). A deterministic fallback parses the per-job `### Failed Tests` tables if the agent is unavailable. **State** (each failure's `first_seen` date, duration, dedup-by-test) is owned by deterministic Python — a hidden JSON blob in the issue body, NEVER recomputed — so a test red for months keeps an accurate "Broken since" date independent of the daily report's short lookback or GitHub's log retention. Config-driven via `TRACKED_WORKFLOWS`: add a workflow → it gets its own ledger issue. |
 | Suspect PR comments | `suspect_pr_comments.py` | The `finalize` job in `ci-monitor.yml`, once per hourly tick | Reads the suspect PRs the Daily Cross-Workflow Summary names for each cluster, checks them in code (FACT/HIGH confidence, no fix PR, ≥2 failed jobs, PR merged in the last 14 days, commit verified between the last passing and first failing commit), and comments on the merged sglang PR. **Dry run by default**: records what it would post in one comment on the daily issue until the `SUSPECT_PR_COMMENTS` repository variable is set to `post`. See [Suspect PR comments](#suspect-pr-comments). |
@@ -93,8 +94,11 @@ runner-1 entrypoint.sh (sleep 3600) ─┐
                                             24h). Most workflows use `schedule`;
                                             AMD AITER Scout also includes manual
                                             `workflow_dispatch` runs.
-                  3. for each run, get_failed_jobs() — drop gates, dedup vs
-                     <!-- processed_job_ids: ... --> in existing comment
+                  3. for each run, get_failed_jobs() — drop gates;
+                     auto_rerun.consider_run() re-runs the failed jobs if
+                     they all hit a transient error (see Auto-rerun);
+                     dedup vs <!-- processed_job_ids: ... --> in existing
+                     comment
                   4. for each surviving failed job (up to AGENT_PARALLEL=3
                      in parallel):
                         - create_agent_worktree(job_id, head_sha)
@@ -310,6 +314,7 @@ The bot uses **two GitHub accounts**:
 | Claude Code agent (all containers) | `GH_PAT` env var | amd-bot |
 | Runner registration (`entrypoint.sh`) | `GH_PAT` env var (bingxche's PAT) | bingxche |
 | Coverage Exclusion Audit (`coverage-audit.yml`) | `secrets.GH_PAT` (amd-bot's PAT), or `secrets.SGLANG_CI_TOKEN` if set | amd-bot (admin collaborator on ROCm/sglang-ci) |
+| Auto-rerun (`auto_rerun.py`, re-run calls only) | `secrets.AUTO_RERUN_TOKEN` | Whoever owns the token (needs Actions write on sgl-project/sglang) |
 
 ---
 
@@ -336,6 +341,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 | `LLM_GATEWAY_KEY` | AMD LLM Gateway subscription key |
 | `LLM_GATEWAY_URL` | AMD LLM Gateway endpoint (e.g. `https://llm-api.amd.com/Anthropic`) |
 | `SGLANG_CI_TOKEN` | Optional. Overrides `GH_PAT` for `coverage-audit.yml` with another ROCm/sglang-ci admin's PAT |
+| `AUTO_RERUN_TOKEN` | Optional. A token with Actions write access on `sgl-project/sglang`, used only to re-run failed jobs (amd-bot has read access there). Without it, auto-rerun is a dry run. See [Auto-rerun](#auto-rerun). |
 
 **Variables:**
 
@@ -343,6 +349,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 |----------|-------|
 | `USE_AGENT` | `true` to enable agent mode in workflow-triggered reviews and CI checks |
 | `SUSPECT_PR_COMMENTS` | `dry-run` (default when unset), `post`, or `off`. See [Suspect PR comments](#suspect-pr-comments). |
+| `AUTO_RERUN` | `on` (default when unset), `dry-run`, or `off`. See [Auto-rerun](#auto-rerun). |
 | `COVERAGE_AUDIT_MODEL` | Optional `--model` for `coverage-audit.yml` (default `opus`, resolved through the runner's `ANTHROPIC_DEFAULT_OPUS_MODEL`) |
 
 ### Deploy self-hosted runners
@@ -774,6 +781,28 @@ python scripts/suspect_pr_comments.py --bot-repo bingxche/sglang-ci-bot --mode d
 | `--mode` | `SUSPECT_PR_COMMENTS` or `dry-run` | `off` / `dry-run` / `post` |
 | `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token (posts as amd-bot in production) |
 
+### Auto-rerun
+
+Some failures are just the network: a Go module download cut off by `proxy.golang.org`, a git clone reset, a 503 from a mirror. For these `monitor_ci.py` re-runs the failed jobs instead of waiting for someone to press the button. It runs inside each `monitor` matrix job, for every failed run in the lookback window, before the analysis dedup, and only with `--output daily-issue`.
+
+A run is looked at only if it is a `schedule` run, finished as `failure`, is on its first attempt (so it is re-run at most once), and finished less than 6 hours ago. For each failed non-gate job with conclusion `failure`, `auto_rerun.py` reads the 400 log lines before the last `##[error]` line and calls the job transient when they match one of `TRANSIENT_PATTERNS` (HTTP/2 stream reset, connection reset, DNS failure, network timeout, git transfer error, 502/503/504, a download cut off with `unexpected EOF`) and contain no `AssertionError` or `FAILED (failures=`. Then:
+
+| Failed jobs | Action |
+|---|---|
+| All transient | `POST /actions/runs/{id}/rerun-failed-jobs` (the failed jobs and their dependents only) |
+| Exactly one transient, others not | `POST /actions/jobs/{id}/rerun` for that job |
+| None, or several transient mixed with real failures | Nothing |
+
+Each decision is kept in the monitor state under `auto_rerun`, keyed `<run_id>:<attempt>`, for 3 days, so a run's logs are read once. Re-runs (and dry-run or failed re-runs) appear in an **Auto-rerun** table at the top of the workflow's report in the daily issue, with the matching log line. The original failed job is still analysed as usual; its re-run is a new job that the next tick picks up if it fails again.
+
+| `AUTO_RERUN` | Behavior |
+|---|---|
+| `on` (default) | Re-runs with `AUTO_RERUN_TOKEN`. Acts as `dry-run` when the secret is not set |
+| `dry-run` | Nothing is re-run; the report shows what would be |
+| `off` | No checks |
+
+`AUTO_RERUN_TOKEN` needs Actions write access on `sgl-project/sglang` (amd-bot only has read access there). It is used for the re-run calls only; everything else keeps using `GH_PAT`.
+
 ### Failure Trackers (per workflow)
 
 Long-lived issues on the upstream `sgl-project/sglang` repo — **one per tracked workflow**, titled `[Failure Tracker] <display>` — that record every failure as a persistent fact tracker, complementing the bot's rolling daily report. The goal is **transparency**: one unified place where anyone can see every AMD CI failure and exactly how long it has been red. Driven by `failure_tracker.py`, run **once per tick** by the `finalize` job in `ci-monitor.yml` (`needs: monitor`, `if: always()`) after the whole matrix completes — so it sees the fully-populated daily issue and updates each tracker exactly once (no per-matrix-job races).
@@ -1022,6 +1051,10 @@ sglang-ci-bot/
                               fan out, so concurrent find_or_create_daily_issue()
                               calls cannot race and create duplicates. Called from
                               ci-monitor.yml's prepare job.
+    auto_rerun.py           Re-runs a scheduled run's failed jobs, once, when
+                              their logs end in a transient infrastructure error
+                              (TRANSIENT_PATTERNS). Called by monitor_ci.py per
+                              failed run; renders the report's Auto-rerun table.
     monitor_ci.py           CI failure monitor (one-shot, dispatched by GitHub
                               Actions). Called once per matrix entry — exactly one
                               workflow file per process (production deployment).

@@ -37,6 +37,7 @@ from pathlib import Path
 
 import requests
 
+import auto_rerun
 from utils import (
     REPO,
     analyze_job_api,
@@ -703,13 +704,16 @@ def render_workflow_comment_parts(
     use_agent: bool = True,
     max_bytes: int = COMMENT_MAX_BYTES,
     cross_note: str = "",
+    auto_rerun_block: str = "",
 ) -> list[str]:
     """Render the workflow report as a list of comment bodies.
 
     Produces part 1 (with header / cross summary / job table) plus zero or
     more overflow parts carrying the remaining per-job ``<details>`` blocks.
     A *cross_note* is shown above the summary, behind ``CROSS_STALE_MARKER``,
-    when the summary could not be refreshed this run.
+    when the summary could not be refreshed this run. An *auto_rerun_block*
+    (from ``auto_rerun.render_records``) goes between the summary and the
+    job table.
     Every part embeds the full ``processed_job_ids`` metadata and a
     ``ci-monitor-part: i/N`` marker so that downstream readers
     (dedup + adoption logic) can recognise and reassemble the full report.
@@ -791,6 +795,7 @@ def render_workflow_comment_parts(
         note = f"{CROSS_STALE_MARKER}\n{cross_note}\n\n" if cross_note else ""
         part1_header += f"### Summary\n\n{(note + cleaned).strip()}\n\n---\n\n"
 
+    part1_header += auto_rerun_block
     part1_header += (
         f"| Job | Failed Steps | Started |\n"
         f"|-----|-------------|---------|\n"
@@ -1181,12 +1186,17 @@ def monitor_workflow(
     agent_repo_path: Path | None = None,
     event: str | None = None,
     reusable_job_analyses: dict[int, dict] | None = None,
+    auto_rerun_records: dict | None = None,
+    auto_rerun_mode: str = "off",
+    rerun_token: str = "",
 ) -> tuple[list[dict], list[int], list[dict]]:
     """Monitor a single workflow.
 
     Returns (analyses newly added to today's report, their job IDs,
     pending_info). An analysis may be reused from earlier-day state when the
-    current GitHub lookup contains the exact same job ID.
+    current GitHub lookup contains the exact same job ID. When
+    *auto_rerun_records* is given, each failed run is also passed to
+    ``auto_rerun.consider_run``, which records its decision there.
     """
     log.info("Monitoring: %s (branch: %s, event: %s)", workflow_file, branch, event or "all")
 
@@ -1216,15 +1226,26 @@ def monitor_workflow(
         log.info("  Run %d [%s/%s]: %s", run_id, run_status, run_conclusion, run_url)
 
         failed_jobs = get_failed_jobs(token, run_id)
-        if job_name_filter:
-            failed_jobs = [j for j in failed_jobs if job_name_filter in j["name"]]
-        if processed_job_ids:
-            failed_jobs = [j for j in failed_jobs if j["id"] not in processed_job_ids]
-
         gate_jobs = [j for j in failed_jobs if is_gate_job(j)]
         for gj in gate_jobs:
             log.info("    Skipping gate job: %s (ID: %d)", gj["name"], gj["id"])
         failed_jobs = [j for j in failed_jobs if not is_gate_job(j)]
+
+        # Before the filters below: the re-run decision needs every failed
+        # job of the run, including ones already analysed.
+        if auto_rerun_records is not None:
+            try:
+                auto_rerun.consider_run(
+                    token, run, failed_jobs, workflow_file, auto_rerun_records,
+                    auto_rerun_mode, rerun_token,
+                )
+            except Exception as exc:
+                log.warning("    Auto-rerun check failed for run %d: %s", run_id, exc)
+
+        if job_name_filter:
+            failed_jobs = [j for j in failed_jobs if job_name_filter in j["name"]]
+        if processed_job_ids:
+            failed_jobs = [j for j in failed_jobs if j["id"] not in processed_job_ids]
 
         reused_in_run = 0
         queued_in_run = 0
@@ -1461,9 +1482,14 @@ def publish_workflow_report(
                 f"The per-job analyses below are current; the next run retries the summary."
             )
 
+    auto_reruns = [
+        r for r in state.get("auto_rerun", {}).values()
+        if r.get("workflow") == workflow_file and r.get("at", "").startswith(date_str)
+    ]
     parts = render_workflow_comment_parts(
         workflow_file, all_analyses, pending_info, cross,
         use_agent=use_agent, cross_note=cross_note,
+        auto_rerun_block=auto_rerun.render_records(auto_reruns),
     )
     wf_state["last_pending_count"] = total_pending
 
@@ -1646,6 +1672,14 @@ def run_oneshot(
     total_reports = 0
     failed_workflows: list[str] = []
 
+    # Re-runs only from the production report path, never from stdout runs.
+    rerun_token = os.environ.get("AUTO_RERUN_TOKEN", "")
+    rerun_mode = auto_rerun.resolve_mode(os.environ.get("AUTO_RERUN"), rerun_token)
+    rerun_records: dict | None = None
+    if output == "daily-issue" and rerun_mode != "off":
+        rerun_records = state.setdefault("auto_rerun", {})
+        auto_rerun.prune_records(rerun_records)
+
     if bot_repo and not daily.get("issue_number"):
         try:
             daily["issue_number"] = find_daily_issue(token, bot_repo, date_str)
@@ -1670,6 +1704,7 @@ def run_oneshot(
             reusable_job_analyses = get_prior_analyses_by_job_id(
                 state, wf, date_str,
             )
+            known_reruns = set(rerun_records or {})
 
             new_analyses, new_ids, pending = monitor_workflow(
                 token, wf,
@@ -1681,14 +1716,24 @@ def run_oneshot(
                 use_agent=use_agent,
                 agent_repo_path=agent_repo_path,
                 event=workflow_event_filter(wf),
+                auto_rerun_records=rerun_records,
+                auto_rerun_mode=rerun_mode,
+                rerun_token=rerun_token,
+            )
+            new_reruns = any(
+                r.get("decision") != "skip"
+                for key, r in (rerun_records or {}).items()
+                if key not in known_reruns
             )
 
             # "unpublished": an earlier run analysed jobs but failed to post
             # them. A stale summary: an earlier run posted them but its
-            # cross-job agent failed, so the summary needs another try.
+            # cross-job agent failed, so the summary needs another try. A new
+            # auto-rerun is shown in the report even with no new failures.
             retry_publish = output == "daily-issue" and (
                 wf_state.get("unpublished")
                 or cross_summary_is_stale(gh_comments, wf)
+                or new_reruns
             )
             if not new_analyses and not retry_publish:
                 continue

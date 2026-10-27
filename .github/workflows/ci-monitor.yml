@@ -130,6 +130,10 @@ jobs:
           AGENT_PARALLEL: '3'
           AGENT_TIMEOUT_SECS: '1500'
           AGENT_MAX_TURNS: '150'
+          # on unless the AUTO_RERUN repository variable says otherwise; a dry
+          # run while AUTO_RERUN_TOKEN (Actions write on sglang) is unset.
+          AUTO_RERUN: ${{ vars.AUTO_RERUN || 'on' }}
+          AUTO_RERUN_TOKEN: ${{ secrets.AUTO_RERUN_TOKEN }}
         run: |
           HOURS="${{ github.event.inputs.hours_back || '24' }}"
           OUTPUT="${{ github.event.inputs.output_mode || 'daily-issue' }}"
