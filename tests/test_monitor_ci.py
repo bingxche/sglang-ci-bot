@@ -185,6 +185,49 @@ class MonitorWorkflowReuseTests(unittest.TestCase):
         analyze.assert_not_called()
 
 
+    @patch.object(monitor_ci.auto_rerun, "consider_run")
+    @patch.object(monitor_ci, "analyze_job_with_agent")
+    @patch.object(monitor_ci, "get_failed_jobs")
+    @patch.object(monitor_ci, "get_workflow_runs")
+    def test_auto_rerun_sees_already_processed_jobs_but_not_gates(
+        self, get_runs, get_jobs, analyze, consider,
+    ):
+        gate = {"id": 303, "name": "pr-test-amd-finish", "steps": []}
+        get_runs.return_value = [self.run]
+        get_jobs.return_value = [self.reused_job, gate]
+        records: dict = {}
+
+        monitor_ci.monitor_workflow(
+            "token",
+            "target.yml",
+            processed_job_ids={101},
+            use_agent=True,
+            agent_repo_path=Path("/workspace/sglang"),
+            auto_rerun_records=records,
+            auto_rerun_mode="on",
+            rerun_token="rerun-token",
+        )
+
+        consider.assert_called_once_with(
+            "token", self.run, [self.reused_job], "target.yml", records,
+            "on", "rerun-token",
+        )
+        analyze.assert_not_called()
+
+    @patch.object(monitor_ci.auto_rerun, "consider_run")
+    @patch.object(monitor_ci, "get_failed_jobs")
+    @patch.object(monitor_ci, "get_workflow_runs")
+    def test_auto_rerun_is_off_by_default(self, get_runs, get_jobs, consider):
+        get_runs.return_value = [self.run]
+        get_jobs.return_value = [self.reused_job]
+
+        monitor_ci.monitor_workflow(
+            "token", "target.yml", processed_job_ids={101}, use_agent=False,
+        )
+
+        consider.assert_not_called()
+
+
 class RunJobsPaginationTests(unittest.TestCase):
     def test_get_failed_jobs_includes_failure_from_second_page(self):
         first_page = [
@@ -641,6 +684,36 @@ class RunOneshotFailureTests(unittest.TestCase):
             )
         self.assertEqual(failed, [])
         publish.assert_called_once()
+
+
+    @patch.dict(os.environ, {"BUILD_DAILY_SUMMARY": "false", "AUTO_RERUN": "on"}, clear=False)
+    @patch.object(monitor_ci, "save_state")
+    @patch.object(monitor_ci, "publish_workflow_report")
+    @patch.object(monitor_ci, "get_issue_comments", return_value=[])
+    @patch.object(monitor_ci, "find_daily_issue", return_value=77)
+    @patch.object(monitor_ci, "load_state", return_value={})
+    def test_new_auto_rerun_is_published_without_new_failures(
+        self, _load, _find, _comments, publish, _save,
+    ):
+        def monitor(*_args, auto_rerun_records=None, **_kwargs):
+            auto_rerun_records["1:1"] = {"workflow": "a.yml", "decision": "rerun-failed-jobs"}
+            return [], [], []
+
+        with patch.object(monitor_ci, "monitor_workflow", side_effect=monitor):
+            monitor_ci.run_oneshot(
+                "token", "owner/bot", "daily-issue", ["a.yml"], 24, "main", use_agent=False,
+            )
+        publish.assert_called_once()
+
+    @patch.dict(os.environ, {"AUTO_RERUN": "on", "AUTO_RERUN_TOKEN": "t"}, clear=False)
+    @patch.object(monitor_ci, "save_state")
+    @patch.object(monitor_ci, "monitor_workflow", return_value=([], [], []))
+    @patch.object(monitor_ci, "load_state", return_value={})
+    def test_stdout_mode_never_reruns(self, _load, monitor, _save):
+        monitor_ci.run_oneshot(
+            "token", None, "stdout", ["a.yml"], 24, "main", use_agent=False,
+        )
+        self.assertIsNone(monitor.call_args.kwargs["auto_rerun_records"])
 
 
 class IssueCommentPaginationTests(unittest.TestCase):
