@@ -112,9 +112,13 @@ runner-1 entrypoint.sh (sleep 3600) ─┐
                         - run claude -p "Task: Job Failure Analysis ..." (cwd=worktree)
                         - parse output, append to job_analyses
                   5. if >1 failure, run Task: Cross-Job Summary agent
+                     (no API fallback; if the agent fails, the last good
+                     summary is kept with a "not refreshed" note and the
+                     next tick retries it, even with no new failures)
                   6. render_workflow_comment(...) — split into 60KB parts if
                      needed (Part 1/N, Part 2/N, ... markers)
                   7. PATCH or POST the per-workflow comment on today's issue
+                     (a workflow that errors here fails its matrix job)
                   8. if total_reports > 0 AND BUILD_DAILY_SUMMARY != false:
                         → call daily_cross_workflow_summary.build_and_publish_summary()
                                     │
@@ -1152,6 +1156,8 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py'
 | `AGENT_PARALLEL` | `monitor_ci.py` | Max number of Claude Code agents per matrix job, processing failed jobs in parallel (default: `3`, capped to ≥1). Set in `ci-monitor.yml` env block. |
 | `AGENT_TIMEOUT_SECS` | `monitor_ci.py` per-job analysis | Per-job agent timeout (default: `1500` = 25 min in `ci-monitor.yml`; code fallback `1800` when env unset). |
 | `AGENT_MAX_TURNS` | Agent mode (per-job + daily summary) | Max conversation turns the agent may use (default: `150` in `ci-monitor.yml`; code fallback `1000` for per-job in `utils.py`, `200` in `daily_cross_workflow_summary.py` when env unset). |
+| `CROSS_JOB_TIMEOUT_SECS` | `utils.cross_job_analysis` | Agent timeout for one workflow's Cross-Job Summary (default: `1200` = 20 min; 300 s timed out on every tick once pr-test-amd had 40+ analyses) |
+| `CROSS_JOB_MAX_TURNS` | `utils.cross_job_analysis` | Max turns for the Cross-Job Summary agent (default: `100`) |
 | `DAILY_SUMMARY_TIMEOUT_SECS` | `daily_cross_workflow_summary.py` | Agent timeout for the cross-workflow synthesis (default: `1200` = 20 min) |
 | `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Max turns for the `Task: Failure Tracker Data` extraction agent (default: `80`) |
 | `TRACKER_AGENT_TIMEOUT_SECS` | `failure_tracker.py` | Agent timeout for the Failure Tracker extraction (default: `900` = 15 min) |
