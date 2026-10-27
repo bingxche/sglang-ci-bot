@@ -505,6 +505,17 @@ _CROSS_SUMMARY_ANCHOR_RE = re.compile(r"^\*\*Counts\*\*:\s", re.MULTILINE)
 _PER_JOB_ANCHOR_RE = re.compile(r"^###\s+Commit Info\b", re.MULTILINE)
 _DAILY_SUMMARY_ANCHOR_RE = re.compile(r"^#\s+Daily Cross-Workflow Summary\b", re.MULTILINE)
 
+# Marks a part-1 comment whose Summary was not refreshed because the
+# cross-job agent failed; the next run retries the summary when it sees it.
+CROSS_STALE_MARKER = "<!-- ci-monitor-cross-job-stale -->"
+_STALE_NOTE_RE = re.compile(re.escape(CROSS_STALE_MARKER) + r"\n[^\n]*\n*")
+# The Summary section of a published part-1 comment, as rendered by
+# ``render_workflow_comment_parts``.
+_PUBLISHED_SUMMARY_RE = re.compile(
+    r"^### Summary\n\n(.*?)\n\n---\n\n\| Job \| Failed Steps \| Started \|",
+    re.MULTILINE | re.DOTALL,
+)
+
 
 def _strip_llm_preamble(text: str) -> str:
     """Drop any LLM "thinking aloud" prose before the first markdown heading.
@@ -691,11 +702,14 @@ def render_workflow_comment_parts(
     cross_summary: str = "",
     use_agent: bool = True,
     max_bytes: int = COMMENT_MAX_BYTES,
+    cross_note: str = "",
 ) -> list[str]:
     """Render the workflow report as a list of comment bodies.
 
     Produces part 1 (with header / cross summary / job table) plus zero or
     more overflow parts carrying the remaining per-job ``<details>`` blocks.
+    A *cross_note* is shown above the summary, behind ``CROSS_STALE_MARKER``,
+    when the summary could not be refreshed this run.
     Every part embeds the full ``processed_job_ids`` metadata and a
     ``ci-monitor-part: i/N`` marker so that downstream readers
     (dedup + adoption logic) can recognise and reassemble the full report.
@@ -766,13 +780,16 @@ def render_workflow_comment_parts(
 **Last scanned (UTC)**: {now}
 {commits_line}"""
 
-    if cross_summary:
-        extracted = _extract_report(cross_summary, _CROSS_SUMMARY_ANCHOR_RE)
-        cleaned = re.sub(
-            r"^#{1,3}\s+.*(?:Summary|Overview).*$", "",
-            extracted, flags=re.MULTILINE,
-        ).strip()
-        part1_header += f"### Summary\n\n{cleaned}\n\n---\n\n"
+    if cross_summary or cross_note:
+        cleaned = ""
+        if cross_summary:
+            extracted = _extract_report(cross_summary, _CROSS_SUMMARY_ANCHOR_RE)
+            cleaned = re.sub(
+                r"^#{1,3}\s+.*(?:Summary|Overview).*$", "",
+                extracted, flags=re.MULTILINE,
+            ).strip()
+        note = f"{CROSS_STALE_MARKER}\n{cross_note}\n\n" if cross_note else ""
+        part1_header += f"### Summary\n\n{(note + cleaned).strip()}\n\n---\n\n"
 
     part1_header += (
         f"| Job | Failed Steps | Started |\n"
@@ -1325,6 +1342,20 @@ def monitor_workflow(
 # Publishing (daily-issue mode)
 # ---------------------------------------------------------------------------
 
+def published_cross_summary(main_comment: dict | None) -> str:
+    """The Summary section of a published part-1 comment, minus any stale note."""
+    if not main_comment:
+        return ""
+    m = _PUBLISHED_SUMMARY_RE.search(main_comment.get("body", ""))
+    return _STALE_NOTE_RE.sub("", m.group(1)).strip() if m else ""
+
+
+def cross_summary_is_stale(gh_comments: list[dict] | None, workflow_file: str) -> bool:
+    """True if the workflow's published Summary missed its last refresh."""
+    main, _ = find_workflow_comment_parts(gh_comments or [], workflow_file)
+    return main is not None and CROSS_STALE_MARKER in main.get("body", "")
+
+
 def publish_workflow_report(
     token: str,
     bot_repo: str,
@@ -1407,16 +1438,32 @@ def publish_workflow_report(
 
     total_pending = sum(p["count"] for p in pending_info) if pending_info else 0
     cross = ""
+    cross_note = ""
     if len(all_analyses) > 1:
         log.info("  Cross-job analysis (%d jobs, agent=%s)...", len(all_analyses), use_agent)
-        cross = cross_job_analysis(
-            None, workflow_file, all_analyses,
-            use_agent=use_agent, repo_path=agent_repo_path,
-        )
+        try:
+            cross = cross_job_analysis(
+                None, workflow_file, all_analyses,
+                use_agent=use_agent, repo_path=agent_repo_path,
+            )
+        except Exception as exc:
+            # The per-job analyses are done; publish them under the last
+            # good summary rather than dropping the whole report.
+            log.warning(
+                "  Cross-job analysis failed for %s (%s); publishing the "
+                "per-job analyses with the previous summary", workflow_file, exc,
+            )
+            cross = published_cross_summary(main_comment)
+            cross_note = (
+                f"> ⚠️ This summary was not refreshed in the last run "
+                f"({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}): "
+                f"the cross-job agent failed ({' '.join(str(exc).split())[:120]}). "
+                f"The per-job analyses below are current; the next run retries the summary."
+            )
 
     parts = render_workflow_comment_parts(
         workflow_file, all_analyses, pending_info, cross,
-        use_agent=use_agent,
+        use_agent=use_agent, cross_note=cross_note,
     )
     wf_state["last_pending_count"] = total_pending
 
@@ -1569,23 +1616,35 @@ def run_oneshot(
     job_name_filter: str | None = None,
     use_agent: bool = True,
 ):
-    """Run the CI monitor once and exit."""
+    """Run the CI monitor once and exit.
+
+    Returns the workflows (and "Daily Cross-Workflow Summary") that errored.
+    """
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     agent_repo_path = None
     if use_agent:
-        if not claude_code_available():
-            log.warning("--use-agent specified but Claude Code CLI not found, falling back to API mode")
-            use_agent = False
-        else:
-            try:
-                agent_repo_path = ensure_sglang_repo()
-            except Exception:
-                log.exception("Failed to clone sglang repo, falling back to API mode")
-                use_agent = False
+        try:
+            if not claude_code_available():
+                raise RuntimeError("Claude Code CLI not found on the runner")
+            agent_repo_path = ensure_sglang_repo()
+        except Exception as exc:
+            # No API fallback: leave the reports as they are and put an
+            # "agent did not work" notice on the daily summary.
+            log.error("Agent unavailable (%s); not falling back to the API", exc)
+            if output == "daily-issue" and bot_repo:
+                try:
+                    from daily_cross_workflow_summary import mark_summary_stale
+                    issue_num = find_daily_issue(token, bot_repo, date_str)
+                    if issue_num:
+                        mark_summary_stale(token, bot_repo, issue_num, date_str, exc)
+                except Exception as notice_exc:
+                    log.error("Could not post the agent-failure notice: %s", notice_exc)
+            return list(workflows)
 
     state = load_state()
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = get_daily_state(state, date_str)
     total_reports = 0
+    failed_workflows: list[str] = []
 
     if bot_repo and not daily.get("issue_number"):
         try:
@@ -1624,8 +1683,13 @@ def run_oneshot(
                 event=workflow_event_filter(wf),
             )
 
-            # "unpublished": an earlier run analysed jobs but failed to post them.
-            retry_publish = output == "daily-issue" and wf_state.get("unpublished")
+            # "unpublished": an earlier run analysed jobs but failed to post
+            # them. A stale summary: an earlier run posted them but its
+            # cross-job agent failed, so the summary needs another try.
+            retry_publish = output == "daily-issue" and (
+                wf_state.get("unpublished")
+                or cross_summary_is_stale(gh_comments, wf)
+            )
             if not new_analyses and not retry_publish:
                 continue
 
@@ -1634,10 +1698,13 @@ def run_oneshot(
             if output == "stdout":
                 cross = ""
                 if len(new_analyses) > 1:
-                    cross = cross_job_analysis(
-                        None, wf, new_analyses,
-                        use_agent=use_agent, repo_path=agent_repo_path,
-                    )
+                    try:
+                        cross = cross_job_analysis(
+                            None, wf, new_analyses,
+                            use_agent=use_agent, repo_path=agent_repo_path,
+                        )
+                    except Exception as exc:
+                        log.warning("Cross-job analysis failed for %s: %s", wf, exc)
                 body = render_workflow_comment(
                     wf, new_analyses, pending, cross,
                     use_agent=use_agent,
@@ -1659,6 +1726,7 @@ def run_oneshot(
         except Exception as e:
             log.error("Error monitoring %s: %s", wf, e)
             traceback.print_exc()
+            failed_workflows.append(wf)
 
     save_state(state)
 
@@ -1680,8 +1748,9 @@ def run_oneshot(
                 token, bot_repo, use_agent=use_agent, date_str=date_str,
             )
         except Exception as exc:
-            log.warning("Daily Cross-Workflow Summary build failed: %s", exc)
+            log.error("Daily Cross-Workflow Summary build failed: %s", exc)
             traceback.print_exc()
+            failed_workflows.append("Daily Cross-Workflow Summary")
 
     gh_out = os.environ.get("GITHUB_OUTPUT")
     if gh_out:
@@ -1691,6 +1760,9 @@ def run_oneshot(
                 f.write(f"failure_count={total_reports}\n")
 
     log.info("Done. %d workflow(s) had failures.", total_reports)
+    if failed_workflows:
+        log.error("Monitoring errored for: %s", ", ".join(failed_workflows))
+    return failed_workflows
 
 
 # ---------------------------------------------------------------------------
@@ -1755,11 +1827,15 @@ def main():
             log.error("LLM_GATEWAY_URL env var required.")
             sys.exit(1)
 
-    run_oneshot(
+    failed = run_oneshot(
         args.github_token, args.bot_repo, args.output,
         args.workflows, args.hours_back, args.branch, args.job_name,
         use_agent=args.use_agent,
     )
+    # A workflow whose report could not be published fails the job, so the
+    # breakage shows in Actions instead of only in the log.
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

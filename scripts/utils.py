@@ -1675,10 +1675,15 @@ def cross_job_analysis(
     """Find common patterns across multiple failed jobs — concise summary.
 
     When *use_agent* is True, delegates to the Claude Code agent which can
-    read sglang source code to verify patterns.  Falls back to API on failure.
-    """
-    _log = logging.getLogger("ci-monitor")
+    read sglang source code to verify patterns. Agent failures are raised,
+    not answered by the API: a single-shot API summary of dozens of per-job
+    analyses is too shallow to publish, so callers keep the last good one.
 
+    Env vars (agent mode):
+      - CROSS_JOB_TIMEOUT_SECS (default 1200) — a busy pr-test-amd day has
+        60+ analyses of ~20 KB each; 300 s timed out on every tick.
+      - CROSS_JOB_MAX_TURNS (default 100)
+    """
     jobs_text = "\n\n---\n\n".join(
         f"### Job: {ja['job_name']}\n"
         f"**Job ID:** `{ja.get('job_id', 'unknown')}`\n\n"
@@ -1687,28 +1692,25 @@ def cross_job_analysis(
     )
 
     if use_agent:
-        try:
-            work_dir = repo_path or SGLANG_REPO_PATH
-            if not work_dir.exists():
-                raise FileNotFoundError(f"Repo not found at {work_dir}")
+        work_dir = repo_path or SGLANG_REPO_PATH
+        if not work_dir.exists():
+            raise FileNotFoundError(f"Repo not found at {work_dir}")
 
-            prompt = (
-                f"Task: Cross-Job Summary\n"
-                f"Workflow: {workflow_name}\n"
-                f"Number of failed jobs: {len(job_analyses)}\n"
-                f"Per-job analyses: .ci-context/per-job-analyses.md\n"
-                f"Source: current directory\n"
-                f"GitHub API token: $GH_PAT"
-            )
-            return claude_code_analyze(
-                prompt=prompt,
-                work_dir=work_dir,
-                context_files={"per-job-analyses.md": jobs_text},
-                max_turns=30,
-                timeout_secs=300,
-            )
-        except Exception as exc:
-            _log.warning("Agent cross-job analysis failed (%s), falling back to API", exc)
+        prompt = (
+            f"Task: Cross-Job Summary\n"
+            f"Workflow: {workflow_name}\n"
+            f"Number of failed jobs: {len(job_analyses)}\n"
+            f"Per-job analyses: .ci-context/per-job-analyses.md\n"
+            f"Source: current directory\n"
+            f"GitHub API token: $GH_PAT"
+        )
+        return claude_code_analyze(
+            prompt=prompt,
+            work_dir=work_dir,
+            context_files={"per-job-analyses.md": jobs_text},
+            max_turns=int(os.environ.get("CROSS_JOB_MAX_TURNS", "100")),
+            timeout_secs=int(os.environ.get("CROSS_JOB_TIMEOUT_SECS", "1200")),
+        )
 
     if client is None:
         client = create_anthropic_client()
@@ -1757,6 +1759,21 @@ def claude_code_available() -> bool:
         return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
+
+
+def agent_failure_notice(what: str, reason: object) -> str:
+    """Markdown notice published in place of output the agent failed to produce.
+
+    Agent mode never falls back to a single-shot API call: its answers are
+    too shallow to publish, so readers are told the agent did not work.
+    """
+    reason = " ".join(str(reason).replace("`", "'").split())[:300] or "unknown error"
+    return (
+        "> [!WARNING]\n"
+        f"> **The Claude Code agent did not work**, so {what} could not be produced.\n"
+        f"> Error: `{reason}`\n"
+        "> No API fallback is used. Re-run the command, or check the amd-bot runners."
+    )
 
 
 def create_agent_worktree(tag: str, head_sha: str = "") -> Path:

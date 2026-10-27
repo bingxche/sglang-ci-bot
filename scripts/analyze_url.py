@@ -26,6 +26,7 @@ import requests
 
 from utils import (
     REPO,
+    agent_failure_notice,
     analyze_job_api,
     analyze_job_with_agent,
     claude_code_available,
@@ -39,6 +40,7 @@ from utils import (
     is_gate_job,
     post_comment,
     remove_agent_worktree,
+    update_issue_body,
 )
 
 log = logging.getLogger("analyze-url")
@@ -198,31 +200,40 @@ def run_analysis(
 
     # Create issue upfront so user can follow along
     issue_number = None
+    job_list = "\n".join(f"- `{j['name']}`" for j in jobs)
+    intro = (
+        f"**Run**: [{workflow_name} #{run.get('run_number', run_id)}]({run_url})\n"
+        f"**Commit**: [`{short_sha}`](https://github.com/{REPO}/commit/{head_sha})\n"
+        f"**Event**: `{run.get('event', 'unknown')}`\n\n"
+        f"**Jobs to analyze** ({len(jobs)}):\n{job_list}\n\n"
+    )
     if bot_repo:
-        job_list = "\n".join(f"- `{j['name']}`" for j in jobs)
-        body = (
-            f"**Run**: [{workflow_name} #{run.get('run_number', run_id)}]({run_url})\n"
-            f"**Commit**: [`{short_sha}`](https://github.com/{REPO}/commit/{head_sha})\n"
-            f"**Event**: `{run.get('event', 'unknown')}`\n\n"
-            f"**Jobs to analyze** ({len(jobs)}):\n{job_list}\n\n"
-            f"_Analysis in progress..._"
+        issue = create_github_issue(
+            token, title, intro + "_Analysis in progress..._",
+            labels=["analyze"], repo=bot_repo,
         )
-        issue = create_github_issue(token, title, body, labels=["analyze"], repo=bot_repo)
         issue_number = issue["number"]
         log.info("Created issue #%d: %s", issue_number, title)
 
-    # Prepare agent
+    def publish_report(report: str) -> None:
+        if issue_number and bot_repo:
+            update_issue_body(token, bot_repo, issue_number, report)
+            log.info("Updated issue #%d with final report.", issue_number)
+        else:
+            print(f"\n{'='*60}")
+            print(report)
+
+    # Prepare agent. No API fallback: if the agent cannot run, say so.
     agent_repo_path = None
     if use_agent:
-        if not claude_code_available():
-            log.warning("Claude Code CLI not found, falling back to API mode")
-            use_agent = False
-        else:
-            try:
-                agent_repo_path = ensure_sglang_repo()
-            except Exception:
-                log.exception("Failed to clone sglang repo, falling back to API mode")
-                use_agent = False
+        try:
+            if not claude_code_available():
+                raise RuntimeError("Claude Code CLI not found on the runner")
+            agent_repo_path = ensure_sglang_repo()
+        except Exception as exc:
+            log.error("Agent unavailable (%s); not falling back to the API", exc)
+            publish_report(intro + agent_failure_notice("this analysis", exc))
+            raise
 
     # Analyze jobs
     job_analyses: list[dict] = []
@@ -262,6 +273,12 @@ def run_analysis(
                     except Exception as e:
                         log.error("  Error analyzing %s: %s", job["name"], e)
                         traceback.print_exc()
+                        if issue_number and bot_repo:
+                            post_comment(
+                                token, bot_repo, issue_number,
+                                f"### `{job['name']}`\n\n"
+                                + agent_failure_notice("the analysis of this job", e),
+                            )
         finally:
             for wt in worktrees.values():
                 try:
@@ -294,8 +311,12 @@ def run_analysis(
                     traceback.print_exc()
 
     if not job_analyses:
-        log.warning("No analyses produced.")
-        return
+        log.error("No analyses produced.")
+        if use_agent:
+            publish_report(intro + agent_failure_notice(
+                "any job analysis", "every job's agent run failed; see the comments below",
+            ))
+        raise RuntimeError("No analyses produced")
 
     # Cross-job summary
     cross = ""
@@ -306,25 +327,12 @@ def run_analysis(
                 None, workflow_name, job_analyses,
                 use_agent=use_agent, repo_path=agent_repo_path,
             )
-        except Exception:
+        except Exception as exc:
             log.exception("Cross-job analysis failed")
+            if use_agent:
+                cross = agent_failure_notice("the cross-job summary", exc)
 
-    report = render_report(run, job_analyses, cross, use_agent=use_agent)
-
-    if issue_number and bot_repo:
-        # Update issue body with the final summary report
-        issue_url = f"https://api.github.com/repos/{bot_repo}/issues/{issue_number}"
-        resp = requests.patch(
-            issue_url,
-            headers=gh_headers(token),
-            json={"body": report},
-        )
-        resp.raise_for_status()
-        log.info("Updated issue #%d with final report.", issue_number)
-    else:
-        print(f"\n{'='*60}")
-        print(report)
-
+    publish_report(render_report(run, job_analyses, cross, use_agent=use_agent))
     log.info("Done. Analyzed %d job(s).", len(job_analyses))
 
 

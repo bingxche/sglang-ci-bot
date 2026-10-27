@@ -112,9 +112,13 @@ runner-1 entrypoint.sh (sleep 3600) ─┐
                         - run claude -p "Task: Job Failure Analysis ..." (cwd=worktree)
                         - parse output, append to job_analyses
                   5. if >1 failure, run Task: Cross-Job Summary agent
+                     (no API fallback; if the agent fails, the last good
+                     summary is kept with a "not refreshed" note and the
+                     next tick retries it, even with no new failures)
                   6. render_workflow_comment(...) — split into 60KB parts if
                      needed (Part 1/N, Part 2/N, ... markers)
                   7. PATCH or POST the per-workflow comment on today's issue
+                     (a workflow that errors here fails its matrix job)
                   8. if total_reports > 0 AND BUILD_DAILY_SUMMARY != false:
                         → call daily_cross_workflow_summary.build_and_publish_summary()
                                     │
@@ -221,7 +225,7 @@ When a task is triggered (CI failure analysis, PR review, or CI status check), t
    - For the Miles workflows (`MILES_WORKFLOWS` in `utils.py`): the code under test is not the run's commit but the image's, so `prepare_miles_context()` re-checks out the worktree at the image's sglang commit, adds radixark/miles at the image's commit as `.ci-context/miles/src`, and writes `.ci-context/miles/EVIDENCE.md` — the failing tests, traceback, first failure / last pass, commit ranges and candidate commits that the [sglang-ci dashboard](https://rocm.github.io/sglang-ci/miles/) parses from the job and build logs (`MILES_CAUSE_FIX_URL`). It also asks Docker Hub (`check_miles_image()`, no auth) whether the image the job ran on is still the one under its tag, whether the run's day had an image at all, and which days of the track have none. The agent verifies the candidates rather than trusting them; every piece degrades to a note in the evidence file when it is unavailable
 5. For PR tasks: **checks out the PR branch** in the worktree
    - For `PR CI Status Check`: builds the evidence pack (`ci_evidence.py`, see [CI Status Check](#ci-status-check)) and re-checks out the worktree at the **commit CI actually tested** (usually a merge commit, not the PR head)
-   - For `PR CI Status Check` and `PR Correlation`: writes `.ci-context/ci-runtime-env.md`, the env vars AMD PR CI actually sets (`collect_ci_runtime_env()` reads `docker/rocm.Dockerfile` `ENV` lines, `scripts/ci/amd/amd_ci_start_container.sh`, `scripts/ci/amd/amd_ci_exec.sh`, and `-e` flags in `.github/workflows/pr-test-amd*.yml`), so the agent judges env-gated code paths against CI's real environment instead of the code default
+   - For `PR CI Status Check`: writes `.ci-context/ci-runtime-env.md`, the env vars AMD PR CI actually sets (`collect_ci_runtime_env()` reads `docker/rocm.Dockerfile` `ENV` lines, `scripts/ci/amd/amd_ci_start_container.sh`, `scripts/ci/amd/amd_ci_exec.sh`, and `-e` flags in `.github/workflows/pr-test-amd*.yml`), so the agent judges env-gated code paths against CI's real environment instead of the code default
 6. Copies `agent/CLAUDE.md` to `/workspace/CLAUDE.md`
 7. Runs `claude -p "<task prompt>" --dangerously-skip-permissions --disable-slash-commands` with `cwd=<worktree>` (the sglang checkout ships developer skills the bot must not run). The agent's env drops `BOT_PAT` and `LLM_GATEWAY_KEY`; if `AGENT_GH_TOKEN` is set, it replaces `GH_PAT` / `GH_TOKEN`, so the agent, which reads PR content anyone can write, only holds a read-only token
 8. If `AGENT_ARCHIVE_DIR` is set, copies the prompt and the agent's session log (secrets redacted) there, so a bad report can be traced to what the agent read and ran
@@ -239,7 +243,6 @@ Agent prompts are **data-only** — they contain a `Task:` line and metadata, bu
 | `Task: Failure Tracker Data` | Failure Tracker Data (compact JSON-only output of today's failures for the tracked workflows; feeds the long-lived upstream per-workflow Failure Trackers) |
 | `Task: PR CI Status Check` | PR CI Status Check |
 | `Task: PR Code Review` | PR Code Review |
-| `Task: PR Correlation` | PR Correlation |
 
 ### Agent capabilities
 
@@ -262,9 +265,20 @@ The Job Failure Analysis / Cross-Job Summary / Cross-Run Pattern Analysis / Dail
 - **One way to write a job**: a job is always its GitHub name without the runner label or caller prefix, in backticks (`` `nightly-test-1-gpu-kernel (rocm720)` ``), linked to the job page. Several legs of one job are the backticked name followed by one link per leg labelled with its matrix values. No nicknames (`v4-pro`), and no links labelled only `720` or `(1)`, so searching the page for a job finds every mention of it.
 - **Suspected change first**: a hypothesis that blames a change opens with the PR and its commit side by side (`` [#45112](…) ([`693d3333`](…)) moved … ``), and a change being ruled out goes under Disconfirming. Downstream dashboards read that first pair as the suspected cause.
 
-### Fallback to API mode
+### No API fallback in agent mode
 
-If Claude Code CLI is not available, all scripts automatically fall back to API mode (single-shot Anthropic API calls via AMD LLM Gateway). API mode loads prompt templates from the `## API Mode Prompts` section of `CLAUDE.md` via `load_prompt_template()`, ensuring both modes follow the same output format. API mode requires `LLM_GATEWAY_KEY` and `LLM_GATEWAY_URL` environment variables.
+Agent mode (the default) never falls back to a single-shot API call: those answers are too shallow to publish. When the Claude Code CLI is missing or the agent fails, the bot publishes a "The Claude Code agent did not work" notice (`agent_failure_notice()` in `utils.py`, with the error) where the output would have gone, and the job fails:
+
+| Script | Where the notice goes |
+|---|---|
+| `review_pr.py`, `check_ci_for_pr.py` | The PR comment, in place of the review / CI status |
+| `monitor_ci.py` per-workflow report | Cross-job summary failed: the last good summary is kept under a "not refreshed" note and retried next tick. CLI missing: nothing is analysed; the daily summary gets the notice |
+| `daily_cross_workflow_summary.py` | Top of the issue-body summary, above the last good summary (`<!-- daily-summary-agent-failed -->`; replaced, not stacked; removed by the next successful build) |
+| `analyze_url.py` | The `[Analyze]` issue body, and a comment per job whose agent failed |
+
+The Failure Trackers are unchanged: when their extraction agent fails they parse the per-job `Failed Tests` tables deterministically, with no LLM.
+
+API mode (single-shot Anthropic API calls via AMD LLM Gateway) runs only when chosen explicitly with `USE_AGENT=false` / `--no-use-agent`. It loads prompt templates from the `## API Mode Prompts` section of `CLAUDE.md` via `load_prompt_template()` and requires `LLM_GATEWAY_KEY` and `LLM_GATEWAY_URL`.
 
 ### Comment footers
 
@@ -703,7 +717,7 @@ python scripts/daily_cross_workflow_summary.py \
 |--------|---------|-------------|
 | `--bot-repo` | required | Bot repo where the daily issue lives |
 | `--date` | today (UTC) | Daily issue date `YYYY-MM-DD` to rebuild for |
-| `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to force API fallback |
+| `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to use API mode instead |
 | `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token |
 
 The summary lives between two HTML placeholder markers in the daily issue body:
@@ -892,7 +906,7 @@ python scripts/review_pr.py 1234 --no-post --no-use-agent
 | `--focus` | none | Specific areas to focus on |
 | `--context` | none | Additional context |
 | `--no-post` | false | Print to stdout instead of posting |
-| `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to force API fallback |
+| `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to use API mode instead |
 
 ### CI Status Check
 
@@ -915,12 +929,12 @@ python scripts/eval_ci_status.py --runs runs [--run-missing]
 |--------|---------|-------------|
 | `pr_number` | required | PR number |
 | `--no-post` | false | Print to stdout |
-| `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to force API fallback |
+| `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to use API mode instead |
 | `--head-sha` | current PR head | Check this PR head (agent mode) |
 | `--as-of` | now | Use each workflow run's attempt that was current at this UTC time (agent mode) |
 | `--out-dir` | env `CI_STATUS_OUT_DIR` | Save `pack/` (evidence pack), `agent-report.md`, `report.md` (as posted), and `verdicts.json` (agent mode) |
 
-When `--head-sha` or `--as-of` is set, an agent-mode failure exits with an error instead of falling back to the API mode, which cannot honor them.
+An agent-mode failure posts the "agent did not work" notice on the PR and exits with an error (see [No API fallback in agent mode](#no-api-fallback-in-agent-mode)). When `--head-sha` or `--as-of` is set (replays), it exits with the error without posting.
 
 **Untested-change check (AMD coverage gap).** Beyond classifying failures, the checker flags when an AMD test that covers this PR's changes never actually ran — the trap where AMD looks green only because the relevant test never executed. A changed `test/**` file declares its suite via `register_amd_ci(suite=...)` (nightly-only registrations are ignored); that suite maps to an AMD CI job (its `stage-a/b/c` is the stage). A banner is rendered at the **top** of the report whenever:
 
@@ -957,7 +971,7 @@ python scripts/analyze_url.py --url <url> --no-use-agent
 |--------|---------|-------------|
 | `--url` | required | GitHub Actions run or job URL |
 | `--bot-repo` | none | Bot repo to create issue in (omit for stdout) |
-| `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to force API fallback |
+| `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to use API mode instead |
 
 Or via the Actions tab: go to **Analyze CI** workflow, paste the URL, and click Run. The bot creates an issue like `[Analyze] pr-test-amd.yml run #12345 (8fe9bbf)` with results posted as comments.
 
@@ -1152,6 +1166,8 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py'
 | `AGENT_PARALLEL` | `monitor_ci.py` | Max number of Claude Code agents per matrix job, processing failed jobs in parallel (default: `3`, capped to ≥1). Set in `ci-monitor.yml` env block. |
 | `AGENT_TIMEOUT_SECS` | `monitor_ci.py` per-job analysis | Per-job agent timeout (default: `1500` = 25 min in `ci-monitor.yml`; code fallback `1800` when env unset). |
 | `AGENT_MAX_TURNS` | Agent mode (per-job + daily summary) | Max conversation turns the agent may use (default: `150` in `ci-monitor.yml`; code fallback `1000` for per-job in `utils.py`, `200` in `daily_cross_workflow_summary.py` when env unset). |
+| `CROSS_JOB_TIMEOUT_SECS` | `utils.cross_job_analysis` | Agent timeout for one workflow's Cross-Job Summary (default: `1200` = 20 min; 300 s timed out on every tick once pr-test-amd had 40+ analyses) |
+| `CROSS_JOB_MAX_TURNS` | `utils.cross_job_analysis` | Max turns for the Cross-Job Summary agent (default: `100`) |
 | `DAILY_SUMMARY_TIMEOUT_SECS` | `daily_cross_workflow_summary.py` | Agent timeout for the cross-workflow synthesis (default: `1200` = 20 min) |
 | `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Max turns for the `Task: Failure Tracker Data` extraction agent (default: `80`) |
 | `TRACKER_AGENT_TIMEOUT_SECS` | `failure_tracker.py` | Agent timeout for the Failure Tracker extraction (default: `900` = 15 min) |

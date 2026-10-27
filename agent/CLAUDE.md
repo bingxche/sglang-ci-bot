@@ -22,7 +22,6 @@ The prompt starts with a `Task:` line indicating which task to perform. Follow t
 - `Task: SGLang AMD CI Staging Candidates` → **SGLang AMD CI Staging Candidates** (emit fail-closed machine-readable candidates for the isolated Notion staging database)
 - `Task: PR CI Status Check` → **PR CI Status Check**
 - `Task: PR Code Review` → **PR Code Review**
-- `Task: PR Correlation` → **PR Correlation**
 
 The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All methodology and output format instructions are in the sections below.
 
@@ -666,12 +665,15 @@ Do NOT use `[name](#job-<job_id>)` in the Job column — those in-issue anchors 
 2. **Summary Table** (immediately after Counts): one row per failing test, grouped visually by cluster.
    - For `amd-aiter-scout.yml`, columns MUST be:
      `| # | Cluster | Job | Test File | Test Function | Origin | Status | Hypothesis (confidence) |`
+   - For workflows whose job names carry a ROCm version (`rocm10`, `rocm724`, `rocm720`, … — e.g. `pr-test-amd.yml`, `nightly-test-amd.yml`), columns are:
+     `| # | Cluster | Job | ROCm | Test File | Test Function | Status | Hypothesis (confidence) |`
    - For all other workflows, columns are:
      `| # | Cluster | Job | Test File | Test Function | Status | Hypothesis (confidence) |`
 
    Column rules:
    - **Cluster**: short noun phrase (e.g. "GPU mem fault during warmup"). Repeat the same cluster name across all rows that belong to it — this is what makes grouping visible. Each unique cluster also gets a `### Cluster: <name>` subsection below the table.
    - **Job**: ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`` — link to the actual sglang job page, NOT an in-issue anchor. See "Job column link (MUST follow)" above.
+   - **ROCm**: which ROCm versions fail this row and which pass it, in the workflow's version order (default version first): `✗ rocm720 · rocm724; ✓ rocm10`. A version is `✓` only if a per-job analysis shows that same test passing on it in a comparable run (same or later commit); a version with no evidence either way is left out, never guessed. Clusters span ROCm versions — do NOT split a cluster per version; this column is how a reader sees the split.
    - **Test File / Test Function**: from the per-job's `Failed Tests` table. Test-file granularity is REQUIRED — never report at job-only level.
    - **Origin** (scout only): `aiter-caused` | `pre-existing (sglang)` | `unclear`.
    - **Status**: factual one-liner — e.g. "5 days persistent" / "new today" / "1/7 runs (flaky)" / "Never-passed". NOT priority.
@@ -679,7 +681,7 @@ Do NOT use `[name](#job-<job_id>)` in the Job column — those in-issue anchors 
 
 3. **Cluster details** (one `### Cluster: <name>` subsection per unique cluster). Each subsection contains:
    - **Affected**: list of `(job, test_file, test_function)` rows from the table (each job rendered as ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)`` linking to the upstream sglang job page).
-   - **Shared facts**: what the per-jobs agree on (stack-trace overlap, common version, common runner).
+   - **Shared facts**: what the per-jobs agree on (stack-trace overlap, common version, common runner). When the ROCm versions split (some fail, some pass), state the split and what differs between those images (ROCm/torch/Python version, image tag) — it is evidence for or against a code change as the cause.
    - **Top hypothesis**: best candidate cause with confidence label and disconfirming evidence.
    - **In-flight fix**: ✅ PR #N or ❌ none — copy from per-job In-flight Fix Check; if multiple per-jobs cite the same PR, list it once.
    - **Suggested triage**: one or two concrete steps (bisect / repro / disable). NOT a prescription.
@@ -1047,45 +1049,6 @@ phase rather than a log dump. Do not set a staging status; the deterministic
 writer leaves the `Status` property blank for human triage. Never recommend
 promotion, rejection, deletion, or changes to the official known-error data
 source.
-
----
-
-## PR Correlation
-
-When asked to assess whether CI failures are caused by a PR's changes, analyze the PR diff, changed files, and CI errors to determine correlation.
-
-The prompt provides:
-- PR number and job list (exact job names to assess)
-- Context files in `.ci-context/`:
-  - `pr-diff.txt` — the PR diff
-  - `pr-files.txt` — list of changed files
-  - `ci-errors.md` — extracted error signals per job
-  - `ci-runtime-env.md` — env vars AMD PR CI sets (image `ENV`, container start / exec scripts, workflow `-e` flags)
-
-You have access to the sglang source code. Use it to:
-1. Read the full source files that were changed by the PR (not just the diff).
-2. Read the test files that failed to understand what they test.
-3. Trace the call chain: does the modified code affect the failing test?
-4. When the changed path is env-gated, check `ci-runtime-env.md` before deciding it was inactive. A code default of "off" does not mean the path was off in CI.
-
-### Output format
-
-Output ONLY a raw JSON array. No markdown fences, no explanation text before or after:
-
-```
-[
-  {"job": "exact job name", "test_file": "test/path/test_foo.py", "test_function": "test_name", "verdict": "likely", "explanation": "one sentence"},
-  {"job": "exact job name", "test_file": "test/path/test_bar.py", "test_function": "test_other", "verdict": "unlikely", "explanation": "one sentence"}
-]
-```
-
-If a job has multiple failing test files, include one entry per test file.
-If the failure is not a test (e.g. build error), use "N/A" for test_file and test_function.
-
-Rules for "verdict":
-- "likely" = the error clearly involves code paths touched by the PR
-- "possibly" = the error could be influenced by the PR but also has other explanations
-- "unlikely" = the error is in unrelated code, infrastructure, or a known flaky test
 
 ---
 

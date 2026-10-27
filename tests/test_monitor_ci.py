@@ -556,6 +556,93 @@ class PublishAfterReorderTests(unittest.TestCase):
         self.assertEqual([ja["job_id"] for ja in wf_state["job_analyses"]], [5])
 
 
+class CrossJobFailureTests(unittest.TestCase):
+    WF = "pr-test-amd.yml"
+    TODAY = "2026-10-26"
+
+    def _published(self, cross: str, *analyses: dict) -> dict:
+        body = monitor_ci.render_workflow_comment_parts(self.WF, list(analyses), [], cross)[0]
+        return {"id": 1, "body": body}
+
+    def _publish(self, comments: list[dict], new: list[dict]) -> str:
+        state = {"daily_comments": {self.TODAY: {"issue_number": 7, "workflows": {}}}}
+        with patch.object(monitor_ci, "update_comment") as update, \
+                patch.object(monitor_ci, "post_comment", return_value={"id": 99}), \
+                patch.object(monitor_ci, "maybe_publish_cross_run_summary"):
+            monitor_ci.publish_workflow_report(
+                "token", "owner/bot", self.WF, new, [], state,
+                gh_comments=comments, use_agent=True, date_str=self.TODAY,
+            )
+        wf_state = state["daily_comments"][self.TODAY]["workflows"][self.WF]
+        self.assertNotIn("unpublished", wf_state)
+        return update.call_args_list[0].args[3]
+
+    @patch.object(monitor_ci, "cross_job_analysis", side_effect=RuntimeError("Claude Code timed out after 1200s"))
+    def test_failed_summary_publishes_jobs_under_the_previous_summary(self, _cross):
+        old = self._published("**Counts**: 2 failures · 1 clusters\n\nOLD TABLE", _analysis(1, "a"), _analysis(2, "b"))
+
+        body = self._publish([old], [_analysis(3, "fresh")])
+
+        self.assertIn("OLD TABLE", body)
+        self.assertIn(monitor_ci.CROSS_STALE_MARKER, body)
+        self.assertIn("timed out after 1200s", body)
+        self.assertIn('data-job-id="3"', body)
+        self.assertTrue(monitor_ci.cross_summary_is_stale([{"id": 1, "body": body}], self.WF))
+
+        # A second failure keeps one note, not two.
+        again = self._publish([{"id": 1, "body": body}], [])
+        self.assertEqual(again.count(monitor_ci.CROSS_STALE_MARKER), 1)
+        self.assertIn("OLD TABLE", again)
+
+    def test_refreshed_summary_drops_the_stale_note(self):
+        with patch.object(monitor_ci, "cross_job_analysis", side_effect=RuntimeError("timeout")):
+            stale = self._publish(
+                [self._published("**Counts**: old", _analysis(1, "a"), _analysis(2, "b"))], [],
+            )
+        with patch.object(monitor_ci, "cross_job_analysis", return_value="**Counts**: 2 failures · NEW"):
+            body = self._publish([{"id": 1, "body": stale}], [])
+
+        self.assertNotIn(monitor_ci.CROSS_STALE_MARKER, body)
+        self.assertIn("NEW", body)
+        self.assertFalse(monitor_ci.cross_summary_is_stale([{"id": 1, "body": body}], self.WF))
+
+    def test_published_cross_summary_without_a_summary(self):
+        self.assertEqual(monitor_ci.published_cross_summary(None), "")
+        no_summary = self._published("", _analysis(1, "a"))
+        self.assertEqual(monitor_ci.published_cross_summary(no_summary), "")
+
+
+class RunOneshotFailureTests(unittest.TestCase):
+    @patch.dict(os.environ, {"BUILD_DAILY_SUMMARY": "false"}, clear=False)
+    @patch.object(monitor_ci, "save_state")
+    @patch.object(monitor_ci, "publish_workflow_report", side_effect=RuntimeError("boom"))
+    @patch.object(monitor_ci, "monitor_workflow", return_value=([_analysis(1, "a")], [1], []))
+    @patch.object(monitor_ci, "get_issue_comments", return_value=[])
+    @patch.object(monitor_ci, "find_daily_issue", return_value=77)
+    @patch.object(monitor_ci, "load_state", return_value={})
+    def test_errored_workflow_is_returned(self, *_mocks):
+        failed = monitor_ci.run_oneshot(
+            "token", "owner/bot", "daily-issue", ["a.yml"], 24, "main", use_agent=False,
+        )
+        self.assertEqual(failed, ["a.yml"])
+
+    @patch.dict(os.environ, {"BUILD_DAILY_SUMMARY": "false"}, clear=False)
+    @patch.object(monitor_ci, "save_state")
+    @patch.object(monitor_ci, "publish_workflow_report")
+    @patch.object(monitor_ci, "monitor_workflow", return_value=([], [], []))
+    @patch.object(monitor_ci, "find_daily_issue", return_value=77)
+    @patch.object(monitor_ci, "load_state", return_value={})
+    def test_stale_summary_is_retried_without_new_failures(self, _load, _find, _monitor, publish, _save):
+        stale = {"id": 5, "body": "<!-- ci-monitor-part: 1/1 -->\n## `a.yml` — 2 failure(s)\n"
+                                  + monitor_ci.CROSS_STALE_MARKER}
+        with patch.object(monitor_ci, "get_issue_comments", return_value=[stale]):
+            failed = monitor_ci.run_oneshot(
+                "token", "owner/bot", "daily-issue", ["a.yml"], 24, "main", use_agent=False,
+            )
+        self.assertEqual(failed, [])
+        publish.assert_called_once()
+
+
 class IssueCommentPaginationTests(unittest.TestCase):
     @patch.object(monitor_ci.requests, "get")
     def test_reads_every_page(self, get):
