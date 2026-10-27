@@ -22,7 +22,6 @@ The prompt starts with a `Task:` line indicating which task to perform. Follow t
 - `Task: SGLang AMD CI Staging Candidates` → **SGLang AMD CI Staging Candidates** (emit fail-closed machine-readable candidates for the isolated Notion staging database)
 - `Task: PR CI Status Check` → **PR CI Status Check**
 - `Task: PR Code Review` → **PR Code Review**
-- `Task: PR Correlation` → **PR Correlation**
 
 The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All methodology and output format instructions are in the sections below.
 
@@ -1050,45 +1049,6 @@ phase rather than a log dump. Do not set a staging status; the deterministic
 writer leaves the `Status` property blank for human triage. Never recommend
 promotion, rejection, deletion, or changes to the official known-error data
 source.
-
----
-
-## PR Correlation
-
-When asked to assess whether CI failures are caused by a PR's changes, analyze the PR diff, changed files, and CI errors to determine correlation.
-
-The prompt provides:
-- PR number and job list (exact job names to assess)
-- Context files in `.ci-context/`:
-  - `pr-diff.txt` — the PR diff
-  - `pr-files.txt` — list of changed files
-  - `ci-errors.md` — extracted error signals per job
-  - `ci-runtime-env.md` — env vars AMD PR CI sets (image `ENV`, container start / exec scripts, workflow `-e` flags)
-
-You have access to the sglang source code. Use it to:
-1. Read the full source files that were changed by the PR (not just the diff).
-2. Read the test files that failed to understand what they test.
-3. Trace the call chain: does the modified code affect the failing test?
-4. When the changed path is env-gated, check `ci-runtime-env.md` before deciding it was inactive. A code default of "off" does not mean the path was off in CI.
-
-### Output format
-
-Output ONLY a raw JSON array. No markdown fences, no explanation text before or after:
-
-```
-[
-  {"job": "exact job name", "test_file": "test/path/test_foo.py", "test_function": "test_name", "verdict": "likely", "explanation": "one sentence"},
-  {"job": "exact job name", "test_file": "test/path/test_bar.py", "test_function": "test_other", "verdict": "unlikely", "explanation": "one sentence"}
-]
-```
-
-If a job has multiple failing test files, include one entry per test file.
-If the failure is not a test (e.g. build error), use "N/A" for test_file and test_function.
-
-Rules for "verdict":
-- "likely" = the error clearly involves code paths touched by the PR
-- "possibly" = the error could be influenced by the PR but also has other explanations
-- "unlikely" = the error is in unrelated code, infrastructure, or a known flaky test
 
 ---
 

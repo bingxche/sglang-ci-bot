@@ -67,6 +67,7 @@ from monitor_ci import (
 from utils import (
     REPO,
     CLAUDE_MODEL,
+    agent_failure_notice,
     claude_code_analyze,
     claude_code_available,
     create_anthropic_client,
@@ -97,6 +98,11 @@ _SUMMARY_BLOCK_RE = re.compile(
     r"<!-- (?:daily-cross-workflow-summary|ci-monitor-daily-status-board):end -->",
     re.DOTALL,
 )
+
+# Tops a summary kept from an earlier run because the agent failed; the
+# notice under it is a blockquote, so it ends at the first non-">" line.
+AGENT_FAILED_MARKER = "<!-- daily-summary-agent-failed -->"
+_AGENT_FAILED_RE = re.compile(re.escape(AGENT_FAILED_MARKER) + r"\n(?:>[^\n]*(?:\n|$))*\n*")
 
 
 # ---------------------------------------------------------------------------
@@ -281,16 +287,14 @@ def run_agent(
     snapshot_utc: str,
     issue_num: int,
     monitored_workflows: list[str],
-) -> str | None:
-    """Invoke the Claude Code agent in the sglang repo to produce the summary."""
+) -> str:
+    """Invoke the Claude Code agent in the sglang repo to produce the summary.
+
+    Raises when the agent cannot run or returns nothing.
+    """
     if not claude_code_available():
-        log.info("Claude Code CLI unavailable; agent mode skipped")
-        return None
-    try:
-        repo_path = ensure_sglang_repo()
-    except Exception as exc:
-        log.warning("Could not prepare sglang repo (%s); agent mode skipped", exc)
-        return None
+        raise RuntimeError("Claude Code CLI not found on the runner")
+    repo_path = ensure_sglang_repo()
 
     context_files: dict[str, str] = {
         "per-workflow-analyses.md": workflows_block,
@@ -303,31 +307,33 @@ def run_agent(
         monitored_workflows,
         has_yesterday_context=bool(yesterday_block),
     )
-    try:
-        return claude_code_analyze(
-            prompt=prompt,
-            work_dir=repo_path,
-            context_files=context_files,
-            max_turns=int(
-                os.environ.get("AGENT_MAX_TURNS", str(DEFAULT_AGENT_MAX_TURNS))
-            ),
-            timeout_secs=int(
-                os.environ.get("DAILY_SUMMARY_TIMEOUT_SECS", str(DEFAULT_SUMMARY_TIMEOUT))
-            ),
-        )
-    except Exception as exc:
-        log.warning("Agent run failed (%s)", exc)
-        return None
+    text = claude_code_analyze(
+        prompt=prompt,
+        work_dir=repo_path,
+        context_files=context_files,
+        max_turns=int(
+            os.environ.get("AGENT_MAX_TURNS", str(DEFAULT_AGENT_MAX_TURNS))
+        ),
+        timeout_secs=int(
+            os.environ.get("DAILY_SUMMARY_TIMEOUT_SECS", str(DEFAULT_SUMMARY_TIMEOUT))
+        ),
+    )
+    if not text.strip():
+        raise RuntimeError("the agent returned no output")
+    return text
 
 
-def run_api_fallback(
+def run_api(
     workflows_block: str,
     yesterday_block: str | None,
     date_str: str,
     snapshot_utc: str,
     issue_num: int,
 ) -> str | None:
-    """Single-shot Claude API call using the ``daily-cross-workflow-summary`` template."""
+    """Single-shot Claude API call using the ``daily-cross-workflow-summary`` template.
+
+    API mode only (``USE_AGENT=false``); never a fallback for a failed agent.
+    """
     template = load_prompt_template("daily-cross-workflow-summary")
     if not template:
         log.error("daily-cross-workflow-summary template not found in CLAUDE.md")
@@ -357,7 +363,7 @@ def run_api_fallback(
         )
         return "\n".join(b.text for b in msg.content if b.type == "text")
     except Exception as exc:
-        log.error("API fallback failed (%s)", exc)
+        log.error("API call failed (%s)", exc)
         return None
 
 
@@ -846,6 +852,28 @@ def _cleanup_legacy_summary_comments(
                         c["id"], exc)
 
 
+def mark_summary_stale(
+    token: str, bot_repo: str, issue_num: int, date_str: str, reason: object,
+) -> None:
+    """Keep the last good summary in the body, topped by an "agent failed" notice.
+
+    A notice from an earlier failure is replaced, not stacked; the next
+    successful build renders a fresh body without it.
+    """
+    try:
+        current = get_issue(token, bot_repo, issue_num).get("body", "")
+        previous = _AGENT_FAILED_RE.sub("", extract_summary_from_body(current) or "").strip()
+        notice = agent_failure_notice("the refreshed Daily Cross-Workflow Summary", reason)
+        if previous:
+            notice += "\n> The summary below is from the last successful run."
+        publish_summary(
+            token, bot_repo, issue_num,
+            f"{AGENT_FAILED_MARKER}\n{notice}\n\n{previous}", date_str,
+        )
+    except Exception as exc:
+        log.error("Could not mark the summary stale (%s)", exc)
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -866,9 +894,10 @@ def build_and_publish_summary(
 
     Returns the issue number on success, or ``None`` if there was
     nothing to aggregate (no per-workflow comments yet) or the daily
-    issue does not exist for today. Errors during agent / API calls
-    are logged and swallowed so this never breaks the caller
-    (typically ``monitor_ci.run_oneshot``).
+    issue does not exist for today. If the agent fails, the last good
+    summary is kept under an "agent did not work" notice and the error
+    is re-raised, so the caller (typically ``monitor_ci.run_oneshot``)
+    can fail its job.
     """
     date_str = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     snapshot_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -897,28 +926,29 @@ def build_and_publish_summary(
     workflows_block = build_workflows_block(wf_analyses)
     yesterday_block = fetch_yesterday_summary(token, bot_repo, date_str)
 
-    agent_text: str | None = None
-    used_agent = False
     if use_agent:
-        agent_text = run_agent(
+        try:
+            agent_text = run_agent(
+                workflows_block, yesterday_block,
+                date_str, snapshot_utc, issue_num,
+                MONITORED_WORKFLOWS,
+            )
+        except Exception as exc:
+            # No API fallback: keep the last good summary and say why it
+            # was not refreshed.
+            log.error("Summary agent failed (%s); not falling back to the API", exc)
+            mark_summary_stale(token, bot_repo, issue_num, date_str, exc)
+            raise
+    else:
+        agent_text = run_api(
             workflows_block, yesterday_block,
             date_str, snapshot_utc, issue_num,
-            MONITORED_WORKFLOWS,
         )
-        used_agent = bool(agent_text)
+        if not agent_text:
+            log.error("API call failed; cannot publish summary")
+            return None
 
-    if not agent_text:
-        log.info("Falling back to API mode for summary synthesis")
-        agent_text = run_api_fallback(
-            workflows_block, yesterday_block,
-            date_str, snapshot_utc, issue_num,
-        )
-
-    if not agent_text:
-        log.error("Both agent and API failed; cannot publish summary")
-        return None
-
-    body = render_summary_body(snapshot_utc, agent_text, used_agent, wf_analyses)
+    body = render_summary_body(snapshot_utc, agent_text, use_agent, wf_analyses)
     try:
         return publish_summary(token, bot_repo, issue_num, body, date_str)
     except Exception as exc:
@@ -979,11 +1009,15 @@ def main() -> int:
         )
         return 1
 
-    issue_id = build_and_publish_summary(
-        args.github_token, args.bot_repo,
-        use_agent=args.use_agent,
-        date_str=args.date,
-    )
+    try:
+        issue_id = build_and_publish_summary(
+            args.github_token, args.bot_repo,
+            use_agent=args.use_agent,
+            date_str=args.date,
+        )
+    except Exception as exc:
+        log.error("Daily Cross-Workflow Summary not refreshed: %s", exc)
+        return 1
     if issue_id is None:
         log.info("Daily Cross-Workflow Summary not updated (see logs above)")
         return 0

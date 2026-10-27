@@ -1616,21 +1616,32 @@ def run_oneshot(
     job_name_filter: str | None = None,
     use_agent: bool = True,
 ):
-    """Run the CI monitor once and exit."""
+    """Run the CI monitor once and exit.
+
+    Returns the workflows (and "Daily Cross-Workflow Summary") that errored.
+    """
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     agent_repo_path = None
     if use_agent:
-        if not claude_code_available():
-            log.warning("--use-agent specified but Claude Code CLI not found, falling back to API mode")
-            use_agent = False
-        else:
-            try:
-                agent_repo_path = ensure_sglang_repo()
-            except Exception:
-                log.exception("Failed to clone sglang repo, falling back to API mode")
-                use_agent = False
+        try:
+            if not claude_code_available():
+                raise RuntimeError("Claude Code CLI not found on the runner")
+            agent_repo_path = ensure_sglang_repo()
+        except Exception as exc:
+            # No API fallback: leave the reports as they are and put an
+            # "agent did not work" notice on the daily summary.
+            log.error("Agent unavailable (%s); not falling back to the API", exc)
+            if output == "daily-issue" and bot_repo:
+                try:
+                    from daily_cross_workflow_summary import mark_summary_stale
+                    issue_num = find_daily_issue(token, bot_repo, date_str)
+                    if issue_num:
+                        mark_summary_stale(token, bot_repo, issue_num, date_str, exc)
+                except Exception as notice_exc:
+                    log.error("Could not post the agent-failure notice: %s", notice_exc)
+            return list(workflows)
 
     state = load_state()
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = get_daily_state(state, date_str)
     total_reports = 0
     failed_workflows: list[str] = []
@@ -1737,8 +1748,9 @@ def run_oneshot(
                 token, bot_repo, use_agent=use_agent, date_str=date_str,
             )
         except Exception as exc:
-            log.warning("Daily Cross-Workflow Summary build failed: %s", exc)
+            log.error("Daily Cross-Workflow Summary build failed: %s", exc)
             traceback.print_exc()
+            failed_workflows.append("Daily Cross-Workflow Summary")
 
     gh_out = os.environ.get("GITHUB_OUTPUT")
     if gh_out:

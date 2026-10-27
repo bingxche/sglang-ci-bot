@@ -1761,6 +1761,21 @@ def claude_code_available() -> bool:
         return False
 
 
+def agent_failure_notice(what: str, reason: object) -> str:
+    """Markdown notice published in place of output the agent failed to produce.
+
+    Agent mode never falls back to a single-shot API call: its answers are
+    too shallow to publish, so readers are told the agent did not work.
+    """
+    reason = " ".join(str(reason).replace("`", "'").split())[:300] or "unknown error"
+    return (
+        "> [!WARNING]\n"
+        f"> **The Claude Code agent did not work**, so {what} could not be produced.\n"
+        f"> Error: `{reason}`\n"
+        "> No API fallback is used. Re-run the command, or check the amd-bot runners."
+    )
+
+
 def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
     """Create an isolated git worktree for a parallel agent.
 
