@@ -200,6 +200,7 @@ class RenderTest(unittest.TestCase):
         self.assertIn(f"[stage-b (rocm10)]({RUN}/job/1)", body)
         self.assertIn("…and 1 more", body)
         self.assertIn("Also involved: #45112.", body)
+        self.assertIn("Posted automatically by [amd-bot](https://github.com/amd-bot)", body)
         self.assertNotIn("sglang-ci-bot", body)
 
     def test_mentions(self):
