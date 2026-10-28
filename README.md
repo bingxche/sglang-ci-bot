@@ -749,7 +749,7 @@ When the daily summary attributes a cluster to a merged sglang PR, `suspect_pr_c
 4. The agent gave both the last passing and the first failing commit.
 5. The PR is merged, within the last 14 days, and the cited commit is the PR's (its merge commit, or GitHub lists the PR for that commit).
 6. The compare API puts the commit after the last passing commit and at or before the first failing commit.
-7. The PR has no earlier comment carrying the same `<!-- amd-bot-suspect-pr:<cluster> -->` marker, so a cluster is reported once per PR, however many days it stays red.
+7. The PR has no earlier suspect-PR comment (a `<!-- amd-bot-suspect-pr:<cluster> -->` marker) for any cluster. Cluster IDs are reassigned from day to day (#45791 was R327, then R332, an hour apart), so checking only the same cluster would comment on the same break again. A PR gets one comment, however long it stays red; when two clusters name the same PR in one tick, only the strongest is posted.
 
 At most 3 comments are posted per tick, strongest confidence and most failed jobs first. The comment says what fails and why the PR is suspected, gives the commit window and up to 8 failing job links, and asks the author to say so if the PR is not the cause. It has no `@`-mentions (any in the agent's evidence are put in code spans) and no links to this repo.
 
