@@ -300,7 +300,9 @@ def render_pr_comment(d: Decision, job_info: dict[int, dict]) -> str:
         "",
         closing,
         "",
-        f"<sub>Posted automatically by the AMD CI monitor. Confidence: {s['confidence']}.</sub>",
+        # Says amd-bot even while another account's token does the posting.
+        f"<sub>Posted automatically by [amd-bot](https://github.com/amd-bot), the AMD CI monitor. "
+        f"Confidence: {s['confidence']}.</sub>",
     ]
     return "\n".join(lines)
 
