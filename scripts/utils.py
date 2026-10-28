@@ -130,6 +130,90 @@ def is_gate_job(job: dict) -> bool:
     return all(GATE_STEP_PATTERNS.search(s["name"]) for s in failed_steps)
 
 
+RUNNER_LOST_ANNOTATION = "lost communication with the server"
+_STEP_FAILED = ("failure", "cancelled", "timed_out")
+
+
+def is_runner_lost(job: dict) -> bool:
+    """True when a failed job's runner went away mid-job rather than a step failing.
+
+    GitHub reports this as "The self-hosted runner lost communication with the
+    server" -- a check-run annotation, which the jobs endpoint does not carry --
+    and usually keeps no log. The step list gives it away: the job is
+    ``failure`` but no step is, because the step that was running is left
+    ``in_progress``, the list stops short, or (most often) it is empty. A real
+    failure always fails a step, and ``timeout-minutes`` cancels one.
+
+    Checked against the annotation on 1,384 failed jobs of the four AMD
+    workflows: it matched all 22 annotated jobs and one more from the same
+    outage that GitHub never annotated. The same rule drives the "Runner lost"
+    column on the ROCm/sglang-ci Runner Health page.
+    """
+    if job.get("status") != "completed" or job.get("conclusion") != "failure":
+        return False
+    # A job that never got a runner (startup failure) has nothing to lose.
+    if not job.get("runner_name"):
+        return False
+    return not any(s.get("conclusion") in _STEP_FAILED for s in job.get("steps") or [])
+
+
+def get_job_annotations(token: str, job_id: int) -> list[dict] | None:
+    """The check-run annotations of a job, or None when they could not be read."""
+    url = f"https://api.github.com/repos/{REPO}/check-runs/{job_id}/annotations"
+    try:
+        resp = requests.get(url, headers=gh_headers(token), timeout=30)
+    except requests.RequestException:
+        return None
+    return resp.json() if resp.status_code == 200 else None
+
+
+def _lost_at_step(job: dict) -> str:
+    steps = job.get("steps") or []
+    running = next((s for s in steps if s.get("status") == "in_progress"), None)
+    if running:
+        return f"`{running['name']}` (step {running['number']}, left in progress)"
+    if not steps:
+        return "before any step was reported (the job has no steps)"
+    last = steps[-1]
+    return f"after `{last['name']}` (step {last['number']}); the step list stops there"
+
+
+def runner_lost_evidence(
+    token: str | None, job: dict, run_jobs: list[dict] | None = None,
+) -> str:
+    """Facts about a lost-runner job, for the analysis prompt and evidence packs.
+
+    *run_jobs* are the other jobs of the same run; the lost ones among them
+    tell a host outage (several jobs, one runner, one window) from a job that
+    takes its own runner down.
+    """
+    lines = [
+        f"- Runner: `{job.get('runner_name')}` (labels: "
+        + ", ".join(f"`{x}`" for x in job.get("labels") or []) + ")",
+        f"- Started {job.get('started_at')}, marked failed {job.get('completed_at')}",
+        f"- Lost during: {_lost_at_step(job)}",
+    ]
+    anns = get_job_annotations(token, job["id"]) if token else None
+    msg = next((a.get("message", "") for a in anns or []
+                if RUNNER_LOST_ANNOTATION in a.get("message", "")), None)
+    if msg:
+        lines.append(f"- GitHub annotation: \"{msg.splitlines()[0]}\"")
+    elif anns is not None:
+        lines.append("- GitHub annotation: none (GitHub does not always annotate a lost runner)")
+    others = [j for j in run_jobs or [] if j.get("id") != job["id"] and is_runner_lost(j)]
+    if others:
+        others.sort(key=lambda j: j.get("completed_at") or "")
+        lines.append(f"- Other jobs in this run that lost their runner: {len(others)}")
+        lines += [
+            f"  - `{j.get('runner_name')}` · {j.get('completed_at')} · "
+            f"[{j['name']}]({j.get('html_url')})"
+            for j in others
+        ]
+    else:
+        lines.append("- Other jobs in this run that lost their runner: none")
+    return "\n".join(lines)
+
+
 def get_failed_jobs(token: str, run_id: int) -> list[dict]:
     """Get completed non-success, non-skipped jobs for a workflow run.
 
@@ -1426,6 +1510,7 @@ def analyze_job_with_agent(
     workflow_file: str = "", head_sha: str = "",
     event_filter: str = "",
     github_token: str | None = None,
+    run_jobs: list[dict] | None = None,
 ) -> dict:
     """Invoke Claude Code agent to fully analyze a CI failure.
 
@@ -1434,6 +1519,9 @@ def analyze_job_with_agent(
     reading sglang source code, checking git history, and producing a
     root-cause analysis.  Investigation methodology is defined in
     ``CLAUDE.md`` which Claude Code reads automatically.
+
+    *run_jobs* (the failed jobs of the same run) only matter when this job's
+    runner was lost: the other lost jobs are listed for the agent.
     """
     job_name = job["name"]
     job_id = job["id"]
@@ -1497,6 +1585,13 @@ def analyze_job_with_agent(
         )
 
     event_line = f"Event filter: {event_filter}\n" if event_filter else ""
+    runner_lost_lines = ""
+    if is_runner_lost(job):
+        token = github_token or os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
+        runner_lost_lines = (
+            "Runner lost: yes\n"
+            f"{runner_lost_evidence(token, job, run_jobs)}\n"
+        )
     prompt = (
         f"Task: Job Failure Analysis\n"
         f"Job: {job_name}\n"
@@ -1506,6 +1601,7 @@ def analyze_job_with_agent(
         f"Workflow file: {workflow_file}\n"
         f"{event_line}"
         f"Log URL: https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs\n"
+        f"{runner_lost_lines}"
         f"{artifact_lines}"
         f"Source: current directory\n"
         f"GitHub API token: $GH_PAT"
@@ -1539,6 +1635,7 @@ def analyze_job_api(
     run_url: str,
     head_sha: str = "",
     workflow_file: str = "",
+    run_jobs: list[dict] | None = None,
 ) -> dict:
     """Download logs, extract errors, and run focused API analysis for one job."""
     _log = logging.getLogger("ci-monitor")
@@ -1563,6 +1660,12 @@ def analyze_job_api(
     _log.info("  [%s] Extracted %d error signal(s)", job_name, len(error_lines))
 
     filtered_log = prefilter_large_step_log(raw_log)
+    if is_runner_lost(job):
+        _log.info("  [%s] Runner lost mid-job", job_name)
+        filtered_log = (
+            "## Runner lost\n"
+            f"{runner_lost_evidence(token, job, run_jobs)}\n\n{filtered_log}"
+        )
     if len(filtered_log) < len(raw_log):
         _log.info(
             "  [%s] Pre-filtered log: %s -> %s chars",

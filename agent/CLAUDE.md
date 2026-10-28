@@ -279,6 +279,41 @@ landed fix candidate; say whether the newest image already contains it.
 - **aiter**: per the rule below (`N/A` when the log has no `[CI-AITER-CHECK]` markers)
 ```
 
+### Lost runner (REQUIRED when the prompt says `Runner lost: yes`)
+
+The job failed because its self-hosted runner went away mid-job ("The
+self-hosted runner lost communication with the server"), not because a step
+failed. The harness detected it from the step list (the job failed while no
+step did) and lists the facts under the `Runner lost: yes` line: the runner,
+the step that was running, GitHub's annotation, and the other jobs in the same
+run that lost their runner. Cite those lines as `[FACT]`.
+
+- **There is usually no log.** GitHub keeps none for most of these jobs (the
+  log URL answers 404 `BlobNotFound`). Try it once. If one exists it stops
+  where the runner vanished; read its end for the test that was running.
+  Do not spend turns retrying, and never write "the log shows no error" as
+  if the job had finished.
+- **No test failed.** The Failed Tests table gets one non-test row:
+  `runner lost during <step>` in Test File, `N/A` in Test Function, the
+  annotation (or `no annotation`) as Error. If the cut-off log shows a test
+  was running, name it as **running when lost**, not as failed.
+- **Failure Cluster**: exactly `Self-hosted runner lost communication (<runs-on label>)`,
+  e.g. `Self-hosted runner lost communication (linux-sglang-mi35x-di)`, so the
+  Daily Cross-Workflow Summary groups every lost job of a pool into one cluster.
+- **Regression Status**: `Infrastructure issue`. The history check is at the
+  **job** level here, since there is no failing test: in the 15 comparable runs,
+  did this same job (same shard) lose its runner, fail a test, or pass?
+
+Then tell the two patterns apart, because their fixes are different:
+
+| Pattern | Evidence | Top hypothesis |
+|---|---|---|
+| **Host outage** | Several *different* jobs lost their runner on the same runner(s) inside one window (the "Other jobs" list); the same jobs pass in other runs | `[HIGH]` the runner host or its network dropped during `<window>`. Triage: the runner owners check that host for the window (OOM kill, reboot, network). No sglang change is suspected. |
+| **Job takes its runner down** | The *same* job/shard loses its runner across runs, on different runners (ARC pods are new for each job), while other jobs on the pool are fine | `[MEDIUM]` something in this job exhausts the runner (host memory, disk, a killed pod). Find which test was running at the loss: compare the elapsed time at the loss with per-test timings in a passing run of the same shard. Then look for the run in which the job started losing its runner, and the commits to that shard's tests or to the code they exercise in the window before it. |
+
+If neither fits (one job, once), say so: `[LOW]` a one-off runner loss; re-run.
+Never blame an sglang commit for a host outage.
+
 ### Commit info extraction (REQUIRED)
 
 Every analysis **must** begin with a `### Commit Info` section. The prompt will supply a `Commit SHA` — use it as the sglang commit (except for Miles workflows: see **Miles workflows** above).
@@ -537,6 +572,7 @@ How to weigh evidence:
 - **Judge env gates against the environment the job ran with**, never against defaults in the code.
 - **Reached is not active.** A line logged when an object is constructed shows the code was reached, not that the feature was used. Prefer evidence of use: kernel modules loaded, dispatch or backend selection, changed outputs.
 - **Infrastructure-looking failures can be the PR's** when the PR changes images, dependencies, or CI config.
+- **A lost runner** (mode `runner_lost`: the runner went away mid-job, no step failed, usually no log) is 🟢 `unrelated` on `independence` when other jobs lost their runner in the same window or the job passes in other attempts: cite the failure's evidence and a diff hunk, and address any CI file the PR changes. It is 🟡 when the same job loses its runner in every attempt on this PR but not on `main`: the PR may make it exhaust the runner (memory, disk).
 - **No link found is not independence.** That is 🟡 or ⚪.
 - **Fail-fast cascades and gate jobs** get no verdict of their own; mention them with their root failure.
 
@@ -769,7 +805,7 @@ When asked to produce the **top-of-issue Daily Cross-Workflow Summary** that agg
    - List of monitored workflows + their daily run counts + per-workflow per-job analyses available in `.ci-context/per-workflow/<workflow>.md`
    - Optional: previous day's snapshot for trend comparison in `.ci-context/yesterday.md`
 2. For each workflow, read its per-job analyses and extract the `Failure Cluster` + `Hypothesised Causes` from each.
-3. **Deduplicate clusters across workflows.** A cluster spans workflows when the same failure pattern (same test file + test function + same top-of-stack-trace) appears in jobs of more than one workflow. Assign each unique cluster an ID `R1`, `R2`, ... (rolling, NEW clusters get fresh IDs in the order they were first observed today).
+3. **Deduplicate clusters across workflows.** A cluster spans workflows when the same failure pattern (same test file + test function + same top-of-stack-trace) appears in jobs of more than one workflow. Assign each unique cluster an ID `R1`, `R2`, ... (rolling, NEW clusters get fresh IDs in the order they were first observed today). Jobs whose runner was lost (`Self-hosted runner lost communication (<runs-on label>)`) have no test to match on: group them by runner pool and pattern (a host outage and a job that takes its runner down are separate clusters, even on one pool), and give the status line the runners and the time window. They are infrastructure, so they never go in `suspect-prs`.
 4. **Compute trends**: for each workflow, the sequence of failure counts across its runs in the lookback window. **Only count completed runs**. If the latest run is in-flight, exclude it from the trend or label it `[IN-FLIGHT]`.
 5. **Identify NEW clusters today**: clusters that did not appear in yesterday's summary. Mark them `🆕 [NEW]`.
 6. **Identify in-flight fixes**: aggregate the In-flight Fix Check from per-job analyses. If multiple per-jobs cite the same PR, list it once at the cluster level.
@@ -922,7 +958,7 @@ Your output is consumed by a parser, NOT shown to humans, so it must be **only**
 - Reuse the facts already in the analyses — do NOT re-investigate or invent.
 - `error` is exactly ONE line (error type + short message), no newlines.
 - `status` is the regression status you see, e.g. `new today` / `recurring` / `flaky 2/4` / `never-passed`.
-- A non-test failure (build error, server crash, runner hang) is still a row: put a short descriptor in `test_file` and `N/A` in `test_function`.
+- A non-test failure (build error, server crash, runner hang) is still a row: put a short descriptor in `test_file` and `N/A` in `test_function`. A lost runner is `runner lost during <step>`, one row per job, since there is no test to deduplicate on.
 - Do NOT include `first_seen`, `duration`, or any "days" field — the harness owns those.
 - Include a row for EVERY failing test across ALL tracked workflows. If a tracked workflow had no failures, simply emit no rows for it (an overall empty array `[]` is valid if nothing failed).
 
@@ -1076,6 +1112,14 @@ These errors were programmatically extracted from the log. Start your analysis f
 If this log block contains a `## MI355X Run Artifact Logs` section, use those
 artifact logs as the primary failure evidence for the MI355X disagg workflow;
 the GitHub job log alone is not sufficient for that workflow.
+
+If this log block starts with a `## Runner lost` section, the job's runner went
+away mid-job and no step failed; the log below it is usually just
+`[Failed to fetch logs: HTTP 404]`. Report one non-test row
+(`runner lost during <step>`, `N/A`, the annotation), use the Failure Cluster
+`Self-hosted runner lost communication (<runs-on label>)`, and say whether the
+other lost jobs listed there point to a host outage (several jobs, one window)
+or this job taking its runner down. Blame no sglang change from this log alone.
 
 Produce a CONCISE report. Be brief — engineers will read this quickly then check the logs themselves. Be honest about uncertainty: this is API mode (no source-code access, no git history), so confidence on causes is bounded by what's visible in the log alone.
 

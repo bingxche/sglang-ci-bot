@@ -31,7 +31,16 @@ from pathlib import Path
 
 import requests
 
-from utils import REPO, checkout_commit, download_job_logs, extract_error_lines, gh_headers, is_gate_job
+from utils import (
+    REPO,
+    checkout_commit,
+    download_job_logs,
+    extract_error_lines,
+    gh_headers,
+    is_gate_job,
+    is_runner_lost,
+    runner_lost_evidence,
+)
 
 SCHEMA_VERSION = 1
 BASELINE_RUNS = 6
@@ -533,6 +542,9 @@ def build_evidence_pack(
                 "id": job["id"], "name": job["name"], "url": job.get("html_url"),
                 "labels": job.get("labels", []), "runner": job.get("runner_name"),
                 "steps": job.get("steps", []),
+                # Facts about the runner going away, or None. Such a job usually
+                # has no log, so this is the only evidence of what happened.
+                "runner_lost": runner_lost_evidence(token, job, jobs) if is_runner_lost(job) else None,
             }
             (gates if is_gate_job(job) or _OPT_IN_GATE_RE.search(job["name"]) else failed).append(entry)
 
@@ -615,9 +627,13 @@ def build_evidence_pack(
                                               "backend_lines": t["backend_lines"],
                                               "aiter_modules": t["aiter_modules"]}
             else:
-                failure.update(failed_cases=[], attempts=1, mode="cascade" if p["cascade_of"] else "no_test_failure")
+                lost = job["runner_lost"]
+                mode = "cascade" if p["cascade_of"] else "runner_lost" if lost else "no_test_failure"
+                failure.update(failed_cases=[], attempts=1, mode=mode)
+                # After the tail, which the report trims from the front.
+                text = f"{p['tail']}\n\nThe runner was lost mid-job:\n{lost}" if lost else p["tail"]
                 evidence[f"{fid}.failure"] = {"kind": "failure", "failure_id": fid, "log": f"logs/{job['id']}.log",
-                                              "text": p["tail"]}
+                                              "text": text}
             evidence[f"{fid}.env"] = {**env, "failure_id": fid}
             failures.append(failure)
 

@@ -1206,6 +1206,9 @@ def monitor_workflow(
     reused_job_analyses: list[dict] = []
     pending_info: list[dict] = []
     reusable_job_analyses = reusable_job_analyses or {}
+    # Every failed job of each run, before the filters below, so a job whose
+    # runner was lost can be shown the other jobs that lost theirs.
+    run_failed_jobs: dict[str, list[dict]] = {}
 
     for run in runs:
         run_id = run["id"]
@@ -1216,6 +1219,7 @@ def monitor_workflow(
         log.info("  Run %d [%s/%s]: %s", run_id, run_status, run_conclusion, run_url)
 
         failed_jobs = get_failed_jobs(token, run_id)
+        run_failed_jobs[run_url] = failed_jobs
         if job_name_filter:
             failed_jobs = [j for j in failed_jobs if job_name_filter in j["name"]]
         if processed_job_ids:
@@ -1293,6 +1297,7 @@ def monitor_workflow(
                             head_sha=sha,
                             event_filter=event or "",
                             github_token=token,
+                            run_jobs=run_failed_jobs.get(run_url),
                         ): job
                         for job, run_url, sha in jobs_to_analyze
                     }
@@ -1319,6 +1324,7 @@ def monitor_workflow(
                     executor.submit(
                         analyze_job_api, client, token, job, run_url,
                         head_sha=sha, workflow_file=workflow_file,
+                        run_jobs=run_failed_jobs.get(run_url),
                     ): job
                     for job, run_url, sha in jobs_to_analyze
                 }
