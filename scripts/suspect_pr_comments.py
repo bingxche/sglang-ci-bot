@@ -15,7 +15,9 @@ code whether each suspect is solid enough to tell the PR's author:
     the PR's
   - the commit lies between the last passing and the first failing commit
     the agent cited (checked with the compare API)
-  - the PR has no comment from an earlier tick for the same cluster
+  - the PR has no suspect-PR comment yet, for any cluster: cluster IDs are
+    reassigned from day to day, so a per-cluster check would comment on the
+    same break again under its new ID
 
 Modes (``--mode`` / ``SUSPECT_PR_COMMENTS``):
 
@@ -61,6 +63,7 @@ MAX_JOBS_LISTED = 8
 
 LOG_COMMENT_MARKER = "<!-- ci-monitor-suspect-pr-log -->"
 _PR_MARKER = "<!-- amd-bot-suspect-pr:{cluster} -->"
+_PR_MARKER_RE = re.compile(r"<!-- amd-bot-suspect-pr:(R\d+) -->")
 _MENTION_RE = re.compile(r"(?<![\w`])@([A-Za-z0-9][\w-]*(?:/[\w.-]+)?)")
 
 
@@ -179,10 +182,12 @@ def check_suspect(
             f"and first failing {s['first_fail_sha'][:8]}"
         )
 
-    marker = pr_marker(s["cluster"])
     for c in gh.pr_comments(s["pr"]):
-        if marker in (c.get("body") or ""):
-            d.result, d.reason, d.comment_url = "already", "already commented", c.get("html_url", "")
+        m = _PR_MARKER_RE.search(c.get("body") or "")
+        if m:
+            d.result, d.comment_url = "already", c.get("html_url", "")
+            if m.group(1) != s["cluster"]:
+                d.reason = f"commented earlier as {m.group(1)}"
             return d
 
     d.result = "post"
@@ -273,6 +278,8 @@ def render_log_comment(decisions: list[Decision], mode: str, snapshot_utc: str) 
     for d in decisions:
         s = d.suspect
         result = _RESULT_TEXT.get(d.result, f"skipped: {d.reason}")
+        if d.result == "already" and d.reason:
+            result += f" ({d.reason})"
         if d.comment_url:
             result = f"[{result}]({d.comment_url})"
         lines.append(
@@ -324,6 +331,16 @@ def decide_all(
     decisions.sort(key=lambda d: (
         d.result != "post", rank.get(d.suspect["confidence"], 9), -len(d.jobs),
     ))
+    # Two clusters naming the same PR in one tick: only the strongest is posted.
+    posting: dict[int, str] = {}
+    for d in decisions:
+        if d.result != "post":
+            continue
+        pr = d.suspect["pr"]
+        if pr in posting:
+            d.result, d.reason, d.body = "skip", f"#{pr} gets one comment, for {posting[pr]}", ""
+        else:
+            posting[pr] = d.suspect["cluster"]
     return decisions
 
 

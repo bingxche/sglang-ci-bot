@@ -140,6 +140,14 @@ class CheckSuspectTest(unittest.TestCase):
         d = self.check(gh=gh)
         self.assertEqual((d.result, d.comment_url), ("already", "u"))
 
+    def test_comment_under_an_earlier_cluster_id_is_not_repeated(self):
+        # #45791 was R327 at 22:05 and R332 at 23:05 on Oct 27.
+        gh = FakeGitHub(comments=[{"body": spc.pr_marker("R327") + "\nhi", "html_url": "u"}])
+        d = self.check(_suspect(cluster="R332"), gh=gh)
+        self.assertEqual((d.result, d.reason), ("already", "commented earlier as R327"))
+        log_body = spc.render_log_comment([d], "post", "2026-10-28 18:00 UTC")
+        self.assertIn("[already commented (commented earlier as R327)](u)", log_body)
+
 
 class RenderTest(unittest.TestCase):
     def test_pr_comment(self):
@@ -162,7 +170,7 @@ class RenderTest(unittest.TestCase):
 
     def test_dry_run_holds_over_limit_and_logs(self):
         gh = FakeGitHub()
-        suspects = [_suspect(cluster=f"R{i}") for i in range(1, spc.MAX_POSTS_PER_RUN + 2)]
+        suspects = [_suspect(cluster=f"R{i}", pr=42229 + i) for i in range(1, spc.MAX_POSTS_PER_RUN + 2)]
         suspects.append(_suspect(cluster="R99", confidence="LOW"))
         clusters = {s["cluster"]: [1, 2] for s in suspects}
         decisions = spc.decide_all(suspects, clusters, {}, gh, NOW)
@@ -184,6 +192,18 @@ class RenderTest(unittest.TestCase):
             [_suspect(), _suspect()], {"R281": [1, 2]}, {}, FakeGitHub(), NOW,
         )
         self.assertEqual(len(decisions), 1)
+
+    def test_two_clusters_on_one_pr_post_once(self):
+        decisions = spc.decide_all(
+            [_suspect(cluster="R1"), _suspect(cluster="R2")],
+            {"R1": [1, 2], "R2": [1, 2, 3]}, {}, FakeGitHub(), NOW,
+        )
+        self.assertEqual(
+            [(d.suspect["cluster"], d.result) for d in decisions],
+            [("R2", "post"), ("R1", "skip")],
+        )
+        self.assertEqual(decisions[1].reason, "#42229 gets one comment, for R2")
+        self.assertEqual(decisions[1].body, "")
 
 
 if __name__ == "__main__":
