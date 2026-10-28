@@ -36,8 +36,10 @@ def _suspect(**overrides) -> dict:
 
 class FakeGitHub:
     def __init__(self, merged_at="2026-10-21T05:32:30Z", merge_sha=SHA,
-                 statuses=None, comments=None):
+                 statuses=None, comments=None, fixes=None):
         self.merged_at = merged_at
+        # fix PR number -> its pull payload
+        self.fixes = fixes or {}
         self.merge_sha = merge_sha
         # (base, head) -> status; default puts SHA inside PASS..FAIL.
         self.statuses = statuses or {(PASS, SHA): "ahead", (SHA, FAIL): "ahead"}
@@ -46,7 +48,10 @@ class FakeGitHub:
 
     def pull(self, pr):
         self.calls += 1
-        return {"number": pr, "merged_at": self.merged_at, "merge_commit_sha": self.merge_sha}
+        if pr in self.fixes:
+            return self.fixes[pr]
+        return {"number": pr, "merged_at": self.merged_at, "merge_commit_sha": self.merge_sha,
+                "user": {"login": "pr-author"}}
 
     def full_sha(self, sha):
         return SHA if SHA.startswith(sha) else None
@@ -109,8 +114,43 @@ class CheckSuspectTest(unittest.TestCase):
         self.assertIn("MEDIUM", d.reason)
         self.assertEqual(gh.calls, 0)
 
-    def test_linked_fix_pr_is_skipped(self):
-        self.assertIn("fix PR #45656", self.check(_suspect(fix_pr=45656)).reason)
+    def _fix(self, state="open", merged_at=None, author="fixer"):
+        return {45656: {"number": 45656, "state": state, "merged_at": merged_at,
+                        "title": "Fix it", "user": {"login": author}}}
+
+    def test_open_fix_pr_asks_the_author_to_review(self):
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix()))
+        self.assertEqual((d.result, d.fix["number"], d.pr_author), ("post", 45656, "pr-author"))
+        body = spc.render_pr_comment(d, {})
+        self.assertTrue(body.startswith(spc.fix_marker(45656)))
+        self.assertIn("@pr-author AMD CI jobs started failing", body)
+        self.assertIn("#45656 proposes a fix. Could you review it?", body)
+        # The author is the only mention; the evidence's are still neutralized.
+        self.assertIn("`@someone`", body)
+        log_body = spc.render_log_comment([d], "post", "2026-10-28 18:00 UTC")
+        self.assertIn("would comment (review request for #45656)", log_body)
+
+    def test_review_request_goes_out_after_an_earlier_suspect_comment(self):
+        gh = FakeGitHub(fixes=self._fix(), comments=[{"body": spc.pr_marker("R281"), "html_url": "u"}])
+        self.assertEqual(self.check(_suspect(fix_pr=45656), gh=gh).result, "post")
+
+    def test_review_request_is_sent_once_per_fix(self):
+        gh = FakeGitHub(fixes=self._fix(), comments=[{"body": spc.fix_marker(45656), "html_url": "u"}])
+        d = self.check(_suspect(fix_pr=45656), gh=gh)
+        self.assertEqual((d.result, d.reason), ("already", "asked to review #45656"))
+
+    def test_merged_fix_is_skipped(self):
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix("closed", "2026-10-22T00:00:00Z")))
+        self.assertEqual(d.reason, "fix PR #45656 already merged")
+
+    def test_fix_by_the_pr_author_is_skipped(self):
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix(author="PR-Author")))
+        self.assertEqual(d.reason, "fix PR #45656 is by the PR's author")
+
+    def test_abandoned_fix_falls_back_to_a_plain_comment(self):
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix("closed")))
+        self.assertEqual((d.result, d.fix), ("post", None))
+        self.assertTrue(spc.render_pr_comment(d, {}).startswith(spc.pr_marker("R281")))
 
     def test_single_failed_job_is_skipped(self):
         self.assertIn("needs 2", self.check(jobs=[1]).reason)
