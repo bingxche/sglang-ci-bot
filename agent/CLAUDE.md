@@ -934,7 +934,7 @@ After the `job-clusters` block, end with a second fenced block listing every clu
 - `fix_pr` is the open or merged sglang PR that fixes the cluster, if the In-flight Fix Check found one; else `null`.
 - `related_prs` lists other PRs the failure depends on, e.g. the PR that removed a symbol the suspect PR still imports.
 - `evidence` is one or two plain sentences a PR author can check: what fails and how it traces to their change. No `@`-mentions, no links to this bot repo or other internal pages, no priority words.
-- The harness strips this block from the summary. Separate code decides whether to comment on the PR (FACT/HIGH only, no fix PR, ≥2 failed jobs, commit verified to be between `last_pass_sha` and `first_fail_sha`), so state the confidence you actually have.
+- The harness strips this block from the summary. Separate code decides whether to comment on the PR (FACT/HIGH only, ≥2 failed jobs, commit verified to be between `last_pass_sha` and `first_fail_sha`; with an open `fix_pr`, the comment asks the suspect PR's author to review that fix, so only name a `fix_pr` that actually fixes this cluster), so state the confidence you actually have.
 
 ---
 

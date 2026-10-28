@@ -9,7 +9,6 @@ run once per tick by the ``finalize`` job, reads that copy and decides in
 code whether each suspect is solid enough to tell the PR's author:
 
   - confidence is ``FACT`` or ``HIGH``
-  - no fix PR is linked for the cluster
   - the cluster has at least ``MIN_FAILED_JOBS`` failed jobs
   - the PR is merged, within ``MAX_PR_AGE_DAYS``, and the cited commit is
     the PR's
@@ -18,6 +17,12 @@ code whether each suspect is solid enough to tell the PR's author:
   - the PR has no suspect-PR comment yet, for any cluster: cluster IDs are
     reassigned from day to day, so a per-cluster check would comment on the
     same break again under its new ID
+
+When the cluster has a fix PR, the comment instead ``@``-mentions the
+suspect PR's author and asks them to review it, once per fix PR, even on a
+PR that already had a suspect comment. That needs the fix PR to be open
+and by someone else; a merged fix skips the suspect, and one closed
+without merging is treated as no fix.
 
 Modes (``--mode`` / ``SUSPECT_PR_COMMENTS``):
 
@@ -64,11 +69,17 @@ MAX_JOBS_LISTED = 8
 LOG_COMMENT_MARKER = "<!-- ci-monitor-suspect-pr-log -->"
 _PR_MARKER = "<!-- amd-bot-suspect-pr:{cluster} -->"
 _PR_MARKER_RE = re.compile(r"<!-- amd-bot-suspect-pr:(R\d+) -->")
+# On a comment that asks the suspect PR's author to review an open fix PR.
+_FIX_MARKER = "<!-- amd-bot-suspect-fix:{fix_pr} -->"
 _MENTION_RE = re.compile(r"(?<![\w`])@([A-Za-z0-9][\w-]*(?:/[\w.-]+)?)")
 
 
 def pr_marker(cluster: str) -> str:
     return _PR_MARKER.format(cluster=cluster)
+
+
+def fix_marker(fix_pr: int) -> str:
+    return _FIX_MARKER.format(fix_pr=fix_pr)
 
 
 def _pr_url(pr: int) -> str:
@@ -135,6 +146,26 @@ class Decision:
     full_sha: str = ""
     comment_url: str = ""
     body: str = field(default="", repr=False)
+    # Set when the comment asks the PR's author to review an open fix PR.
+    fix: dict | None = None
+    pr_author: str = ""
+
+
+def check_fix(fix_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:
+    """``(fix, "")`` when the fix PR is open and worth a review request,
+    ``(None, "")`` when it is gone (closed unmerged: comment as if there were
+    no fix), or ``(None, reason)`` to skip the suspect."""
+    pull = gh.pull(fix_pr)
+    if not pull:
+        return None, f"fix PR #{fix_pr} not found"
+    if pull.get("merged_at"):
+        return None, f"fix PR #{fix_pr} already merged"
+    if pull.get("state") != "open":
+        return None, ""
+    fix_author = (pull.get("user") or {}).get("login", "")
+    if fix_author.lower() == author.lower():
+        return None, f"fix PR #{fix_pr} is by the PR's author"
+    return {"number": fix_pr, "title": pull.get("title", ""), "author": fix_author}, ""
 
 
 def check_suspect(
@@ -150,8 +181,6 @@ def check_suspect(
     s = suspect
     if s["confidence"] not in POSTABLE_CONFIDENCE:
         return skip(f"confidence {s['confidence']} (needs FACT or HIGH)")
-    if s.get("fix_pr"):
-        return skip(f"fix PR #{s['fix_pr']} already linked")
     if len(jobs) < MIN_FAILED_JOBS:
         return skip(f"{len(jobs)} failed job(s) in {s['cluster']} (needs {MIN_FAILED_JOBS})")
     if not s.get("last_pass_sha") or not s.get("first_fail_sha"):
@@ -182,6 +211,23 @@ def check_suspect(
             f"and first failing {s['first_fail_sha'][:8]}"
         )
 
+    d.pr_author = (pull.get("user") or {}).get("login", "")
+    if s.get("fix_pr"):
+        d.fix, reason = check_fix(s["fix_pr"], d.pr_author, gh)
+        if reason:
+            return skip(reason)
+
+    if d.fix:
+        # One review request per fix PR, even after an earlier suspect comment.
+        marker = fix_marker(d.fix["number"])
+        for c in gh.pr_comments(s["pr"]):
+            if marker in (c.get("body") or ""):
+                d.result, d.comment_url = "already", c.get("html_url", "")
+                d.reason = f"asked to review #{d.fix['number']}"
+                return d
+        d.result = "post"
+        return d
+
     for c in gh.pr_comments(s["pr"]):
         m = _PR_MARKER_RE.search(c.get("body") or "")
         if m:
@@ -201,11 +247,20 @@ def check_suspect(
 def render_pr_comment(d: Decision, job_info: dict[int, dict]) -> str:
     """The comment posted on the suspect PR."""
     s = d.suspect
-    lines = [
-        pr_marker(s["cluster"]),
-        "AMD CI jobs started failing after this PR was merged, and the evidence points at this change.",
-        "",
-    ]
+    if d.fix:
+        # The one deliberate mention: the author is asked to review the fix.
+        lines = [
+            fix_marker(d.fix["number"]),
+            f"@{d.pr_author} AMD CI jobs started failing after this PR was merged, and "
+            f"#{d.fix['number']} proposes a fix. Could you review it?",
+            "",
+        ]
+    else:
+        lines = [
+            pr_marker(s["cluster"]),
+            "AMD CI jobs started failing after this PR was merged, and the evidence points at this change.",
+            "",
+        ]
     if s.get("evidence"):
         lines += [neutralize_mentions(s["evidence"]), ""]
     window = (
@@ -232,10 +287,18 @@ def render_pr_comment(d: Decision, job_info: dict[int, dict]) -> str:
         lines.append(f"- [{name}]({url})")
     if len(d.jobs) > len(listed):
         lines.append(f"- …and {len(d.jobs) - len(listed)} more")
+    if d.fix:
+        closing = (
+            "If this PR isn't the cause, please say so here so the attribution can be corrected."
+        )
+    else:
+        closing = (
+            "If this PR is the cause, a fix or a revert would turn these jobs green again. "
+            "If it isn't, please say so here so the attribution can be corrected."
+        )
     lines += [
         "",
-        "If this PR is the cause, a fix or a revert would turn these jobs green again. "
-        "If it isn't, please say so here so the attribution can be corrected.",
+        closing,
         "",
         f"<sub>Posted automatically by the AMD CI monitor. Confidence: {s['confidence']}.</sub>",
     ]
@@ -280,6 +343,8 @@ def render_log_comment(decisions: list[Decision], mode: str, snapshot_utc: str) 
         result = _RESULT_TEXT.get(d.result, f"skipped: {d.reason}")
         if d.result == "already" and d.reason:
             result += f" ({d.reason})"
+        elif d.fix and d.result in ("post", "posted", "held"):
+            result += f" (review request for #{d.fix['number']})"
         if d.comment_url:
             result = f"[{result}]({d.comment_url})"
         lines.append(
