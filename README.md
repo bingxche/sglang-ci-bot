@@ -2,13 +2,13 @@
 
 The AMD CI bot for [sglang](https://github.com/sgl-project/sglang). It watches AMD CI, explains failures, names the PRs that broke it, and reviews PRs on request. It posts as **[amd-bot](https://github.com/amd-bot)**. The analysis is done by Claude Code agents running on self-hosted runners that reach Claude through the AMD LLM Gateway.
 
-This README is the map of the repo: what each part does and why. Implementation details live in the code it links to. If you read only two sections, read [The big picture](#1-the-big-picture) and [Design rules](#3-design-rules).
+This README is the map of the repo: what each part does and why. Implementation details live in the code it links to. If you read only two sections, read [The big picture](#1-the-big-picture) and [Design rules](#3-design-rules). **Changing the repo, by hand or with an AI tool?** Read [Changing this repo](#changing-this-repo) first.
 
 **Contents**
 
 1. [The big picture](#1-the-big-picture)
 2. [Feature map](#2-feature-map)
-3. [Design rules](#3-design-rules)
+3. [Design rules](#3-design-rules) · [Hidden markers](#hidden-markers-where-the-state-lives) · [Changing this repo](#changing-this-repo)
 4. [How an agent runs](#4-how-an-agent-runs)
 5. [Features](#5-features): [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) · [Suspect PR comments](#52-suspect-pr-comments) · [Failure Trackers](#53-failure-trackers) · [PR commands](#54-pr-commands-the-comment-watcher) · [PR review](#55-pr-review) · [PR CI status](#56-pr-ci-status-check) · [On-demand analysis](#57-on-demand-analysis) · [Notion staging](#58-notion-staging) · [Coverage audit](#59-coverage-exclusion-audit)
 6. [Operations](#6-operations)
@@ -18,60 +18,58 @@ This README is the map of the repo: what each part does and why. Implementation 
 
 ## 1. The big picture
 
+Each feature is one lane, read left to right: what starts it, which workflow runs, where the LLM is used, what code checks it, and where the result goes.
+
 ```mermaid
-flowchart LR
-    subgraph triggers["Triggers"]
-        T1["runner-1 loop<br/>(hourly)"]
-        T2["@amd-bot command<br/>on a sglang PR"]
-        T3["Actions tab:<br/>Analyze CI"]
-        T4["schedule<br/>12:00 UTC daily"]
-        T5["schedule<br/>Mon 16:07 UTC"]
+flowchart TB
+    classDef trigger fill:#e8eefc,stroke:#5b7bd5,color:#1b2a4a
+    classDef workflow fill:#f4f4f4,stroke:#888,color:#222
+    classDef agent fill:#fff4e0,stroke:#d99a2b,color:#3d2a00
+    classDef code fill:#eaf6ea,stroke:#4c9a4c,color:#173d17
+    classDef output fill:#f3e8fb,stroke:#9a5bc4,color:#341a47
+
+    subgraph L1["① CI monitor"]
+        direction LR
+        A1(["hourly timer<br/>(runner-1)"]):::trigger --> A2["ci-monitor.yml"]:::workflow --> A3{{"agents: per job →<br/>per workflow →<br/>daily summary"}}:::agent --> A4[("daily issue<br/>in this repo")]:::output --> A5["finalize: code checks<br/>+ 3 verifier agents"]:::code --> A6[("sglang: suspect-PR<br/>comments, trackers")]:::output
     end
 
-    W0["comment watcher<br/>watch_comments.py<br/>(daemon 15s + cron 5min)"]
-
-    subgraph workflows["GitHub Actions in this repo, on self-hosted runners"]
-        W1["ci-monitor.yml<br/>prepare → monitor matrix → finalize"]
-        W2["pr-review.yml"]
-        W3["ci-status-check.yml"]
-        W4["analyze-ci.yml"]
-        W5["notion-staging.yml"]
-        W6["coverage-audit.yml"]
+    subgraph L2["② @amd-bot review"]
+        direction LR
+        B1(["@amd-bot review"]):::trigger --> B2["watcher →<br/>pr-review.yml"]:::workflow --> B3{{"4 reviewer agents"}}:::agent --> B4["code checks<br/>+ 3 verifier agents"]:::code --> B5[("review on<br/>the sglang PR")]:::output
     end
 
-    A["Claude Code agents<br/>claude_code_analyze()<br/>instructions from agent/"]
-
-    subgraph outputs["Where results go"]
-        O1["Daily issue<br/>(this repo)"]
-        O2["Comments / reviews<br/>on sglang PRs"]
-        O3["Failure Tracker issues<br/>(sgl-project/sglang)"]
-        O4["Analyze issue<br/>(this repo)"]
-        O5["Notion staging DB"]
-        O6["PR merged into<br/>ROCm/sglang-ci"]
+    subgraph L3["③ @amd-bot ci-status"]
+        direction LR
+        C1(["@amd-bot ci-status"]):::trigger --> C2["watcher →<br/>ci-status-check.yml"]:::workflow --> C3["evidence pack<br/>(code)"]:::code --> C4{{"attribution agent"}}:::agent --> C5["verdicts checked<br/>against evidence"]:::code --> C6[("comment on<br/>the sglang PR")]:::output
     end
 
-    T1 --> W1
-    T2 --> W0 --> W2 & W3
-    T3 --> W4
-    T4 --> W5
-    T5 --> W6
-    W1 & W2 & W3 & W4 & W5 --> A
-    W1 --> O1
-    W1 -- finalize --> O2 & O3
-    W2 & W3 --> O2
-    W4 --> O4
-    W5 --> O5
-    W6 --> O6
-    O1 -. "read back as state" .-> W1 & W5
+    subgraph L4["④ On-demand analysis"]
+        direction LR
+        D1(["Actions tab:<br/>run or job URL"]):::trigger --> D2["analyze-ci.yml"]:::workflow --> D3{{"agents: each job,<br/>cross-job"}}:::agent --> D4[("Analyze issue<br/>in this repo")]:::output
+    end
+
+    subgraph L5["⑤ Notion staging"]
+        direction LR
+        E1(["daily schedule"]):::trigger --> E2["notion-staging.yml"]:::workflow --> E3{{"candidates agent<br/>(reads daily issues)"}}:::agent --> E4["stability gate<br/>+ dedup (code)"]:::code --> E5[("Notion<br/>staging table")]:::output
+    end
+
+    subgraph L6["⑥ Coverage audit"]
+        direction LR
+        F1(["weekly schedule"]):::trigger --> F2["coverage-audit.yml"]:::workflow --> F3{{"audit agents<br/>(prompt lives in<br/>ROCm/sglang-ci)"}}:::agent --> F4["validate + test<br/>(code)"]:::code --> F5[("PR merged into<br/>ROCm/sglang-ci")]:::output
+    end
+
+    L1 ~~~ L2 ~~~ L3 ~~~ L4 ~~~ L5 ~~~ L6
 ```
 
-How to read it:
+**Colors.** 🔵 trigger · ⬜ GitHub Actions workflow · 🟧 LLM agents · 🟩 deterministic code · 🟪 where results go.
 
-- **Everything runs on the self-hosted runner containers** (`runner/`), because only they can reach the LLM gateway. The work runs as GitHub Actions jobs of this repo. The only exception is two loops on runner-1: the comment watcher daemon, and the hourly dispatch of the CI monitor.
-- **The left side is a handful of triggers:** runner-1's two loops, plus cron schedules and manual runs.
-- **Every workflow calls Python scripts, and every script that needs judgement calls Claude Code agents** through one function, [`claude_code_analyze()`](scripts/utils.py). The agents' instructions are files under [`agent/`](agent/), never strings in Python.
-- **The daily issue is both output and state.** Later steps (the cross-workflow summary, suspect-PR comments, Failure Trackers, Notion staging) read the analyses back from it. Runners keep no state that matters.
-- **The only things written upstream** (to sgl-project/sglang) are PR comments and reviews, and the Failure Tracker issues. Each has its own gate (§3, rule 7).
+**The one pattern to notice.** Wherever a result leaves this repo (lanes ①②③⑤⑥), a green box stands between the orange LLM and the purple output. The LLM proposes, and code decides what gets out. That is design rules [R2](#r2) and [R4](#r4) in picture form. Only lanes ① and ④ write straight from an agent, and only into this repo's own issues.
+
+Three more things the picture does not show:
+
+- **Everything runs on the self-hosted runner containers** (`runner/`), because only they can reach the LLM gateway. The work runs as GitHub Actions jobs of this repo, plus two loops on runner-1: the hourly CI-monitor timer, and the comment watcher behind lanes ② and ③.
+- **Every agent goes through one function**, [`claude_code_analyze()`](scripts/utils.py). Agents get their instructions from files under [`agent/`](agent/), never from strings in Python ([§4](#4-how-an-agent-runs)).
+- **The daily issue is also state.** The summary and the `finalize` steps of lane ①, and lane ⑤, read the analyses back from it. Runners keep nothing that matters.
 
 ---
 
@@ -89,37 +87,87 @@ How to read it:
 | [Notion staging](#58-notion-staging) | 12:00 UTC daily | [`notion-staging.yml`](.github/workflows/notion-staging.yml) → [`stage_notion.py`](scripts/stage_notion.py) | SGLang AMD CI Staging Candidates | Notion staging database |
 | [Coverage audit](#59-coverage-exclusion-audit) | Mondays 16:07 UTC | [`coverage-audit.yml`](.github/workflows/coverage-audit.yml) (code lives in ROCm/sglang-ci) | its own prompt, in ROCm/sglang-ci | A PR merged into ROCm/sglang-ci |
 
-Supporting code: [`utils.py`](scripts/utils.py) (GitHub helpers, the agent harness, worktrees, log parsing), [`ensure_daily_issue.py`](scripts/ensure_daily_issue.py), [`eval_ci_status.py`](scripts/eval_ci_status.py) (scores CI-status replays), [`validate_live.py`](scripts/validate_live.py) (runs any use case on a runner without writing to GitHub).
+Supporting code:
+- [`utils.py`](scripts/utils.py): GitHub helpers, the agent harness, worktrees, log parsing.
+- [`ensure_daily_issue.py`](scripts/ensure_daily_issue.py): creates the daily issue.
+- [`eval_ci_status.py`](scripts/eval_ci_status.py): scores CI-status replays.
+- [`validate_live.py`](scripts/validate_live.py): runs any use case on a runner without writing to GitHub.
+- [`check_pr_rules.py`](scripts/check_pr_rules.py) with [`pr-checks.yml`](.github/workflows/pr-checks.yml): enforce the [rules for changes](#changing-this-repo) on every PR.
 
 ---
 
 ## 3. Design rules
 
-These are the decisions everything else follows. If a change breaks one of them, the PR should say so, because the rest of the design probably assumes it.
+The decisions everything else follows, grouped by what they protect. Each has a stable ID, so a PR can say which rules it touches. Each also says **why** it exists and **what keeps it true**; rules kept only by review are marked *review only*.
 
-1. **The LLM judges; code decides and keeps state.** An agent finds and explains things. Plain Python decides whether anything is published and keeps every piece of state. For example, an agent names a suspect PR, but [`check_suspect()`](scripts/suspect_pr_comments.py) decides whether to comment. An agent extracts tracker rows, but [`merge_state()`](scripts/failure_tracker.py) owns `first_seen`. An agent gives CI-status verdicts, but [`ci_verdicts.validate()`](scripts/ci_verdicts.py) checks them against the evidence. A reviewer reports findings, but [`check_findings()`](scripts/review_findings.py) and [`tally()`](scripts/review_findings.py) decide which are posted.
-2. **Never publish a shallow or unverified answer.** Agent mode never falls back to a single-shot API call. When an agent fails, the bot publishes an "agent did not work" notice ([`agent_failure_notice()`](scripts/utils.py)) where the output would have gone, and the job fails. A verification step that cannot finish blocks posting; it does not wave the result through. API mode exists only when chosen explicitly (`USE_AGENT=false`).
-3. **Claims carry evidence.** The Ground Rules in [`agent/CLAUDE.md`](agent/CLAUDE.md) bind every task:
-   - Analysis is at the test-file and test-function level.
-   - Every commit SHA is verified, and every SHA, PR and job is a link.
-   - Every causal claim has a confidence label (`FACT` / `HIGH` / `MEDIUM` / `LOW` / `SPECULATION`) and lists its disconfirming evidence.
-   - An in-flight fix PR is looked up before any fix is suggested.
-   - Only completed runs count in trends.
-   - The bot never assigns priority; it states facts and suggests triage steps, not directives.
-4. **Agents are read-only and isolated.**
-   - Each agent works in its own git worktree, at the exact commit under study.
-   - It loads no settings from that checkout (`--setting-sources user`): a PR could otherwise ship a `.claude/settings.json` whose hooks run on the runner.
-   - Developer skills are disabled.
-   - Its environment drops the posting tokens, and gets a read-only token when `AGENT_GH_TOKEN` is set.
-   - See [§4](#4-how-an-agent-runs).
-5. **Instructions live only in [`agent/`](agent/).** Python prompts are data: a `Task:` line plus metadata. The methodology and output format for each task are in `agent/tasks/<task>.md`, and the Ground Rules for all tasks are in `agent/CLAUDE.md`.
-6. **State lives on GitHub; runners are disposable; every write is idempotent.** Comments and issues carry hidden markers (table below), so any tick can be re-run, any runner can pick up a job, and a host can be rebuilt from scratch ([Disaster recovery](#disaster-recovery)).
-7. **Anything written upstream is gated.**
-   - New writers start in dry-run behind a repository variable.
-   - Posts are capped per tick, and each kind of comment is posted at most once per PR.
-   - The bot @-mentions only the person who ran a command, and the author of a suspect PR when a fix needs their review; mentions inside agent text are put in code spans.
-   - Attributions and review findings are confirmed by independent verifier agents before they are posted.
-8. **This README is the map.** A change in behavior updates the matching section in the same commit ([`AGENTS.md`](AGENTS.md)). [`tests/test_readme.py`](tests/test_readme.py) fails when the README names a file or function that does not exist, or misses a script, workflow, agent task or environment variable.
+### Safety: what the bot can touch
+
+<a id="r1"></a>**R1. Agents read; code writes.**
+- Every agent works in its own git worktree, at the exact commit under study, and loads no settings from that checkout (`--setting-sources user`). Developer skills are disabled.
+- Its environment carries no posting token, and only a read-only one when `AGENT_GH_TOKEN` is set.
+- Only Python code writes to GitHub or Notion.
+
+*Why:* agents read text anyone can write (PR diffs, logs, a PR's own `.claude/settings.json`, whose hooks once could run on our runners). *Kept by:* [`tests/test_agent_tasks.py`](tests/test_agent_tasks.py) (CLI flags), [`tests/test_ci_verdicts.py`](tests/test_ci_verdicts.py) (agent environment).
+
+<a id="r2"></a>**R2. Every write outside this repo passes a code gate.**
+- New writers start in dry-run behind a repository variable.
+- Posts are capped per tick and made at most once per PR (hidden markers).
+- Attributions and review findings are confirmed by independent verifier agents first.
+- The bot @-mentions only the person who ran a command, and the author of a suspect PR asked to review a fix.
+
+*Why:* a wrong comment on someone else's PR costs trust that is hard to win back. *Kept by:* [`tests/test_suspect_pr_comments.py`](tests/test_suspect_pr_comments.py), [`tests/test_review_findings.py`](tests/test_review_findings.py).
+
+<a id="r3"></a>**R3. People decide.** The bot reports, attributes and suggests triage steps. It never approves, merges, prioritizes or reruns sglang work. The one automated merge is the coverage audit's, into ROCm/sglang-ci, of exclusion entries that code validated and tested.
+
+*Why:* priority and merging need context the bot does not have. *Kept by:* review only.
+
+### Truthfulness: what the bot says
+
+<a id="r4"></a>**R4. The LLM judges; code decides and keeps state.** An agent finds and explains. Plain Python decides what is published and keeps every piece of state. For example:
+- an agent names a suspect PR, and [`check_suspect()`](scripts/suspect_pr_comments.py) decides whether to comment;
+- an agent extracts tracker rows, and [`merge_state()`](scripts/failure_tracker.py) owns `first_seen`;
+- an agent gives CI-status verdicts, and [`ci_verdicts.validate()`](scripts/ci_verdicts.py) checks them against the evidence;
+- reviewers report findings, and [`check_findings()`](scripts/review_findings.py) and [`tally()`](scripts/review_findings.py) decide which are posted.
+
+*Why:* models are good at reading logs and code, and unreliable at counting, remembering dates and following thresholds. *Kept by:* the tests of each of those functions.
+
+<a id="r5"></a>**R5. Claims carry evidence.** The Ground Rules in [`agent/ground-rules.md`](agent/ground-rules.md) bind every task:
+- analysis is at the test-file and test-function level;
+- every commit SHA is verified, and every SHA, PR and job is a link;
+- every causal claim has a confidence label (`FACT` … `SPECULATION`) and lists its disconfirming evidence;
+- an in-flight fix PR is looked up before a fix is suggested;
+- only completed runs count in trends.
+
+*Why:* an unsupported claim sends engineers chasing the wrong cause. *Kept by:* the verification steps of R4 where output is published; review only elsewhere.
+
+<a id="r6"></a>**R6. Fail closed.** Agent mode never falls back to a single-shot API call. When an agent fails, the bot publishes an "agent did not work" notice ([`agent_failure_notice()`](scripts/utils.py)) where the output would have gone, and the job fails. A verification step that cannot finish blocks posting.
+
+*Why:* a confident shallow answer is worse than an honest "not available". *Kept by:* [`tests/test_agent_failures.py`](tests/test_agent_failures.py).
+
+### Sustainability: how the repo stays understandable
+
+<a id="r7"></a>**R7. Instructions live only in [`agent/`](agent/).** Python prompts are data: a `Task:` line plus metadata. Methodology and output format live in `agent/tasks/<task>.md`, and rules for every task in `agent/ground-rules.md`. [`AGENT_TASKS`](scripts/utils.py) maps each task to its file and model.
+
+*Why:* behavior can then be reviewed as prose, in one place. *Kept by:* [`tests/test_agent_tasks.py`](tests/test_agent_tasks.py).
+
+<a id="r8"></a>**R8. State lives on GitHub; runners are disposable; writes are idempotent.** Comments and issues carry [hidden markers](#hidden-markers-where-the-state-lives), so any tick can be re-run, any runner can take any job, and a host can be rebuilt from scratch.
+
+*Why:* the runners are containers on one machine that gets rebuilt. *Kept by:* each feature's tests (re-runs, dedup).
+
+<a id="r9"></a>**R9. Cost is bounded.**
+- Every agent run has a turn limit and a timeout.
+- Every fan-out has a cap: agents per matrix job, reviewers, findings verified, suspects verified per tick.
+- Every task's model is chosen for its stakes (Sonnet for extraction and votes).
+
+*Why:* one loop without a bound spends the team's gateway quota. *Kept by:* review only. The limits are in the [environment variables](#environment-variables) table.
+
+<a id="r10"></a>**R10. Agent changes are measured on real data.** A change to an agent's instructions or model is run on real inputs before merge, with [`validate_live.py`](scripts/validate_live.py), a CI-status replay, or a linked run, and the PR says how.
+
+*Why:* a prompt has no compiler; its only test is its output. *Kept by:* the `Validated:` line that [`check_pr_rules.py`](scripts/check_pr_rules.py) requires.
+
+<a id="r11"></a>**R11. This README is the map.** A change in behavior updates the matching section in the same PR. *Kept by:*
+- [`tests/test_readme.py`](tests/test_readme.py): links, function names and lists match the code, and every script, workflow, agent task and environment variable is mentioned;
+- [`check_pr_rules.py`](scripts/check_pr_rules.py): a behavior change without a README change fails.
 
 ### Hidden markers (where the state lives)
 
@@ -137,6 +185,21 @@ These are the decisions everything else follows. If a change breaks one of them,
 | `<!-- amd-bot-review {…} -->` | review body on a sglang PR | reviewed commit, round, findings posted |
 | 🚀 reaction by amd-bot | the `@amd-bot` comment | the command was claimed; no other watcher dispatches it |
 
+### Changing this repo
+
+These rules apply to every change, whether typed by hand or written by an AI tool. [`AGENTS.md`](AGENTS.md) has the full text; Claude Code reads it through the root [`CLAUDE.md`](CLAUDE.md), and Cursor through [`.cursor/rules/`](.cursor/rules/update-readme.mdc).
+
+1. **Read §1–§3 first.** Extend the existing patterns (the agent harness, hidden markers, code gates, dry-run variables) rather than inventing parallel ones.
+2. **Stay on direction.** Do not break a design rule silently. A change that bends one names it in the PR, says why, and updates the rule here, which needs the repo owner's approval.
+3. **One concern per PR.** No drive-by refactors, renames or reformatting, so every diff is reviewable.
+4. **Update this README in the same PR**, following the section map in `AGENTS.md`, along with tests for the new behavior.
+5. **Fill in the three lines of the [PR template](.github/pull_request_template.md):**
+   - `README:` the sections updated, or `not needed — <reason>`;
+   - `Design rules:` `none`, or the rule IDs touched;
+   - `Validated:` how an agent change ran on real data (R10).
+
+[`pr-checks.yml`](.github/workflows/pr-checks.yml) runs the unit tests and [`check_pr_rules.py`](scripts/check_pr_rules.py) on every pull request. It fails a PR that misses any of the above. Making it a required status check for `main` in branch protection is what makes the rules binding.
+
 ---
 
 ## 4. How an agent runs
@@ -144,7 +207,7 @@ These are the decisions everything else follows. If a change breaks one of them,
 Every agent run goes through [`claude_code_analyze()`](scripts/utils.py):
 
 1. The prompt's first line names the task (`Task: Job Failure Analysis`). [`AGENT_TASKS`](scripts/utils.py) maps the task to its instructions file and model; an unknown task fails before anything starts.
-2. The instructions, [`agent/CLAUDE.md`](agent/CLAUDE.md) followed by `agent/tasks/<task>.md` ([`agent_instructions()`](scripts/utils.py)), are passed with `--append-system-prompt`. Nothing is read from the checkout's own `CLAUDE.md` or `.claude/`.
+2. The instructions, [`agent/ground-rules.md`](agent/ground-rules.md) followed by `agent/tasks/<task>.md` ([`agent_instructions()`](scripts/utils.py)), are passed with `--append-system-prompt`. Nothing is read from the checkout's own `CLAUDE.md` or `.claude/`.
 3. Context files the script prepared (logs, evidence packs, other agents' output) are written to `.ci-context/` in the working directory and removed afterwards.
 4. It runs `claude -p` in the worktree:
    - flags: `--setting-sources user --disable-slash-commands --dangerously-skip-permissions`, with a turn limit and a timeout;
@@ -501,19 +564,24 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 | `NOTION_TOKEN` / `NOTION_KNOWN_DATA_SOURCE_ID` / `NOTION_STAGING_DATA_SOURCE_ID` | `stage_notion.py sync` | Notion access; never present in the agent step |
 | `SGLANG_CI_TOKEN` | `coverage-audit.yml` | ROCm/sglang-ci token, in place of `GH_PAT` |
 | `COMMENT_AUTHOR` | review, CI status | Set by the watcher; shown as "requested by" |
+| `PR_BODY` | `check_pr_rules.py` | The PR description, passed by `pr-checks.yml` (or `--body-file`) |
 | `VALIDATE_*` | `validate_live.py` | See [Testing and validating a change](#testing-and-validating-a-change) |
 
 ### Repository layout
 
 ```
 agent/            AI behavior, and nothing else
-  CLAUDE.md         Ground Rules for every task
+  ground-rules.md   Ground Rules for every task
   tasks/            one methodology + output format per Task: line
   api-prompts.md    API-mode prompt templates
 scripts/          everything that runs (see the feature map)
 tests/            unittest suites, one per script area; test_readme.py checks this README
 evals/            hand-labelled CI-status cases
 runner/           Dockerfile, setup.sh, entrypoint.sh for the self-hosted runners
-.github/workflows one workflow per feature
-AGENTS.md         rules for agents (and people) changing this repo
+.github/
+  workflows/        one workflow per feature, plus pr-checks.yml
+  pull_request_template.md   the README / Design rules / Validated lines
+AGENTS.md         rules for changing this repo, for people and AI tools
+CLAUDE.md         makes Claude Code read AGENTS.md (the bot's own agents never load it)
+.cursor/rules/    makes Cursor read AGENTS.md
 ```
