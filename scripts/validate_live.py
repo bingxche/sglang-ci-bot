@@ -4,7 +4,7 @@
 Every non-GET request through ``requests`` is refused, so reports are printed
 instead of posted. Used to validate a branch on a runner container:
 
-    python scripts/validate_live.py monitor|daily|tracker|staging|cistatus|suspect|review
+    python scripts/validate_live.py monitor|crossrun|daily|tracker|staging|cistatus|suspect|review
 """
 
 import logging
@@ -40,6 +40,28 @@ def monitor():
     failed = monitor_ci.run_oneshot(TOKEN, None, "stdout", [wf], hours, "main", use_agent=True,
                                     job_name_filter=os.environ.get("VALIDATE_JOB_FILTER") or None)
     print("FAILED WORKFLOWS:", failed)
+
+
+def crossrun():
+    """Cross-Run Pattern Analysis on today's analyses (it only runs in the publishing path)."""
+    import daily_cross_workflow_summary as s
+    import monitor_ci as m
+    from utils import claude_code_analyze, ensure_sglang_repo
+    wf = os.environ.get("VALIDATE_WORKFLOW", "pr-test-amd.yml")
+    issue = s.find_daily_issue(TOKEN, BOT_REPO, DATE)
+    analyses = s.collect_workflow_analyses(TOKEN, BOT_REPO, issue).get(wf, [])
+    runs = m._runs_from_analyses(analyses)
+    print(f"{wf}: {len(analyses)} analyses in {len(runs)} runs")
+    if len(runs) < 2:
+        return
+    patterns = m._compute_cross_run_patterns(runs)
+    text = claude_code_analyze(
+        prompt=m._build_cross_run_prompt(wf, runs, patterns, analyses),
+        work_dir=ensure_sglang_repo(),
+        context_files={"per-job-analyses.md": m._format_per_job_dump(analyses)},
+        max_turns=150, timeout_secs=600,
+    )
+    print(m._render_cross_run_summary(wf, runs, patterns, agent_text=text, use_agent=True))
 
 
 def daily():
@@ -112,7 +134,7 @@ def review():
     review_pr.review_pr(TOKEN, int(os.environ.get("VALIDATE_PR", "47179")), post_comment_flag=False)
 
 
-CASES = {f.__name__: f for f in (monitor, daily, tracker, staging, cistatus, suspect, review)}
+CASES = {f.__name__: f for f in (monitor, crossrun, daily, tracker, staging, cistatus, suspect, review)}
 
 if __name__ == "__main__":
     logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
