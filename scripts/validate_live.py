@@ -37,7 +37,8 @@ def monitor():
     import monitor_ci
     wf = os.environ.get("VALIDATE_WORKFLOW", "nightly-amd-mi355x-disagg.yml")
     hours = int(os.environ.get("VALIDATE_HOURS", "24"))
-    failed = monitor_ci.run_oneshot(TOKEN, None, "stdout", [wf], hours, "main", use_agent=True)
+    failed = monitor_ci.run_oneshot(TOKEN, None, "stdout", [wf], hours, "main", use_agent=True,
+                                    job_name_filter=os.environ.get("VALIDATE_JOB_FILTER") or None)
     print("FAILED WORKFLOWS:", failed)
 
 
