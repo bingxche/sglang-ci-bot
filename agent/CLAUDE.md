@@ -84,14 +84,26 @@ The remaining lines in the prompt are metadata (Job, PR number, URLs, etc.). All
   - ❌ "out_cache_loc narrowing causes the GPU memory fault" (assertive without confidence label — forbidden)
 - **Surface disconfirming evidence.** When proposing a hypothesis, also list facts that **weaken** it. Bot must surface its own counter-evidence, not just supporting evidence. Example: "Hypothesis: commit X caused this. **Disconfirming**: the test `test_lora_load_from_tensor` was already failing before commit X landed (no green run found in queryable history), so this hypothesis is unlikely to fully explain the failure."
 - **Bot does NOT assign Priority.** Priority/severity is a human judgement call requiring business context the bot does not have. Bot only reports **factual Status**: how long the failure has persisted, how many jobs/workflows are affected, whether an in-flight fix exists. Engineers decide priority. The legacy `Priority: Critical/High/Medium/Low` field is removed from all bot output. Replace it with a `Status` line of facts.
-- **In-flight fix lookup REQUIRED before recommending any fix.** Before suggesting "pin X" / "revert Y" / "upgrade Z" / "disable test", search the sglang PR list for matching open PRs:
+- **In-flight fix lookup REQUIRED before recommending any fix.** Before suggesting "pin X" / "revert Y" / "upgrade Z" / "disable test", run all three searches. Leave out `is:open`: drafts and PRs merged since the break count too.
   ```
+  # 1. PRs that reference the suspect PR. Fix PRs usually link the PR they fix.
   curl -s -H "Authorization: token $GH_PAT" \
-    "https://api.github.com/search/issues?q=repo:sgl-project/sglang+is:pr+is:open+<keyword>"
+    "https://api.github.com/search/issues?q=repo:sgl-project/sglang+is:pr+<suspect_pr_number>"
+  # 2. PRs that name the failing test file (basename, e.g. test_ming_image.py)
+  curl -s -H "Authorization: token $GH_PAT" \
+    "https://api.github.com/search/issues?q=repo:sgl-project/sglang+is:pr+<test_file_basename>"
+  # 3. 1-3 keywords from the failing test name, error message, or library name
+  curl -s -H "Authorization: token $GH_PAT" \
+    "https://api.github.com/search/issues?q=repo:sgl-project/sglang+is:pr+<keyword>"
   ```
-  Use 1-3 keywords from the failing test name, file name, error message, or library name. If a matching open PR exists, report it instead of duplicating the recommendation:
-  - `In-flight fix: ✅ [#23072](url) (open since 2026-04-17, awaiting merge) — chase reviewers, do NOT open a duplicate`
-  - `In-flight fix: ❌ none found in open PRs — needs new PR or investigation`
+  Keep candidates created after the suspect PR merged. A fix PR's title often describes the code change, not the test or the error (a kernel-tuning PR that fixes a shared-memory overflow, say), so the keyword search alone misses it. Search 1 is skipped only when no suspect PR is known.
+
+  **Check a candidate's diff before calling it a fix.** Read its changed files (`GET /repos/sgl-project/sglang/pulls/<n>/files`). It is a fix only if it touches the failing test file, a file the suspect PR changed, or the code in the failing stack trace. A PR that does none of these is not a fix, however well its title matches; list it as related at most. If the fix is part of a larger feature PR, say so.
+
+  If a fix exists, report it instead of duplicating the recommendation:
+  - `In-flight fix: ✅ [#23072](url) (open since 2026-04-17, awaiting merge; changes radix_attention.py) — chase reviewers, do NOT open a duplicate`
+  - `In-flight fix: ❌ none found (searched: #<suspect>, <test file>, <keywords>) — needs new PR or investigation`
+- **PR state is a snapshot.** A PR's draft, review, and merge state changes during the day, and this report is not refreshed when it does. Whenever you state it ("draft", "no reviews", "awaiting merge"), add the UTC time you checked: `draft as of 15:20 UTC`.
 - **Docker images: check Docker Hub, don't infer.** Any claim about an image — that it was or was not published, that a run fell back to an older tag, that a tag was re-pushed, that downstream jobs "may fail to pull" — must be checked against Docker Hub, which needs no auth for public repos:
   ```
   # One tag: 404 = not published; tag_last_pushed = when; digest = which image
@@ -435,7 +447,7 @@ curl -sL -H "Authorization: token $GH_PAT" \
 - **Narrow the regression window using sister-baseline history.** Find the last sister run where the failing test passed (`pass_sha`) and the first sister run where it failed (`fail_sha`). The true regression window is `pass_sha..fail_sha`, often much smaller than the scout-to-scout sglang delta. Use the sister workflow's history (filter `event=schedule`, same branch) to find these SHAs.
 - For each suspicious sglang commit: read its diff (`git show <sha>` or `curl https://api.github.com/repos/sgl-project/sglang/commits/<sha>`) and check whether the modified code is reachable from the failing test's stack trace. Cite the most suspicious sglang commits with confidence labels.
 - **Cite zero aiter commits.** The failure is reproducible without the aiter override, so the aiter delta is irrelevant to root cause. (You may still mention aiter as a confounder if the symptom involves an aiter call site, but only with explicit `[LOW]` confidence and disconfirming evidence noting the baseline reproduces without aiter.)
-- **Search for in-flight sglang fix PRs** with the failing test name and likely-culprit keywords; an in-flight revert/fix may already exist.
+- **Search for in-flight sglang fix PRs** the three ways the Ground Rules give (suspect PR number, failing test file, keywords), and check each candidate's diff; an in-flight revert/fix may already exist.
 
 **7. If Origin is `aiter-caused`** — investigate the aiter side per the AITER analysis subsection above. You may also examine sglang commits in the same window if there is reason to believe the failure is an interaction (e.g. sglang added a new aiter API call path, or the failure only triggers on a specific sglang code path that the sister baseline doesn't exercise).
 
@@ -513,11 +525,11 @@ If no hypothesis reaches MEDIUM confidence, say so explicitly: `No hypothesis ab
 For `amd-aiter-scout.yml` runs, only include aiter commits when the Failure Origin is `aiter-caused`.
 
 ### In-flight Fix Check
-Search for matching open PRs before recommending fixes:
-- `In-flight fix: ✅ [#<num>](url) (open since <date>) — <one-line summary>` — ping reviewers, do NOT open a duplicate
-- `In-flight fix: ❌ none found — needs new PR or investigation`
+Search before recommending fixes, the three ways the Ground Rules give: the suspect PR number, the failing test file, and 1-3 keywords. Include drafts and merged PRs. Name a PR as the fix only after checking that its diff touches the failing path.
+- `In-flight fix: ✅ [#<num>](url) (open since <date>; changes <file>) — <one-line summary>` — ping reviewers, do NOT open a duplicate
+- `In-flight fix: ❌ none found (searched: <queries>) — needs new PR or investigation`
 
-Use 1-3 keywords from the failing test name, error message, or library name. Cite the API call you ran.
+Cite the API calls you ran.
 
 ### Suggested Triage Steps
 (Concrete investigation steps the maintainer can run, NOT directives. Bullet points.)
@@ -931,10 +943,10 @@ After the `job-clusters` block, end with a second fenced block listing every clu
 - One entry per (cluster, PR). Write `[]` when no cluster's top hypothesis names a merged sglang PR. Leave out aiter, Docker, and infrastructure causes.
 - `confidence` is the same label as the cluster's **Top hypothesis**. Do not raise it here.
 - `sha` is the commit the PR landed as on `main`. `last_pass_sha` / `first_fail_sha` are the sglang commits of the last completed run where the cluster's tests passed and the first completed run where they failed. Use `null` when you could not establish one. Verify every SHA as the Ground Rules require.
-- `fix_pr` is the open or merged sglang PR that fixes the cluster, if the In-flight Fix Check found one; else `null`.
+- `fix_pr` is the open or merged sglang PR that fixes the cluster, if the In-flight Fix Check found one and you checked its diff; else `null`. Keep the same `fix_pr` from one tick to the next unless that PR was closed or turned out not to fix the cluster.
 - `related_prs` lists other PRs the failure depends on, e.g. the PR that removed a symbol the suspect PR still imports.
 - `evidence` is one or two plain sentences a PR author can check: what fails and how it traces to their change. No `@`-mentions, no links to this bot repo or other internal pages, no priority words.
-- The harness strips this block from the summary. Separate code decides whether to comment on the PR (FACT/HIGH only, ≥2 failed jobs, commit verified to be between `last_pass_sha` and `first_fail_sha`; with an open `fix_pr`, the comment asks the suspect PR's author to review that fix, so only name a `fix_pr` that actually fixes this cluster), so state the confidence you actually have.
+- The harness strips this block from the summary. Separate code decides whether to comment on the PR (FACT/HIGH only, ≥2 failed jobs, commit verified to be between `last_pass_sha` and `first_fail_sha`; with an open `fix_pr`, the comment asks the suspect PR's author to review that fix, so only name a `fix_pr` that actually fixes this cluster; the code skips a `fix_pr` that neither references the suspect PR nor changes any of its files, and skips the comment when `fix_pr` is `null` but an open PR references the suspect PR), so state the confidence you actually have.
 
 ---
 

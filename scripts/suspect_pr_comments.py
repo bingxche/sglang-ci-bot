@@ -20,9 +20,15 @@ code whether each suspect is solid enough to tell the PR's author:
 
 When the cluster has a fix PR, the comment instead ``@``-mentions the
 suspect PR's author and asks them to review it, once per fix PR, even on a
-PR that already had a suspect comment. That needs the fix PR to be open
-and by someone else; a merged fix skips the suspect, and one closed
-without merging is treated as no fix.
+PR that already had a suspect comment. That needs the fix PR to be open,
+by someone else, and related to the suspect PR: it must reference the
+suspect PR or change one of its files. A merged fix skips the suspect, and
+one closed without merging is treated as no fix. Once a suspect PR's
+author was asked to review an open fix, a different fix PR named on a
+later tick is not sent.
+
+With no open fix PR named, the suspect is skipped when an open PR references
+it: that PR may be a fix the agent missed.
 
 Modes (``--mode`` / ``SUSPECT_PR_COMMENTS``):
 
@@ -71,6 +77,8 @@ _PR_MARKER = "<!-- amd-bot-suspect-pr:{cluster} -->"
 _PR_MARKER_RE = re.compile(r"<!-- amd-bot-suspect-pr:(R\d+) -->")
 # On a comment that asks the suspect PR's author to review an open fix PR.
 _FIX_MARKER = "<!-- amd-bot-suspect-fix:{fix_pr} -->"
+_FIX_MARKER_RE = re.compile(r"<!-- amd-bot-suspect-fix:(\d+) -->")
+MAX_PR_FILE_PAGES = 3
 _MENTION_RE = re.compile(r"(?<![\w`])@([A-Za-z0-9][\w-]*(?:/[\w.-]+)?)")
 
 
@@ -84,6 +92,12 @@ def fix_marker(fix_pr: int) -> str:
 
 def _pr_url(pr: int) -> str:
     return f"https://github.com/{REPO}/pull/{pr}"
+
+
+def references_pr(pull: dict, pr: int) -> bool:
+    """Whether a PR's title or body names ``pr`` as ``#<pr>`` or by its URL."""
+    text = f"{pull.get('title') or ''}\n{pull.get('body') or ''}"
+    return re.search(rf"(?<![\w&])#{pr}\b|/pull/{pr}\b", text) is not None
 
 
 def _commit_link(sha: str) -> str:
@@ -132,6 +146,26 @@ class GitHub:
             self._comments[pr] = get_issue_comments(self.token, REPO, pr)
         return self._comments[pr]
 
+    def pr_files(self, pr: int) -> set[str]:
+        files: set[str] = set()
+        for page in range(1, MAX_PR_FILE_PAGES + 1):
+            batch = self._get(f"pulls/{pr}/files?per_page=100&page={page}") or []
+            files.update(f["filename"] for f in batch)
+            if len(batch) < 100:
+                break
+        return files
+
+    def open_prs_referencing(self, pr: int) -> list[dict]:
+        """Open PRs whose title or body names ``pr``, as search results
+        (``number``, ``title``, ``body``, ``user``)."""
+        resp = requests.get(
+            "https://api.github.com/search/issues", headers=gh_headers(self.token), timeout=60,
+            params={"q": f"repo:{REPO} is:pr is:open {pr}", "per_page": 30},
+        )
+        resp.raise_for_status()
+        return [i for i in resp.json().get("items", [])
+                if i["number"] != pr and references_pr(i, pr)]
+
 
 # ---------------------------------------------------------------------------
 # Decision
@@ -151,7 +185,7 @@ class Decision:
     pr_author: str = ""
 
 
-def check_fix(fix_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:
+def check_fix(fix_pr: int, suspect_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:
     """``(fix, "")`` when the fix PR is open and worth a review request,
     ``(None, "")`` when it is gone (closed unmerged: comment as if there were
     no fix), or ``(None, reason)`` to skip the suspect."""
@@ -165,7 +199,24 @@ def check_fix(fix_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:
     fix_author = (pull.get("user") or {}).get("login", "")
     if fix_author.lower() == author.lower():
         return None, f"fix PR #{fix_pr} is by the PR's author"
+    # The agent can name a PR whose title matches but whose diff is
+    # elsewhere; asking the author to review that wastes their time.
+    if not references_pr(pull, suspect_pr) and not gh.pr_files(fix_pr) & gh.pr_files(suspect_pr):
+        return None, f"fix PR #{fix_pr} neither references #{suspect_pr} nor changes any of its files"
     return {"number": fix_pr, "title": pull.get("title", ""), "author": fix_author}, ""
+
+
+def earlier_open_fix(comments: list[dict], fix_pr: int, gh: GitHub) -> tuple[int, dict] | None:
+    """An earlier review request on this PR for a different fix PR that is
+    still open, so a fix PR changing from tick to tick asks only once."""
+    for c in comments:
+        m = _FIX_MARKER_RE.search(c.get("body") or "")
+        if not m or int(m.group(1)) == fix_pr:
+            continue
+        pull = gh.pull(int(m.group(1)))
+        if pull and pull.get("state") == "open" and not pull.get("merged_at"):
+            return int(m.group(1)), c
+    return None
 
 
 def check_suspect(
@@ -213,18 +264,24 @@ def check_suspect(
 
     d.pr_author = (pull.get("user") or {}).get("login", "")
     if s.get("fix_pr"):
-        d.fix, reason = check_fix(s["fix_pr"], d.pr_author, gh)
+        d.fix, reason = check_fix(s["fix_pr"], s["pr"], d.pr_author, gh)
         if reason:
             return skip(reason)
 
     if d.fix:
         # One review request per fix PR, even after an earlier suspect comment.
         marker = fix_marker(d.fix["number"])
-        for c in gh.pr_comments(s["pr"]):
+        comments = gh.pr_comments(s["pr"])
+        for c in comments:
             if marker in (c.get("body") or ""):
                 d.result, d.comment_url = "already", c.get("html_url", "")
                 d.reason = f"asked to review #{d.fix['number']}"
                 return d
+        earlier = earlier_open_fix(comments, d.fix["number"], gh)
+        if earlier:
+            d.result, d.comment_url = "already", earlier[1].get("html_url", "")
+            d.reason = f"asked to review #{earlier[0]}, still open; not asking about #{d.fix['number']}"
+            return d
         d.result = "post"
         return d
 
@@ -235,6 +292,12 @@ def check_suspect(
             if m.group(1) != s["cluster"]:
                 d.reason = f"commented earlier as {m.group(1)}"
             return d
+
+    # A PR that links the suspect is often a fix the agent's search missed.
+    referencing = gh.open_prs_referencing(s["pr"])
+    if referencing:
+        nums = ", ".join(f"#{p['number']}" for p in referencing[:3])
+        return skip(f"no open fix PR named, but open PR {nums} references #{s['pr']}")
 
     d.result = "post"
     return d

@@ -36,10 +36,13 @@ def _suspect(**overrides) -> dict:
 
 class FakeGitHub:
     def __init__(self, merged_at="2026-10-21T05:32:30Z", merge_sha=SHA,
-                 statuses=None, comments=None, fixes=None):
+                 statuses=None, comments=None, fixes=None, files=None, referencing=None):
         self.merged_at = merged_at
         # fix PR number -> its pull payload
         self.fixes = fixes or {}
+        # PR number -> changed files
+        self.files = files or {}
+        self.referencing = referencing or []
         self.merge_sha = merge_sha
         # (base, head) -> status; default puts SHA inside PASS..FAIL.
         self.statuses = statuses or {(PASS, SHA): "ahead", (SHA, FAIL): "ahead"}
@@ -64,6 +67,12 @@ class FakeGitHub:
 
     def pr_comments(self, pr):
         return self.comments
+
+    def pr_files(self, pr):
+        return self.files.get(pr, set())
+
+    def open_prs_referencing(self, pr):
+        return self.referencing
 
 
 class SuspectBlockTest(unittest.TestCase):
@@ -114,9 +123,9 @@ class CheckSuspectTest(unittest.TestCase):
         self.assertIn("MEDIUM", d.reason)
         self.assertEqual(gh.calls, 0)
 
-    def _fix(self, state="open", merged_at=None, author="fixer"):
-        return {45656: {"number": 45656, "state": state, "merged_at": merged_at,
-                        "title": "Fix it", "user": {"login": author}}}
+    def _fix(self, state="open", merged_at=None, author="fixer", body="Fixes #42229.", number=45656):
+        return {number: {"number": number, "state": state, "merged_at": merged_at,
+                         "title": "Fix it", "body": body, "user": {"login": author}}}
 
     def test_open_fix_pr_asks_the_author_to_review(self):
         d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix()))
@@ -146,6 +155,39 @@ class CheckSuspectTest(unittest.TestCase):
     def test_fix_by_the_pr_author_is_skipped(self):
         d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix(author="PR-Author")))
         self.assertEqual(d.reason, "fix PR #45656 is by the PR's author")
+
+    def test_fix_unrelated_to_the_suspect_is_skipped(self):
+        gh = FakeGitHub(fixes=self._fix(body="Fix MiniCPM-V chaining."),
+                        files={45656: {"models/minicpmv.py"}, 42229: {"models/deepseek_v2.py"}})
+        d = self.check(_suspect(fix_pr=45656), gh=gh)
+        self.assertEqual(d.reason, "fix PR #45656 neither references #42229 nor changes any of its files")
+
+    def test_fix_changing_a_suspect_file_needs_no_reference(self):
+        gh = FakeGitHub(fixes=self._fix(body="Tune the kernel."),
+                        files={45656: {"qsa/mqa.py"}, 42229: {"qsa/mqa.py", "qsa/metadata.py"}})
+        self.assertEqual(self.check(_suspect(fix_pr=45656), gh=gh).result, "post")
+
+    def test_open_earlier_fix_is_not_replaced(self):
+        fixes = {**self._fix(), **self._fix(number=45799)}
+        gh = FakeGitHub(fixes=fixes, comments=[{"body": spc.fix_marker(45799), "html_url": "u"}])
+        d = self.check(_suspect(fix_pr=45656), gh=gh)
+        self.assertEqual((d.result, d.comment_url), ("already", "u"))
+        self.assertEqual(d.reason, "asked to review #45799, still open; not asking about #45656")
+
+    def test_closed_earlier_fix_allows_a_new_request(self):
+        fixes = {**self._fix(), **self._fix(number=45799, state="closed")}
+        gh = FakeGitHub(fixes=fixes, comments=[{"body": spc.fix_marker(45799), "html_url": "u"}])
+        self.assertEqual(self.check(_suspect(fix_pr=45656), gh=gh).result, "post")
+
+    def test_open_pr_referencing_the_suspect_skips_the_plain_comment(self):
+        d = self.check(gh=FakeGitHub(referencing=[{"number": 46945}]))
+        self.assertEqual(d.reason, "no open fix PR named, but open PR #46945 references #42229")
+
+    def test_references_pr(self):
+        self.assertTrue(spc.references_pr({"body": "Fixes #42229."}, 42229))
+        self.assertTrue(spc.references_pr({"body": "https://github.com/sgl-project/sglang/pull/42229"}, 42229))
+        self.assertFalse(spc.references_pr({"body": "See #422290 and &#42229;"}, 42229))
+        self.assertFalse(spc.references_pr({"title": "Fix it", "body": None}, 42229))
 
     def test_abandoned_fix_falls_back_to_a_plain_comment(self):
         d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix("closed")))
