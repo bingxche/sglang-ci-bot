@@ -1505,12 +1505,12 @@ def task_name(prompt: str) -> str:
 
 
 def agent_instructions(task: str) -> str:
-    """Shared rules (agent/CLAUDE.md) followed by the task's methodology."""
+    """Shared rules (agent/ground-rules.md) followed by the task's methodology."""
     spec = AGENT_TASKS.get(task)
     if spec is None:
         raise RuntimeError(f"Unknown agent task {task!r}; add it to AGENT_TASKS")
     parts = []
-    for name in ("CLAUDE.md", f"tasks/{spec.doc}"):
+    for name in ("ground-rules.md", f"tasks/{spec.doc}"):
         path = _find_agent_file(name)
         if path is None:
             raise RuntimeError(f"agent/{name} not found")
@@ -2415,7 +2415,7 @@ def claude_code_analyze(
     *work_dir* so the agent can read them, runs ``claude -p``, and
     returns the text output.
 
-    The prompt's ``Task:`` line picks the instructions (``agent/CLAUDE.md``
+    The prompt's ``Task:`` line picks the instructions (``agent/ground-rules.md``
     plus that task's file under ``agent/tasks/``), which are appended to the
     system prompt, and the model (``task_model()``). Only user-level settings
     are loaded: the working directory is an sglang checkout, often a PR's,
