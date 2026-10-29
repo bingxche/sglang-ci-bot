@@ -176,11 +176,15 @@ def _title_key(title: str) -> str:
 
 
 def _same(a: Finding, b: Finding) -> bool:
+    """One bug: same file, and the same title, the same line (±1), or the same
+    category within 3 lines. Two angles often file one bug under different
+    categories and words (PR 47179: `contracts` and `correctness`, both line 109)."""
     if a.file != b.file:
         return False
     if _title_key(a.title) == _title_key(b.title):
         return True
-    return a.category == b.category and abs(a.line - b.line) <= 3
+    gap = abs(a.line - b.line)
+    return gap <= 1 or (a.category == b.category and gap <= 3)
 
 
 def _rank(f: Finding) -> tuple:

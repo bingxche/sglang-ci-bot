@@ -1494,6 +1494,12 @@ AGENT_TASKS: dict[str, AgentTask] = {
 }
 
 _MODEL_ALIASES = ("opus", "sonnet", "haiku")
+# The gateway's answer for a model name it has no deployment of, e.g.
+# 'API Error: 400 Deployment of "Claude-Sonnet-4.7" for "..." is not found!'
+_MODEL_UNAVAILABLE_RE = re.compile(
+    r"API Error: 40[04].*(?:Deployment of .* not found|model.*(?:not found|not_found|does not exist))",
+    re.IGNORECASE,
+)
 
 
 def task_name(prompt: str) -> str:
@@ -2158,7 +2164,9 @@ def _archive_agent_session(work_dir: Path, started_at: float, prompt: str) -> No
         return
     try:
         task = prompt.split("\n", 1)[0].removeprefix("Task:").strip() or "agent"
-        dest = Path(archive_root) / f"{time.strftime('%Y%m%d-%H%M%S')}-{_safe_name(task)}"
+        # Parallel agents (review verifiers) can finish in the same second.
+        stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(3).hex()}"
+        dest = Path(archive_root) / f"{stamp}-{_safe_name(task)}"
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "prompt.txt").write_text(redact_secrets(prompt))
         cwd = str(work_dir.resolve())
@@ -2460,15 +2468,29 @@ def claude_code_analyze(
             task, model or "default", max_turns, timeout_secs, work_dir,
         )
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(work_dir),
-            timeout=timeout_secs,
-            stdin=subprocess.DEVNULL,
-            env=env,
-        )
+        def run_cli() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(work_dir),
+                timeout=timeout_secs,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+
+        result = run_cli()
+        if (model and result.returncode != 0
+                and _MODEL_UNAVAILABLE_RE.search(f"{result.stdout}\n{result.stderr}")):
+            # A task model the gateway does not serve (e.g. a stale
+            # ANTHROPIC_DEFAULT_SONNET_MODEL) must not fail the task.
+            _agent_log.warning(
+                "%s: model %r is not served by the gateway (%s); retrying with the default model",
+                task, model, " ".join((result.stdout or result.stderr).split())[:200],
+            )
+            i = cmd.index("--model")
+            del cmd[i:i + 2]
+            result = run_cli()
 
         _agent_log.info(
             "Claude Code exit=%d, stdout=%d chars, stderr=%d chars",

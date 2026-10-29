@@ -104,6 +104,39 @@ class ClaudeCommandTest(unittest.TestCase):
         cmd = self.run_agent("Task: Job Failure Analysis\nJob: x", {})
         self.assertNotIn("--model", cmd)
 
+    def test_unserved_model_retries_with_the_default(self):
+        # The runners mapped sonnet to Claude-Sonnet-4.7, which the gateway no longer serves.
+        cmds = []
+
+        def fake_run(cmd, **kwargs):
+            cmds.append(list(cmd))
+            if "--model" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, stderr="", stdout=(
+                    'API Error: 400 Deployment of "Claude-Sonnet-4.7" for '
+                    '"AnthropicVertexChatCompletions" is not found!'))
+            return subprocess.CompletedProcess(cmd, 0, stdout="votes", stderr="")
+
+        env = {"ANTHROPIC_BASE_URL": "https://gw", "ANTHROPIC_DEFAULT_SONNET_MODEL": "Claude-Sonnet-4.7"}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(utils.subprocess, "run", side_effect=fake_run):
+            out = utils.claude_code_analyze("Task: PR Code Review Verification\nPR: #1", work_dir=Path(tmp))
+        self.assertEqual(out, "votes")
+        self.assertEqual(["--model" in c for c in cmds], [True, False])
+
+    def test_other_failures_are_not_retried(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 1, stdout="API Error: 500 overloaded", stderr="")
+
+        env = {"ANTHROPIC_BASE_URL": "https://gw", "ANTHROPIC_DEFAULT_SONNET_MODEL": "S"}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(utils.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError):
+                utils.claude_code_analyze("Task: Failure Tracker Data\nx", work_dir=Path(tmp))
+        self.assertEqual(len(calls), 1)
+
     def test_unknown_task_never_starts_the_cli(self):
         with mock.patch.object(utils.subprocess, "run", side_effect=AssertionError("must not run")):
             with self.assertRaises(RuntimeError):

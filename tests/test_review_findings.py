@@ -114,6 +114,17 @@ class MergeVoteTest(unittest.TestCase):
         self.assertEqual(bug.angles, ["amd", "correctness"])
         self.assertEqual(bug.evidence, ["e2", "e1"])
 
+    def test_same_line_merges_across_categories(self):
+        # PR 47179: two angles reported one bug at amd-ci-job-monitor.yml:109.
+        a = self.findings(finding(line=11, category="contracts",
+                                  title="Filtered monitor report now matches zero jobs"), angle="contracts")
+        b = self.findings(finding(line=11, category="correctness",
+                                  title="The filtered report passes two workflows, so it matches nothing"),
+                          angle="correctness")
+        c = self.findings(finding(line=13, category="tests", title="untested"), angle="tests-conventions")
+        merged = rf.merge_findings(a + b + c)
+        self.assertEqual([sorted(f.angles) for f in merged], [["contracts", "correctness"], ["tests-conventions"]])
+
     def test_repeats_of_an_earlier_round_are_dropped(self):
         found = self.findings(finding(line=13), finding(file="new.py", line=2, title="new one"))
         kept, dropped = rf.drop_repeats(found, [rf.fingerprint(found[0])])
