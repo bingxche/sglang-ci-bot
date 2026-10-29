@@ -247,5 +247,69 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(decisions[1].body, "")
 
 
+class VerifyTest(unittest.TestCase):
+    def decisions(self, n=1):
+        suspects = [_suspect(cluster=f"R{i}", pr=42229 + i) for i in range(1, n + 1)]
+        return spc.decide_all(suspects, {s["cluster"]: [1, 2] for s in suspects}, {}, FakeGitHub(), NOW)
+
+    def votes(self, confirmed, voters=3):
+        return {"confirmed": confirmed, "voters": voters, "reasons": ["confirmed: the diff removes _hipcc"]}
+
+    def test_confirmed_suspect_is_posted_with_the_vote(self):
+        [d] = self.decisions()
+        cache = {}
+        spc.verify_decisions([d], lambda _d: self.votes(2), cache)
+        self.assertEqual(d.result, "post")
+        self.assertEqual(cache, {spc.vote_key(d): self.votes(2)})
+        self.assertIn("Checked by 2 of 3 independent verifiers.", spc.render_pr_comment(d, {}))
+
+    def test_unconfirmed_suspect_is_skipped(self):
+        [d] = self.decisions()
+        spc.verify_decisions([d], lambda _d: self.votes(1), {})
+        self.assertEqual((d.result, d.body), ("skip", ""))
+        self.assertEqual(d.reason, "verifiers confirmed 1/3 (needs 2)")
+
+    def test_failed_verification_skips_and_is_not_cached(self):
+        [d] = self.decisions()
+        cache = {}
+
+        def boom(_d):
+            raise RuntimeError("only 1 of 3 verifiers finished")
+
+        spc.verify_decisions([d], boom, cache)
+        self.assertEqual(d.result, "skip")
+        self.assertIn("verification failed (only 1 of 3", d.reason)
+        self.assertEqual(cache, {})
+
+    def test_cached_votes_are_reused_and_attempts_are_capped(self):
+        decisions = self.decisions(spc.MAX_VERIFY_PER_RUN + 2)
+        cache = {spc.vote_key(decisions[0]): self.votes(3)}
+        asked = []
+        spc.verify_decisions(decisions, lambda d: asked.append(d) or self.votes(3), cache)
+        self.assertEqual(len(asked), spc.MAX_VERIFY_PER_RUN)
+        self.assertNotIn(decisions[0], asked)
+        self.assertIn("not verified yet", decisions[-1].reason)
+
+    def test_log_comment_keeps_the_votes(self):
+        [d] = self.decisions()
+        cache = {}
+        spc.verify_decisions([d], lambda _d: self.votes(1), cache)
+        body = spc.render_log_comment([d], "dry-run", "2026-10-29 10:00 UTC", cache)
+        self.assertTrue(body.startswith(spc.LOG_COMMENT_MARKER))
+        self.assertIn("skipped: verifiers confirmed 1/3 (needs 2)", body)
+        self.assertIn("Verifier votes", body)
+        self.assertEqual(spc.parse_vote_cache(body), cache)
+        self.assertEqual(spc.parse_vote_cache(spc.render_log_comment([], "post", "t")), {})
+
+    def test_suspect_context_has_the_case_and_the_analyses(self):
+        [d] = self.decisions()
+        job_info = {1: {"run_url": RUN, "job_name": "stage-b", "analysis": "### Commit Info\nboom"}}
+        text = spc.render_suspect_context(d, job_info)
+        self.assertIn(f"- First failing commit: {FAIL}", text)
+        self.assertIn("Imports _hipcc", text)
+        self.assertIn(f"### stage-b {RUN}/job/1", text)
+        self.assertIn("boom", text)
+
+
 if __name__ == "__main__":
     unittest.main()

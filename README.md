@@ -2,7 +2,7 @@
 
 Automated CI monitoring and PR review bot for [sglang](https://github.com/sgl-project/sglang), powered by Claude via AMD LLM Gateway.
 
-All AI behavior — both agent mode and API mode — is defined in a single file: [`agent/CLAUDE.md`](agent/CLAUDE.md). Agent mode reads it automatically; API mode loads prompt templates from it at runtime via `load_prompt_template()`. To change any AI behavior, edit only this file.
+All AI behavior — both agent mode and API mode — is defined under [`agent/`](agent/): the Ground Rules every task follows in [`agent/CLAUDE.md`](agent/CLAUDE.md), one methodology file per task in [`agent/tasks/`](agent/tasks/), and the API-mode templates in [`agent/api-prompts.md`](agent/api-prompts.md). An agent gets `CLAUDE.md` plus its own task's file, appended to its system prompt; API mode loads templates at runtime via `load_prompt_template()`. To change any AI behavior, edit only these files.
 
 All public-facing comments are posted under the dedicated **[amd-bot](https://github.com/amd-bot)** GitHub account.
 
@@ -18,7 +18,7 @@ All public-facing comments are posted under the dedicated **[amd-bot](https://gi
 | Suspect PR comments | `suspect_pr_comments.py` | The `finalize` job in `ci-monitor.yml`, once per hourly tick | Reads the suspect PRs the Daily Cross-Workflow Summary names for each cluster, checks them in code (FACT/HIGH confidence, ≥2 failed jobs, PR merged in the last 14 days, commit verified between the last passing and first failing commit), and comments on the merged sglang PR; when a fix PR is open, the comment asks the PR's author to review it. **Dry run by default**: records what it would post in one comment on the daily issue until the `SUSPECT_PR_COMMENTS` repository variable is set to `post`. See [Suspect PR comments](#suspect-pr-comments). |
 | Notion Staging (daily) | `stage_notion.py` | Independent `notion-staging.yml` schedule at **20:00 Asia/Shanghai daily**; manual `dry-run` / `write` | Uses the existing Claude Code agent to canonicalize failures from recent Daily Reports, then applies a deterministic two-completed-run/no-later-pass gate. Analysis and writing are separate steps: the agent never receives Notion credentials. The sync phase reads the official and isolated staging data sources, skips known/staged matches, appends only new rows to `SGLang AMD CI Staging Errors` with a blank `Status`, and verifies both the new pages and that the official data source is unchanged. |
 | On-Demand Analysis | `analyze_url.py` | `workflow_dispatch` (Actions tab) | Paste a GitHub Actions run or job URL, bot creates an issue with analysis results. Supports both run URLs (all failed jobs) and single job URLs. |
-| PR Code Review | `review_pr.py` | `@amd-bot review` or manual | Checks out PR branch, reviews with full codebase context, posts structured review |
+| PR Code Review | `review_pr.py` + `review_findings.py` | `@amd-bot review` or manual | Reviewer agents read the PR in parallel, one per angle (correctness, AMD/ROCm, contracts, tests and conventions; one reviewer for small PRs), against the sglang maintainers' own `.claude/rules` and `.agents/skills`. Code checks each finding's location and drops repeats from earlier rounds; independent verifier agents vote, and only findings 2 of 3 confirm are posted, as one PR review with inline comments tagged Important / Nit / Pre-existing. It never approves. See [PR Review](#pr-review). |
 | CI Status Check | `check_ci_for_pr.py` | `@amd-bot ci-status` or manual | Checks all CI for a PR, separates CI completeness from executed failure attribution, determines if executed failures are PR-related, and warns when required downstream jobs were fast-fail skipped or when the AMD test covering a changed code path did not run |
 | Comment Watcher | `watch_comments.py` | Daemon (15s poll) + Cron (5min fallback) | Polls sglang PRs for `@amd-bot` commands, dispatches workflows |
 | Coverage Exclusion Audit (weekly) | `upstream_ci/coverage_audit/audit.py` in [ROCm/sglang-ci](https://github.com/ROCm/sglang-ci) | `coverage-audit.yml` schedule, **Mondays 16:07 UTC**; manual dry run | Keeps the AMD-vs-NVIDIA coverage number on ROCm/sglang-ci's `/coverage` page honest: finds NVIDIA tests that newly joined its "NVIDIA tests not run on AMD" gap list, has Claude Code decide which can never run on ROCm, and opens and merges a ROCm/sglang-ci PR adding those to `AMD_EXCLUSION_REASONS`. It runs here only because these runners can reach the AMD LLM Gateway; the code, prompt and ledger live in ROCm/sglang-ci. The agent gets no token and no shell (`--tools Read,Grep,Glob --restricted`, under `env -i`, in the job's temp directory), and its answer is validated before any step writes. See [Coverage exclusion audit](#coverage-exclusion-audit). |
@@ -108,8 +108,9 @@ runner-1 entrypoint.sh (sleep 3600) ─┐
                           at the image's commit under .ci-context/miles/src,
                           and write .ci-context/miles/EVIDENCE.md from the
                           sglang-ci dashboard's Miles cause-fix payload
-                        - deploy /workspace/CLAUDE.md
-                        - run claude -p "Task: Job Failure Analysis ..." (cwd=worktree)
+                        - run claude -p "Task: Job Failure Analysis ..." (cwd=worktree;
+                          agent/CLAUDE.md + agent/tasks/job-failure-analysis.md
+                          appended to the system prompt)
                         - parse output, append to job_analyses
                   5. if >1 failure, run Task: Cross-Job Summary agent
                      (no API fallback; if the agent fails, the last good
@@ -226,29 +227,42 @@ When a task is triggered (CI failure analysis, PR review, or CI status check), t
 5. For PR tasks: **checks out the PR branch** in the worktree
    - For `PR CI Status Check`: builds the evidence pack (`ci_evidence.py`, see [CI Status Check](#ci-status-check)) and re-checks out the worktree at the **commit CI actually tested** (usually a merge commit, not the PR head)
    - For `PR CI Status Check`: writes `.ci-context/ci-runtime-env.md`, the env vars AMD PR CI actually sets (`collect_ci_runtime_env()` reads `docker/rocm.Dockerfile` `ENV` lines, `scripts/ci/amd/amd_ci_start_container.sh`, `scripts/ci/amd/amd_ci_exec.sh`, and `-e` flags in `.github/workflows/pr-test-amd*.yml`), so the agent judges env-gated code paths against CI's real environment instead of the code default
-6. Copies `agent/CLAUDE.md` to `/workspace/CLAUDE.md`
-7. Runs `claude -p "<task prompt>" --dangerously-skip-permissions --disable-slash-commands` with `cwd=<worktree>` (the sglang checkout ships developer skills the bot must not run). The agent's env drops `BOT_PAT` and `LLM_GATEWAY_KEY`; if `AGENT_GH_TOKEN` is set, it replaces `GH_PAT` / `GH_TOKEN`, so the agent, which reads PR content anyone can write, only holds a read-only token
-8. If `AGENT_ARCHIVE_DIR` is set, copies the prompt and the agent's session log (secrets redacted) there, so a bad report can be traced to what the agent read and ran
+6. Runs `claude -p "<task prompt>" --append-system-prompt "<instructions>" --setting-sources user --dangerously-skip-permissions --disable-slash-commands [--model <m>]` with `cwd=<worktree>`:
+   - The instructions are `agent/CLAUDE.md` (Ground Rules) followed by the task's file in `agent/tasks/`, picked by the prompt's `Task:` line (`AGENT_TASKS` in `utils.py`). An unknown task fails before the CLI starts. Earlier versions copied the whole `CLAUDE.md` to `/workspace/CLAUDE.md`; a stale copy there is deleted.
+   - `--setting-sources user` loads no settings from the checkout. The worktree is an sglang commit, often a PR's, and a `.claude/settings.json` in it could otherwise register hooks: a `SessionStart` hook runs a shell command as the session starts, before any model call (verified with Claude Code 2.1.156). It also keeps the checkout's own `CLAUDE.md` and `.claude/rules` out of the context; the PR review hands the maintainers' rules to the agents explicitly, from `main`.
+   - `--disable-slash-commands`: the sglang checkout ships developer skills the bot must not run.
+   - `--model` comes from the task (see [Models per task](#models-per-task)).
+   - The agent's env drops `BOT_PAT` and `LLM_GATEWAY_KEY`; if `AGENT_GH_TOKEN` is set, it replaces `GH_PAT` / `GH_TOKEN`, so the agent, which reads PR content anyone can write, only holds a read-only token
+7. If `AGENT_ARCHIVE_DIR` is set, copies the prompt and the agent's session log (secrets redacted) there, so a bad report can be traced to what the agent read and ran
 
 ### Task dispatch
 
-Agent prompts are **data-only** — they contain a `Task:` line and metadata, but no instructions. All methodology and output format is defined in `CLAUDE.md`. The agent routes to the correct section based on the task type:
+Agent prompts are **data-only** — they contain a `Task:` line and metadata, but no instructions. All methodology and output format is defined under `agent/`. The `Task:` line picks the file appended after the Ground Rules, and the model:
 
-| Prompt `Task:` line | CLAUDE.md section |
-|---------------------|-------------------|
-| `Task: Job Failure Analysis` | Job Failure Analysis — Per-Job Failure Investigation |
-| `Task: Cross-Job Summary` | Cross-Job Summary (one workflow's many jobs, grouped by symptom cluster) |
-| `Task: Cross-Run Pattern Analysis` | Cross-Run Pattern Analysis (one workflow across multiple runs) |
-| `Task: Daily Cross-Workflow Summary` | Daily Cross-Workflow Summary (rendered into the daily issue **body** between `:start --> / :end -->` placeholders, so it appears above all per-workflow comments) |
-| `Task: Failure Tracker Data` | Failure Tracker Data (compact JSON-only output of today's failures for the tracked workflows; feeds the long-lived upstream per-workflow Failure Trackers) |
-| `Task: PR CI Status Check` | PR CI Status Check |
-| `Task: PR Code Review` | PR Code Review |
+| Prompt `Task:` line | Instructions (`agent/tasks/`) | Model |
+|---------------------|-------------------------------|-------|
+| `Task: Job Failure Analysis` | `job-failure-analysis.md` | default |
+| `Task: Cross-Job Summary` | `cross-job-summary.md` (one workflow's many jobs, grouped by symptom cluster) | default |
+| `Task: Cross-Run Pattern Analysis` | `cross-run-pattern-analysis.md` (one workflow across multiple runs) | default |
+| `Task: Daily Cross-Workflow Summary` | `daily-cross-workflow-summary.md` (rendered into the daily issue **body** between `:start --> / :end -->` placeholders, so it appears above all per-workflow comments) | default |
+| `Task: Failure Tracker Data` | `failure-tracker-data.md` (compact JSON-only output of today's failures for the tracked workflows; feeds the long-lived upstream per-workflow Failure Trackers) | Sonnet |
+| `Task: SGLang AMD CI Staging Candidates` | `staging-candidates.md` | default |
+| `Task: PR CI Status Check` | `pr-ci-status-check.md` | default |
+| `Task: PR Code Review` | `pr-code-review.md` (one reviewer, one angle) | default |
+| `Task: PR Code Review Verification` | `pr-code-review-verify.md` (one verifier's votes) | Sonnet |
+| `Task: Suspect PR Verification` | `suspect-pr-verify.md` (one verifier's vote on a suspect PR) | default |
+
+### Models per task
+
+The model follows what a wrong answer costs. Tasks whose output is published, or decides what gets published (analyses, summaries, the CI status verdicts, PR review findings, suspect-PR verification), use the runner's default, `ANTHROPIC_MODEL` (`opus[1m]`). Extraction from existing analyses (Failure Tracker Data) and the PR review's second-opinion votes, three per finding, use Sonnet.
+
+An alias goes through the gateway only when the runner maps it: `ANTHROPIC_DEFAULT_SONNET_MODEL` must be set in `claude.env`, or the task logs a warning and keeps the default model. Override one task with `AGENT_MODEL_<TASK>` (the task name upper-cased, non-alphanumerics as `_`), e.g. `AGENT_MODEL_FAILURE_TRACKER_DATA=opus` or `AGENT_MODEL_PR_CODE_REVIEW_VERIFICATION=Claude-Opus-5.5`.
 
 ### Agent capabilities
 
 - **CI failures**: Download logs via GitHub API, identify failed tests at the **test file + function** level, compare with recent **completed** runs, detect regressions, propose hypothesised commits with confidence labels, search for in-flight fix PRs to avoid duplication. For `nightly-amd-mi355x-disagg.yml`, the bot also downloads `mi355x-*` run artifacts and analyzes bundled `bench.log`, `prefill_*.log`, `decode_*.log`, `server_exit_*`, and `bench_exit` files because the job page log alone does not contain the full multi-node failure evidence.
-- **Lost runners**: a job whose self-hosted runner went away mid-job ("The self-hosted runner lost communication with the server") fails with no failed step and usually no log. `is_runner_lost()` in `utils.py` spots it from the step list (checked against GitHub's annotation on 1,384 failed AMD jobs: all 22 annotated jobs, plus one GitHub never annotated), and `runner_lost_evidence()` hands the analysis the facts instead: the runner, the step it was in, the annotation, and the other jobs in the run that lost theirs. In agent mode this is a `Runner lost: yes` block in the prompt; in API mode a `## Runner lost` section ahead of the log; in the PR CI-status evidence pack, mode `runner_lost`. CLAUDE.md's **Lost runner** section has the agent report it as infrastructure under one cluster name per runner pool, and tell a host outage (many jobs, one window) from a job that takes its own runner down (the same shard, every run). The same rule drives the "Runner lost" column on the ROCm/sglang-ci Runner Health page.
-- **PR reviews**: Read full source files in workspace, find callers of modified functions, verify AMD/ROCm parity, check test coverage
+- **Lost runners**: a job whose self-hosted runner went away mid-job ("The self-hosted runner lost communication with the server") fails with no failed step and usually no log. `is_runner_lost()` in `utils.py` spots it from the step list (checked against GitHub's annotation on 1,384 failed AMD jobs: all 22 annotated jobs, plus one GitHub never annotated), and `runner_lost_evidence()` hands the analysis the facts instead: the runner, the step it was in, the annotation, and the other jobs in the run that lost theirs. In agent mode this is a `Runner lost: yes` block in the prompt; in API mode a `## Runner lost` section ahead of the log; in the PR CI-status evidence pack, mode `runner_lost`. The **Lost runner** section of `agent/tasks/job-failure-analysis.md` has the agent report it as infrastructure under one cluster name per runner pool, and tell a host outage (many jobs, one window) from a job that takes its own runner down (the same shard, every run). The same rule drives the "Runner lost" column on the ROCm/sglang-ci Runner Health page.
+- **PR reviews**: several reviewers, each from one angle, read full source files, find callers of modified functions, check AMD/ROCm parity, test coverage and the maintainers' conventions; verifiers then try to refute each finding (see [PR Review](#pr-review))
 - **Isolation**: Each agent gets its own worktree — parallel agents (`AGENT_PARALLEL=3` per `monitor_ci.py` matrix job; `MAX_PARALLEL_JOBS=2` in `analyze_url.py`) and concurrent tasks cannot interfere with each other
 
 ### CI report methodology principles
@@ -337,6 +351,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 | `LLM_GATEWAY_KEY` | AMD LLM Gateway subscription key |
 | `LLM_GATEWAY_URL` | AMD LLM Gateway endpoint (e.g. `https://llm-api.amd.com/Anthropic`) |
 | `SGLANG_CI_TOKEN` | Optional. Overrides `GH_PAT` for `coverage-audit.yml` with another ROCm/sglang-ci admin's PAT |
+| `AGENT_GH_TOKEN` | Recommended. A read-only GitHub token handed to the agents in place of `GH_PAT` (PR review, CI status check, suspect-PR verification), since they read content anyone can write |
 
 **Variables:**
 
@@ -344,6 +359,7 @@ In `bingxche/sglang-ci-bot` > Settings > Secrets and variables > Actions:
 |----------|-------|
 | `USE_AGENT` | `true` to enable agent mode in workflow-triggered reviews and CI checks |
 | `SUSPECT_PR_COMMENTS` | `dry-run` (default when unset), `post`, or `off`. See [Suspect PR comments](#suspect-pr-comments). |
+| `SUSPECT_PR_VERIFY` | `on` (default when unset) or `off`: whether verifier agents must confirm a suspect before it is commented on |
 | `COVERAGE_AUDIT_MODEL` | Optional `--model` for `coverage-audit.yml` (default `opus`, resolved through the runner's `ANTHROPIC_DEFAULT_OPUS_MODEL`) |
 
 ### Deploy self-hosted runners
@@ -398,7 +414,7 @@ ANTHROPIC_BASE_URL=https://llm-api.amd.com/Anthropic
 ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: <your-key>
 ANTHROPIC_MODEL=opus[1m]
 ANTHROPIC_DEFAULT_OPUS_MODEL=Claude-Opus-5.5
-ANTHROPIC_DEFAULT_SONNET_MODEL=Claude-Sonnet-4.8
+ANTHROPIC_DEFAULT_SONNET_MODEL=Claude-Sonnet-5.5
 ANTHROPIC_DEFAULT_HAIKU_MODEL=Claude-Haiku-4.8
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 ```
@@ -647,7 +663,7 @@ docker logs -f amd-ci-bot-runner-1
 | What changed | Workflows (cron + dispatch) | Daemon (runner-1) |
 |---|---|---|
 | `scripts/*.py` | `git push` — next run picks up changes | `docker restart amd-ci-bot-runner-1` |
-| `agent/CLAUDE.md` | `git push` — next run picks up changes | `docker restart amd-ci-bot-runner-1` |
+| `agent/` (CLAUDE.md, tasks/, api-prompts.md) | `git push` — next run picks up changes | `docker restart amd-ci-bot-runner-1` |
 | `.github/workflows/*.yml` | `git push` — effective immediately | N/A |
 | `runner/entrypoint.sh` | N/A | `git pull` on host + `docker restart amd-ci-bot-runner-1` (bind-mounted) |
 | `runner/Dockerfile` | N/A | Rebuild image + recreate containers |
@@ -735,7 +751,7 @@ Legacy summary *comments* from the pre-body code path (carrying the older `<!-- 
 
 If no daily issue exists yet for the date, or if no per-workflow comments have been posted, the script logs and exits cleanly without creating an empty summary.
 
-Methodology and output format live in `agent/CLAUDE.md` under `## Daily Cross-Workflow Summary`. The Python script is a data-only harness.
+Methodology and output format live in `agent/tasks/daily-cross-workflow-summary.md`. The Python script is a data-only harness.
 
 The agent ends the report with two fenced JSON blocks that the script strips before publishing: `job-clusters` (cluster → job IDs, kept as the hidden `<!-- ci-monitor-job-clusters:v1 … -->` comment) and `suspect-prs` (per cluster, the merged sglang PR its top hypothesis names, with confidence and the last-passing / first-failing commits). Valid `suspect-prs` entries are kept as the hidden `<!-- ci-monitor-suspect-prs:v1 … -->` comment for `suspect_pr_comments.py`. If the agent leaves the block out, no PR gets a comment.
 
@@ -750,12 +766,13 @@ When the daily summary attributes a cluster to a merged sglang PR, `suspect_pr_c
 5. The compare API puts the commit after the last passing commit and at or before the first failing commit.
 6. If the cluster has a fix PR, it is still open and by someone other than the PR's author. A merged fix skips the suspect (nothing left to ask); a fix closed without merging is treated as no fix.
 7. Without an open fix PR, the PR has no earlier suspect-PR comment (a `<!-- amd-bot-suspect-pr:<cluster> -->` marker) for any cluster. Cluster IDs are reassigned from day to day (#45791 was R327, then R332, an hour apart), so checking only the same cluster would comment on the same break again. A PR gets one comment, however long it stays red; when two clusters name the same PR in one tick, only the strongest is posted.
+8. **Independent verifiers confirm it.** The checks above prove the commit is in the window, not that it caused the failure: that claim is one agent's reading of the per-job analyses. So 3 agents (`Task: Suspect PR Verification`, `agent/tasks/suspect-pr-verify.md`), each in a fresh worktree at the first failing commit, try to refute the attribution: they read the PR's diff and the failing logs, list the other commits in the window, and look for an image, dependency or infrastructure change, or a later pass. The comment is posted only if at least 2 confirm, and its footer says how many did. A verifier that does not finish counts for nothing; if fewer than 2 finish, the suspect is skipped (fail closed). Votes are stored, keyed by PR, commit and first failing commit, in a hidden `<!-- suspect-pr-votes … -->` block of the daily-issue log comment, so each suspect is verified once a day rather than every hourly tick, at most 5 new suspects per tick. `SUSPECT_PR_VERIFY=off` (repository variable) skips this check.
 
 At most 3 comments are posted per tick, strongest confidence and most failed jobs first. The comment says what fails and why the PR is suspected, gives the commit window and up to 8 failing job links, and asks the author to say so if the PR is not the cause. It ends with a footer saying it was posted automatically by amd-bot, the AMD CI monitor, whichever account's token posts it. It has no `@`-mentions (any in the agent's evidence are put in code spans) and no links to this repo.
 
 When an open fix PR is linked, the comment instead starts with `@<PR author>`, says the fix PR proposes a fix and asks them to review it, followed by the same evidence, window and job links. This is the only mention the bot makes. It carries a `<!-- amd-bot-suspect-fix:<fix PR> -->` marker and is sent once per fix PR, including on a PR that already had a suspect comment, so an author first told about the break is told again when a fix shows up.
 
-Every tick also writes one comment on the daily issue (marker `<!-- ci-monitor-suspect-pr-log -->`, edited in place) with a row per suspect: would comment / commented / already commented / skipped and why. In dry-run mode it includes the full text of each comment that would be posted.
+Every tick also writes one comment on the daily issue (marker `<!-- ci-monitor-suspect-pr-log -->`, edited in place) with a row per suspect: would comment / commented / already commented / skipped and why, the verifier count, and each verifier's reason. In dry-run mode it includes the full text of each comment that would be posted. Verification runs in dry-run mode too, so the log shows what the verifiers would let through before `post` is switched on.
 
 | `SUSPECT_PR_COMMENTS` | Behavior |
 |---|---|
@@ -775,6 +792,7 @@ python scripts/suspect_pr_comments.py --bot-repo bingxche/sglang-ci-bot --mode d
 | `--bot-repo` | required | Bot repo hosting the daily issue |
 | `--date` | today (UTC) | Daily issue date `YYYY-MM-DD` to read suspects from |
 | `--mode` | `SUSPECT_PR_COMMENTS` or `dry-run` | `off` / `dry-run` / `post` |
+| `--verify` / `--no-verify` | on (env `SUSPECT_PR_VERIFY=off` to disable) | Have verifier agents confirm each suspect first |
 | `--github-token` | `BOT_PAT` / `GH_PAT` / `GITHUB_TOKEN` | GitHub token (posts as amd-bot in production) |
 
 ### Failure Trackers (per workflow)
@@ -899,6 +917,9 @@ layout. Blank `Owner` and `Fix PR` values are omitted.
 # Agent mode is the default:
 python scripts/review_pr.py 1234 --no-post
 
+# Force a tier:
+python scripts/review_pr.py 1234 --no-post --tier standard
+
 # Force API-mode fallback:
 python scripts/review_pr.py 1234 --no-post --no-use-agent
 ```
@@ -906,10 +927,22 @@ python scripts/review_pr.py 1234 --no-post --no-use-agent
 | Option | Default | Description |
 |--------|---------|-------------|
 | `pr_number` | required | PR number to review |
-| `--focus` | none | Specific areas to focus on |
+| `--focus` | none | Specific areas to focus on (passed to every reviewer) |
 | `--context` | none | Additional context |
+| `--tier` | `auto` (env `REVIEW_TIER`) | `quick`, `standard`, or `auto` (from the PR's size) |
 | `--no-post` | false | Print to stdout instead of posting |
 | `--use-agent` / `--no-use-agent` | **enabled** (env: `USE_AGENT=false` to disable) | Use Claude Code agent; pass `--no-use-agent` to use API mode instead |
+
+How an agent-mode review works (`review_pr.agent_review()`; the deterministic half is `review_findings.py`):
+
+1. **Context.** Each agent's `.ci-context/` holds `pr.md` (description, changed files), the full `pr.diff`, `ci-runtime-env.md`, and `upstream/`: the sglang maintainers' `.claude/rules/*.md` and `.agents/skills/*/SKILL.md` from `main`, with an `INDEX.md` listing which changed files each rule's `paths` cover. These are the review standards; the checkout's own `.claude/` is not loaded (see [How Agent Mode Works](#how-agent-mode-works)).
+2. **Tier.** A PR of at most 200 changed lines in at most 6 files is `quick`: one reviewer with every angle. Otherwise `standard`: four reviewers in parallel (`REVIEW_PARALLEL`), one per angle: `correctness`, `amd` (ROCm parity, aiter dispatch, env gates against the CI env), `contracts` (callers, signatures, config and IPC fields), `tests-conventions` (tests for the changed paths, `register_amd_ci`, the maintainers' rules). Each works in its own worktree at the PR head (`Task: PR Code Review`, `agent/tasks/pr-code-review.md`) and ends with a `<!-- review-findings {...} -->` JSON block. A finding needs a mechanism (the line and the concrete failure); style, naming, logging and "consider" suggestions are not reported, nor are conventions without a rule behind them.
+3. **Checks in code.** A finding must name a file the PR changed, unless marked pre-existing; it is commented inline only if its line is in a hunk of the diff, otherwise it is listed in the summary. A `convention` finding must cite an `upstream/` rule file. Duplicates from several angles are merged; findings an earlier round posted are dropped; at most 12 go on (`REVIEW_MAX_FINDINGS`), with at most 3 nits.
+4. **Verification.** Three verifier agents (`Task: PR Code Review Verification`, `REVIEW_VOTERS`) each read every candidate and vote `confirmed` / `refuted` / `uncertain`, trying to refute it: reachability, guards in callers, intent, whether the PR introduced it. A finding is kept only with 2 confirmations (`REVIEW_VOTES_REQUIRED`); a missing vote counts as no. Fewer than 2 verifiers finishing fails the review. A clean PR skips this step.
+5. **Posting.** One PR review with event `COMMENT` (never Approve or Request changes): inline comments tagged 🔴 Important / 🟡 Nit / ⚪ Pre-existing, each with the verifier count, the bug's other locations, and the maintainers' rule when one applies. The summary starts with a count, or says **No issues found**, and notes reviewers that did not finish. If GitHub refuses the inline comments, they are folded into the review body. A hidden `<!-- amd-bot-review {...} -->` marker records the reviewed commit, the round and the findings.
+6. **Later rounds.** On the next `@amd-bot review`, the reviewers get `previous-review.md` (what was posted) and `since-last-review.diff` (changes since the reviewed commit). They focus on the new changes, and earlier findings are not repeated. From round 4, the summary suggests stepping back to reconsider the approach.
+
+If no reviewer finishes, the PR gets the "agent did not work" notice and the job fails. `pr-review.yml` passes `AGENT_GH_TOKEN` and uploads the agent sessions (`AGENT_ARCHIVE_DIR`) as an artifact. Timeouts: `REVIEW_FIND_TIMEOUT_SECS` (1500), `REVIEW_VERIFY_TIMEOUT_SECS` (900); turns: `REVIEW_FIND_MAX_TURNS` (200), `REVIEW_VERIFY_MAX_TURNS` (80).
 
 ### CI Status Check
 
@@ -984,25 +1017,26 @@ Or via the Actions tab: go to **Analyze CI** workflow, paste the URL, and click 
 
 ```
 sglang-ci-bot/
-  agent/
-    CLAUDE.md               Single source of truth for ALL AI behavior:
-                              - Task dispatch routing
-                              - Ground rules (evidence-based, confidence labels, no priority,
-                                  in-flight fix lookup, completed-runs-only)
-                              - Job Failure Analysis methodology + output format (per-job, with Failure
-                                  Cluster + Facts + Hypothesised Causes with confidence)
-                              - Cross-Job Summary (one workflow's many jobs, grouped by cluster)
-                              - Cross-Run Pattern Analysis (one workflow across runs)
-                              - Daily Cross-Workflow Summary (rendered into the daily
-                                  issue body between :start --> / :end --> placeholders;
-                                  ends with job-clusters and suspect-prs JSON blocks)
-                              - SGLang AMD CI Staging Candidates (strict JSON for
-                                  the isolated Notion staging gate)
-                              - PR CI Status Check methodology + output format
-                                  (judgment bar, hidden verdict block)
-                              - PR Code Review methodology + output format
-                              - AITER analysis instructions (GitHub API)
-                              - API Mode prompt templates (loaded at runtime)
+  agent/                    Single source of truth for ALL AI behavior
+    CLAUDE.md               Ground rules every task follows (evidence-based,
+                              confidence labels, no priority, in-flight fix
+                              lookup, completed-runs-only, link hygiene)
+    tasks/                  One methodology + output format per Task: line,
+                              appended after CLAUDE.md (AGENT_TASKS in utils.py):
+      job-failure-analysis.md       per-job, with Failure Cluster + Facts +
+                                      Hypothesised Causes; AITER, Miles,
+                                      MI355X disagg, lost runners
+      cross-job-summary.md          one workflow's many jobs, by cluster
+      cross-run-pattern-analysis.md one workflow across runs
+      daily-cross-workflow-summary.md  daily issue body; ends with
+                                      job-clusters and suspect-prs JSON blocks
+      failure-tracker-data.md       JSON for the upstream Failure Trackers
+      staging-candidates.md         strict JSON for the Notion staging gate
+      pr-ci-status-check.md         judgment bar, hidden verdict block
+      pr-code-review.md             one reviewer's angle and findings block
+      pr-code-review-verify.md      one verifier's votes on the findings
+      suspect-pr-verify.md          one verifier's vote on a suspect PR
+    api-prompts.md          API Mode prompt templates (loaded at runtime)
   scripts/
     utils.py                Shared utilities:
                               - GitHub API helpers (incl. update_issue_body())
@@ -1012,14 +1046,18 @@ sglang-ci-bot/
                               - is_runner_lost(), runner_lost_evidence() — a job
                                   whose runner went away mid-job, and its facts
                               - analyze_job_with_agent(), analyze_job_api()
-                              - load_prompt_template() — reads CLAUDE.md API templates
+                              - load_prompt_template() — reads agent/api-prompts.md
+                              - AGENT_TASKS, agent_instructions(), task_model() —
+                                  each Task: line's instructions and model
                               - Worktree management: create_/remove_/agent_worktree()
                               - collect_ci_runtime_env() — AMD PR CI env vars for
                                   .ci-context/ci-runtime-env.md
                               - checkout_commit() — check out an exact SHA, verified
                               - Claude Code CLI wrapper: claude_code_analyze()
-                                  (agent env, session archive, redact_secrets())
-                              - _deploy_claude_md() — copies agent/CLAUDE.md to /workspace
+                                  (instructions, user-only settings, model, agent
+                                  env, session archive, redact_secrets())
+                              - _remove_deployed_claude_md() — deletes the copy
+                                  older versions left in /workspace
     ensure_daily_issue.py   Idempotently create today's daily CI-monitor issue
                               (with Daily Cross-Workflow Summary placeholder
                               block already seeded
@@ -1093,7 +1131,11 @@ sglang-ci-bot/
     ci_verdicts.py          Checks the agent's verdict block against the evidence
                               pack and marks unsupported rows in the report
     eval_ci_status.py       Scores ci-status replays against evals/ci_status/cases
-    review_pr.py            PR code review
+    review_pr.py            PR code review: reviewer agents per angle, verifier
+                              agents, one PR review with inline comments
+    review_findings.py      The review's deterministic half: parse findings
+                              and votes, check locations, merge, drop repeats,
+                              tally, render
     watch_comments.py       Comment watcher / command dispatcher
     local_run.sh            Local dev runner
     verify_agent.sh         Claude Code agent verification
@@ -1139,7 +1181,15 @@ sglang-ci-bot/
     test_eval_ci_status.py  Tests for ci-status eval scoring.
     test_suspect_pr_comments.py
                             Tests for the suspect-prs block round trip, each
-                              comment check, rendering, and the per-tick cap.
+                              comment check, rendering, the per-tick cap, and
+                              the verifier vote and its cache.
+    test_agent_tasks.py     Tests that every Task: line has instructions that fit
+                              in one argument, the model per task, and the CLI
+                              flags (system prompt, user-only settings).
+    test_review_findings.py Tests for findings/votes parsing, location checks,
+                              merging, repeats, caps, tally and rendering.
+    test_review_pr.py       Tests for tiers, the upstream rules index, the review
+                              pipeline end to end with agents faked, and posting.
   evals/ci_status/cases/    Hand-labeled ci-status cases (PR head, as-of time,
                               truth + basis per failure; "proposed" until a
                               reviewer confirms)
@@ -1177,6 +1227,12 @@ PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py'
 | `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Max turns for the `Task: Failure Tracker Data` extraction agent (default: `80`) |
 | `TRACKER_AGENT_TIMEOUT_SECS` | `failure_tracker.py` | Agent timeout for the Failure Tracker extraction (default: `900` = 15 min) |
 | `SUSPECT_PR_COMMENTS` | `suspect_pr_comments.py` | `dry-run` (default), `post`, or `off`; same as `--mode`. Set from the repository variable of the same name in `ci-monitor.yml`. |
+| `SUSPECT_PR_VERIFY` | `suspect_pr_comments.py` | `on` (default) or `off`; same as `--verify` / `--no-verify` |
+| `SUSPECT_VERIFY_TIMEOUT_SECS` / `SUSPECT_VERIFY_MAX_TURNS` | `suspect_pr_comments.py` | Per-verifier timeout (default `1200`) and turns (default `120`) |
+| `REVIEW_TIER` | `review_pr.py` | `auto` (default), `quick` or `standard`; same as `--tier` |
+| `REVIEW_PARALLEL` / `REVIEW_VOTERS` / `REVIEW_VOTES_REQUIRED` / `REVIEW_MAX_FINDINGS` | `review_pr.py` | Agents run at once (4), verifiers (3), confirmations a finding needs (2), findings sent to verification (12) |
+| `REVIEW_FIND_TIMEOUT_SECS` / `REVIEW_FIND_MAX_TURNS` / `REVIEW_VERIFY_TIMEOUT_SECS` / `REVIEW_VERIFY_MAX_TURNS` | `review_pr.py` | Reviewer (1500 s, 200 turns) and verifier (900 s, 80 turns) budgets |
+| `AGENT_MODEL_<TASK>` | Agent mode | Model for one task, overriding the default in `AGENT_TASKS` (see [Models per task](#models-per-task)) |
 | `STAGING_AGENT_MAX_TURNS` | `stage_notion.py analyze` | Max turns for the machine-readable staging-candidate agent (default: `120`) |
 | `STAGING_AGENT_TIMEOUT_SECS` | `stage_notion.py analyze` | Timeout for the staging-candidate agent (default: `1200` = 20 min) |
 | `NOTION_TOKEN` | `stage_notion.py sync` | Single Notion token with Read + Insert but no Update capability, shared only with the official and isolated staging databases; never present in the agent step |
@@ -1216,10 +1272,11 @@ the image when a new model needs a newer CLI.
 
 ### Agent behavior and prompt templates
 
-Edit `agent/CLAUDE.md`. This is the **single source of truth** for all AI behavior:
+Edit `agent/`. This is the **single source of truth** for all AI behavior:
 
-- **Agent mode sections** (Job Failure Analysis, PR CI Status Check, PR Code Review): methodology, output format, ground rules
-- **API Mode Prompts** section: `{placeholder}` templates loaded by `load_prompt_template()` at runtime
+- `agent/CLAUDE.md`: Ground Rules for every task. Keep it short; every agent run carries it.
+- `agent/tasks/<task>.md`: one task's methodology and output format. A new task needs a file here and an entry in `AGENT_TASKS` in `scripts/utils.py` (`tests/test_agent_tasks.py` fails otherwise).
+- `agent/api-prompts.md`: `{placeholder}` templates loaded by `load_prompt_template()` at runtime
 
 Changes take effect on next `git push` + container restart (for daemon) or next workflow run (for workflow-triggered tasks).
 

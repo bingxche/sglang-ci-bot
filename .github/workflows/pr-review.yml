@@ -16,6 +16,15 @@ on:
         required: false
         default: 'false'
         type: boolean
+      tier:
+        description: 'Review tier (auto = from the PR size)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - quick
+          - standard
 
   repository_dispatch:
     types: [pr-review]
@@ -27,6 +36,8 @@ concurrency:
 jobs:
   review:
     runs-on: [self-hosted, amd-internal]
+    # Reviewers (25 min) then verifiers (15 min), each set in parallel.
+    timeout-minutes: 90
     permissions:
       contents: read
 
@@ -55,11 +66,15 @@ jobs:
       - name: Review PR
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          # The agents read PR content anyone can write: give them a read-only token.
+          AGENT_GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN }}
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
           COMMENT_AUTHOR: ${{ steps.pr.outputs.comment_author }}
           USE_AGENT: ${{ vars.USE_AGENT || 'false' }}
           AGENT_WORKSPACE: /workspace
+          AGENT_ARCHIVE_DIR: ${{ runner.temp }}/pr-review/agent-sessions
+          REVIEW_TIER: ${{ github.event.inputs.tier || 'auto' }}
         run: |
           ARGS="${{ steps.pr.outputs.number }}"
 
@@ -74,3 +89,12 @@ jobs:
           fi
 
           eval python scripts/review_pr.py $ARGS
+
+      - name: Upload agent sessions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-review-pr${{ steps.pr.outputs.number }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/pr-review/
+          if-no-files-found: ignore
+          retention-days: 30

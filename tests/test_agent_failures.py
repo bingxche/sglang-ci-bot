@@ -44,12 +44,11 @@ class PrCommandTests(unittest.TestCase):
             review_pr.review_pr("token", 7)
         self._assert_notice_posted(post, "Claude Code CLI not found")
 
-    @patch.object(review_pr, "get_pr_info", side_effect=AssertionError("no API-mode path"))
+    @patch.object(review_pr, "review_pr_with_claude", side_effect=AssertionError("no API-mode path"))
     @patch.object(review_pr, "post_comment", return_value={"html_url": "u"})
-    @patch.object(review_pr, "review_pr_with_agent", side_effect=TimeoutError("timed out after 600s"))
-    @patch.object(review_pr, "agent_worktree")
+    @patch.object(review_pr, "agent_review", side_effect=TimeoutError("timed out after 600s"))
     @patch.object(review_pr, "claude_code_available", return_value=True)
-    def test_review_agent_error_posts_notice_and_fails(self, _cli, _wt, _agent, post, _info):
+    def test_review_agent_error_posts_notice_and_fails(self, _cli, _agent, post, _api):
         with self.assertRaises(TimeoutError):
             review_pr.review_pr("token", 7)
         self._assert_notice_posted(post, "timed out after 600s")
