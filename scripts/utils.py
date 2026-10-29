@@ -1475,18 +1475,22 @@ class AgentTask:
     model: str = ""   # "" = the runner's default (ANTHROPIC_MODEL)
 
 
-# Every agent task, keyed by the prompt's ``Task:`` line. All use the runner's
-# default model (ANTHROPIC_MODEL); give one its own with ``model=`` here, or
-# AGENT_MODEL_<TASK> (e.g. AGENT_MODEL_FAILURE_TRACKER_DATA=sonnet).
+# Every agent task, keyed by the prompt's ``Task:`` line. The model is matched
+# to what a wrong answer costs: tasks whose output is published or decides what
+# gets published keep the runner's default (Opus); extraction and second-opinion
+# votes use Sonnet. Override one with AGENT_MODEL_<TASK> (e.g.
+# AGENT_MODEL_FAILURE_TRACKER_DATA=opus).
 AGENT_TASKS: dict[str, AgentTask] = {
     "Job Failure Analysis": AgentTask("job-failure-analysis.md"),
     "Cross-Job Summary": AgentTask("cross-job-summary.md"),
     "Cross-Run Pattern Analysis": AgentTask("cross-run-pattern-analysis.md"),
     "Daily Cross-Workflow Summary": AgentTask("daily-cross-workflow-summary.md"),
-    "Failure Tracker Data": AgentTask("failure-tracker-data.md"),
+    "Failure Tracker Data": AgentTask("failure-tracker-data.md", model="sonnet"),
     "SGLang AMD CI Staging Candidates": AgentTask("staging-candidates.md"),
     "PR CI Status Check": AgentTask("pr-ci-status-check.md"),
     "PR Code Review": AgentTask("pr-code-review.md"),
+    "PR Code Review Verification": AgentTask("pr-code-review-verify.md", model="sonnet"),
+    "Suspect PR Verification": AgentTask("suspect-pr-verify.md"),
 }
 
 _MODEL_ALIASES = ("opus", "sonnet", "haiku")
