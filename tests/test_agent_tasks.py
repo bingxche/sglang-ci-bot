@@ -43,8 +43,8 @@ class TaskRegistryTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             utils.agent_instructions("Something New")
 
-    def test_claude_md_is_short(self):
-        self.assertLess(len((ROOT / "agent" / "CLAUDE.md").read_bytes()), 20_000)
+    def test_ground_rules_are_short(self):
+        self.assertLess(len((ROOT / "agent" / "ground-rules.md").read_bytes()), 20_000)
 
     def test_api_templates_moved_with_the_loader(self):
         for name in ("focused-job-analysis", "cross-job-summary", "pr-correlation",

@@ -15,7 +15,7 @@ name: Coverage Exclusion Audit
 # The agent reads upstream sglang test files, which anyone who lands an
 # upstream PR controls. So it gets no token and no shell: it runs in this
 # job's temp directory (never the shared workspace, which holds the bot
-# checkout and agent/CLAUDE.md), under `env -i` with only the gateway
+# checkout and agent/ground-rules.md), under `env -i` with only the gateway
 # variables, with `--tools Read,Grep,Glob --restricted`: those three tools
 # are all it has, confined to that directory, with no settings files or MCP
 # servers. Its answer is data: audit.py
