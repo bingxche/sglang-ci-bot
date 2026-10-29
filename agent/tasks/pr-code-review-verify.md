@@ -19,6 +19,7 @@ For each candidate:
    - `refuted`: you found a concrete reason it is wrong, unreachable, intended, or not worth a comment.
    - `uncertain`: neither.
 4. Check the labels. Give the `severity` (`important` or `nit`) and `pre_existing` you think are right.
+5. Check for duplicates. Reviewers working from different angles often report one bug twice, at different lines and in different words. Two candidates are the same bug if one fix resolves both. In that case, set `duplicate_of` on the weaker one to the `id` of the one that states the bug best, and still give it a verdict. Leave `duplicate_of` empty otherwise.
 
 Your final message is only this block, with one vote per candidate `id`:
 
@@ -26,7 +27,7 @@ Your final message is only this block, with one vote per candidate `id`:
 <!-- review-votes
 {"votes": [
   {"id": "F1", "verdict": "confirmed", "severity": "important", "pre_existing": false,
-   "reason": "One or two sentences: what you checked and what decided it."}
+   "duplicate_of": "", "reason": "One or two sentences: what you checked and what decided it."}
 ]}
 -->
 ```

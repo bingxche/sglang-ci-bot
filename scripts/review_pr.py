@@ -36,6 +36,7 @@ from pathlib import Path
 import requests
 
 from review_findings import (
+    DUPLICATE_REASON,
     MAX_NITS,
     Finding,
     cap_findings,
@@ -556,9 +557,9 @@ def agent_review(
     review.voters = len(ballots)
     confirmed, rejected = tally(kept, ballots, REVIEW_VOTES_REQUIRED)
     for f, reason in rejected:
-        print(f"  Not confirmed {f.file}:{f.line} '{f.title}': {reason}")
+        print(f"  Not posted {f.file}:{f.line} '{f.title}': {reason}")
     review.findings = confirmed
-    review.dropped_by_votes = len(rejected)
+    review.dropped_by_votes = sum(not reason.startswith(DUPLICATE_REASON) for _, reason in rejected)
     return review
 
 

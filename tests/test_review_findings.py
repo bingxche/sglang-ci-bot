@@ -161,6 +161,30 @@ class MergeVoteTest(unittest.TestCase):
         self.assertFalse(kept[0].pre_existing)  # 1 of 2 confirmers said so: no majority
         self.assertEqual(dropped[0][1], "confirmed by 1/3 verifiers")
 
+    def test_duplicates_the_verifiers_name_are_folded_in(self):
+        # PR 47179: the same comma-split bug reported at lines 97 and 109 by different angles.
+        found = rf.merge_findings(
+            self.findings(finding(file="new.py", line=1, title="filter matches nothing"), angle="correctness")
+            + self.findings(finding(line=40, category="amd", title="per-job report is always empty",
+                                    evidence=["q.py:255"]), angle="amd")
+        )
+        a, b = (f.id for f in found)  # a: new.py:1 (sorts first), b: a.py:40
+
+        def ballot(dup_b):
+            return rf.parse_votes(block(rf.VOTES_MARK, {"votes": [
+                {"id": a, "verdict": "confirmed"},
+                {"id": b, "verdict": "confirmed", "duplicate_of": dup_b}]}))
+
+        kept, dropped = rf.tally(found, [ballot(a), ballot(a), ballot("")], 2)
+        self.assertEqual([f.id for f in kept], [a])
+        self.assertEqual(kept[0].angles, ["correctness", "amd"])
+        self.assertEqual(kept[0].other_locations, ["python/sglang/srt/a.py:40"])
+        self.assertIn("q.py:255", kept[0].evidence)
+        self.assertEqual(dropped[0][1], f"{rf.DUPLICATE_REASON} {a} (2/3 verifiers)")
+
+        kept, _ = rf.tally(rf.merge_findings(found), [ballot(a), ballot(""), ballot("")], 2)
+        self.assertEqual(len(kept), 2)  # one verifier is not a majority
+
     def test_too_few_verifiers_is_an_error(self):
         with self.assertRaises(RuntimeError):
             rf.tally([], [{}], 2)

@@ -262,6 +262,7 @@ def parse_votes(text: str) -> dict[str, dict]:
                 "verdict": str(v["verdict"]).lower(),
                 "severity": str(v.get("severity") or "").lower(),
                 "pre_existing": v.get("pre_existing"),
+                "duplicate_of": str(v.get("duplicate_of") or "").strip(),
                 "reason": " ".join(str(v.get("reason") or "").split()),
             }
     return votes
@@ -299,7 +300,44 @@ def tally(
         elif pre.count(False) * 2 > len(yes):
             f.pre_existing = False
         kept.append(f)
-    return kept, dropped
+    return _merge_duplicates(kept, ballots, dropped)
+
+
+DUPLICATE_REASON = "duplicate of"
+
+
+def _merge_duplicates(
+    kept: list[Finding], ballots: list[dict[str, dict]], dropped: list[tuple[Finding, str]],
+) -> tuple[list[Finding], list[tuple[Finding, str]]]:
+    """Fold a confirmed finding into another when most verifiers call it a duplicate.
+
+    Reviewers on different angles report one bug at different lines and in
+    different words (PR 47179: the same comma-split bug at lines 97 and 109),
+    which no location rule catches; the verifiers read all candidates side by side.
+    """
+    by_id = {f.id: f for f in kept}
+    absorbed: set[str] = set()
+    for f in kept:
+        targets = [b[f.id]["duplicate_of"] for b in ballots if f.id in b]
+        targets = [t for t in targets if t in by_id and t != f.id]
+        if not targets:
+            continue
+        target = max(set(targets), key=targets.count)
+        if targets.count(target) * 2 <= len(ballots) or target in absorbed or f.id in absorbed:
+            continue
+        into = by_id[target]
+        absorbed.add(f.id)
+        for angle in f.angles:
+            if angle not in into.angles:
+                into.angles.append(angle)
+        location = f"{f.file}:{f.line}"
+        if location not in into.other_locations and (f.file, f.line) != (into.file, into.line):
+            into.other_locations.append(location)
+        into.evidence += [e for e in f.evidence if e not in into.evidence]
+        if f.severity == "important":
+            into.severity = "important"
+        dropped.append((f, f"{DUPLICATE_REASON} {into.id} ({targets.count(target)}/{len(ballots)} verifiers)"))
+    return [f for f in kept if f.id not in absorbed], dropped
 
 
 # ---------------------------------------------------------------------------
