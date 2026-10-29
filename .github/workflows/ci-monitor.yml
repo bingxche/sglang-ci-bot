@@ -173,11 +173,16 @@ jobs:
         run: python scripts/order_daily_comments.py
 
       # dry-run unless the SUSPECT_PR_COMMENTS repository variable is "post".
+      # Each suspect that passes the checks is put to independent verifier
+      # agents first (SUSPECT_PR_VERIFY=off skips them).
       - name: Comment on suspect PRs
         continue-on-error: true
+        timeout-minutes: 60
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
+          AGENT_GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN }}
           SUSPECT_PR_COMMENTS: ${{ vars.SUSPECT_PR_COMMENTS || 'dry-run' }}
+          SUSPECT_PR_VERIFY: ${{ vars.SUSPECT_PR_VERIFY || 'on' }}
         run: python scripts/suspect_pr_comments.py --bot-repo ${{ github.repository }}
 
       - name: Update upstream Failure Trackers

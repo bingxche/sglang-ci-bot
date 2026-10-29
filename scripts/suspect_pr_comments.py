@@ -24,6 +24,13 @@ PR that already had a suspect comment. That needs the fix PR to be open
 and by someone else; a merged fix skips the suspect, and one closed
 without merging is treated as no fix.
 
+A suspect that passes every check then goes to ``VERIFIERS`` independent
+agents (``Task: Suspect PR Verification``), each trying to refute the
+attribution from the PR's diff, the failing logs and the other commits in
+the window. It is commented on only if at least ``VOTES_REQUIRED`` confirm.
+Votes are kept, per PR and commit window, in the daily issue's log comment,
+so each suspect is verified once a day, not once a tick.
+
 Modes (``--mode`` / ``SUSPECT_PR_COMMENTS``):
 
   - ``dry-run`` (default): post nothing upstream; record what would be
@@ -33,11 +40,13 @@ Modes (``--mode`` / ``SUSPECT_PR_COMMENTS``):
 """
 
 import argparse
+import json
 import logging
 import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from itertools import zip_longest
@@ -54,7 +63,20 @@ from daily_cross_workflow_summary import (
     parse_suspect_prs_comment,
 )
 from monitor_ci import find_daily_issue, get_issue_comments
-from utils import REPO, get_issue, gh_headers, post_comment, update_comment
+from review_findings import parse_block
+from utils import (
+    REPO,
+    checkout_commit,
+    claude_code_analyze,
+    claude_code_available,
+    create_agent_worktree,
+    ensure_sglang_repo,
+    get_issue,
+    gh_headers,
+    post_comment,
+    remove_agent_worktree,
+    update_comment,
+)
 
 log = logging.getLogger("suspect-prs")
 
@@ -65,8 +87,16 @@ MIN_FAILED_JOBS = 2
 MAX_PR_AGE_DAYS = 14
 MAX_POSTS_PER_RUN = 3
 MAX_JOBS_LISTED = 8
+VERIFIERS = 3
+VOTES_REQUIRED = 2
+MAX_VERIFY_PER_RUN = 5
+VERIFY_TIMEOUT_SECS = int(os.environ.get("SUSPECT_VERIFY_TIMEOUT_SECS") or 1200)
+VERIFY_MAX_TURNS = int(os.environ.get("SUSPECT_VERIFY_MAX_TURNS") or 120)
+MAX_ANALYSIS_CHARS = 40_000
 
 LOG_COMMENT_MARKER = "<!-- ci-monitor-suspect-pr-log -->"
+_VOTES_MARK = "<!-- suspect-pr-votes"
+_VOTE_MARK = "<!-- suspect-vote"
 _PR_MARKER = "<!-- amd-bot-suspect-pr:{cluster} -->"
 _PR_MARKER_RE = re.compile(r"<!-- amd-bot-suspect-pr:(R\d+) -->")
 # On a comment that asks the suspect PR's author to review an open fix PR.
@@ -149,6 +179,8 @@ class Decision:
     # Set when the comment asks the PR's author to review an open fix PR.
     fix: dict | None = None
     pr_author: str = ""
+    # {"confirmed": n, "voters": m, "reasons": [...]} once verified.
+    votes: dict | None = None
 
 
 def check_fix(fix_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:
@@ -302,9 +334,15 @@ def render_pr_comment(d: Decision, job_info: dict[int, dict]) -> str:
         "",
         # Says amd-bot even while another account's token does the posting.
         f"<sub>Posted automatically by [amd-bot](https://github.com/amd-bot), the AMD CI monitor. "
-        f"Confidence: {s['confidence']}.</sub>",
+        f"Confidence: {s['confidence']}.{_votes_note(d)}</sub>",
     ]
     return "\n".join(lines)
+
+
+def _votes_note(d: Decision) -> str:
+    if not d.votes:
+        return ""
+    return f" Checked by {d.votes['confirmed']} of {d.votes['voters']} independent verifiers."
 
 
 _RESULT_TEXT = {
@@ -315,8 +353,10 @@ _RESULT_TEXT = {
 }
 
 
-def render_log_comment(decisions: list[Decision], mode: str, snapshot_utc: str) -> str:
-    """The comment on the daily issue recording every decision."""
+def render_log_comment(
+    decisions: list[Decision], mode: str, snapshot_utc: str, vote_cache: dict | None = None,
+) -> str:
+    """The comment on the daily issue recording every decision (and today's votes)."""
     title = "Suspect PR comments" + (" (dry run)" if mode == "dry-run" else "")
     if mode == "dry-run":
         note = (
@@ -332,9 +372,10 @@ def render_log_comment(decisions: list[Decision], mode: str, snapshot_utc: str) 
         f"{note} Last updated {snapshot_utc}.",
         "",
     ]
+    cache_line = f"{_VOTES_MARK} {json.dumps(vote_cache or {}, separators=(',', ':'))} -->"
     if not decisions:
         lines.append("No suspect PRs in today's summary.")
-        return "\n".join(lines)
+        return "\n".join(lines + ["", cache_line])
 
     lines += [
         "| Cluster | PR | Confidence | Failed jobs | Result |",
@@ -347,12 +388,23 @@ def render_log_comment(decisions: list[Decision], mode: str, snapshot_utc: str) 
             result += f" ({d.reason})"
         elif d.fix and d.result in ("post", "posted", "held"):
             result += f" (review request for #{d.fix['number']})"
+        if d.votes and d.result in ("post", "posted", "held"):
+            result += f" (verifiers {d.votes['confirmed']}/{d.votes['voters']})"
         if d.comment_url:
             result = f"[{result}]({d.comment_url})"
         lines.append(
             f"| {s['cluster']} | [#{s['pr']}]({_pr_url(s['pr'])}) | {s['confidence']} "
             f"| {len(d.jobs)} | {result} |"
         )
+    voted = [d for d in decisions if d.votes and d.votes.get("reasons")]
+    if voted:
+        lines += ["", "<details><summary>Verifier votes</summary>", ""]
+        for d in voted:
+            lines.append(f"**#{d.suspect['pr']}** ({d.suspect['cluster']}): "
+                         f"{d.votes['confirmed']}/{d.votes['voters']} confirmed")
+            lines += [f"- {neutralize_mentions(r)}" for r in d.votes["reasons"]]
+            lines.append("")
+        lines.append("</details>")
     for d in decisions:
         if d.body and d.result in ("post", "held"):
             lines += [
@@ -364,7 +416,7 @@ def render_log_comment(decisions: list[Decision], mode: str, snapshot_utc: str) 
                 "",
                 "</details>",
             ]
-    return "\n".join(lines)
+    return "\n".join(lines + ["", cache_line])
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +488,166 @@ def apply_decisions(token: str, decisions: list[Decision], post: bool) -> None:
         log.info("Commented on #%d for %s: %s", d.suspect["pr"], d.suspect["cluster"], d.comment_url)
 
 
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+
+def vote_key(d: Decision) -> str:
+    """Votes are about a PR's commit and a failure window, not a cluster ID."""
+    s = d.suspect
+    return f"{s['pr']}:{(d.full_sha or s['sha'])[:12]}:{s['first_fail_sha'][:12]}"
+
+
+def verify_decisions(decisions: list[Decision], verify, cache: dict) -> None:
+    """Put each postable decision to the verifiers; skip the ones they don't confirm.
+
+    *verify* takes a Decision and returns ``{"confirmed", "voters", "reasons"}``.
+    Results are stored in *cache* (by ``vote_key``) and reused from it.
+    """
+    attempts = 0
+    for d in decisions:
+        if d.result != "post":
+            continue
+        key = vote_key(d)
+        votes = cache.get(key)
+        if votes is None:
+            if attempts >= MAX_VERIFY_PER_RUN:
+                d.result, d.body = "skip", ""
+                d.reason = f"not verified yet (at most {MAX_VERIFY_PER_RUN} per tick)"
+                continue
+            attempts += 1
+            try:
+                votes = verify(d)
+            except Exception as exc:
+                log.warning("Verifying #%d failed (%s)", d.suspect["pr"], exc)
+                d.result, d.body = "skip", ""
+                d.reason = f"verification failed ({' '.join(str(exc).split())[:120]})"
+                continue
+            cache[key] = votes
+        d.votes = votes
+        if votes["confirmed"] < VOTES_REQUIRED:
+            d.result, d.body = "skip", ""
+            d.reason = (f"verifiers confirmed {votes['confirmed']}/{votes['voters']} "
+                        f"(needs {VOTES_REQUIRED})")
+
+
+def render_suspect_context(d: Decision, job_info: dict[int, dict]) -> str:
+    """``.ci-context/suspect.md``: the summary's case against the PR, and the job analyses."""
+    s = d.suspect
+    lines = [
+        f"# Suspect: #{s['pr']} for cluster {s['cluster']}",
+        "",
+        f"- Confidence given by the summary: {s['confidence']}",
+        f"- PR commit: {d.full_sha or s['sha']}",
+        f"- Last passing commit: {s['last_pass_sha']}",
+        f"- First failing commit: {s['first_fail_sha']}",
+    ]
+    if s.get("related_prs"):
+        lines.append("- Also named: " + ", ".join(f"#{n}" for n in s["related_prs"]))
+    if d.fix:
+        lines.append(f"- Open fix PR: #{d.fix['number']} ({d.fix['title']})")
+    lines += ["", "## The summary's evidence", "", s.get("evidence") or "(none given)", "",
+              "## Per-job analyses of the cluster's jobs", ""]
+    for j in d.jobs:
+        info = job_info.get(j) or {}
+        url = f"{info['run_url'].rstrip('/')}/job/{j}" if info.get("run_url") else ""
+        lines += [f"### {info.get('job_name') or j} {url}".rstrip(), "",
+                  (info.get("analysis") or "(no analysis)")[:MAX_ANALYSIS_CHARS], ""]
+    return "\n".join(lines)
+
+
+def agent_verify(d: Decision, job_info: dict[int, dict]) -> dict:
+    """Run ``VERIFIERS`` agents on one suspect, each in a worktree at the first failing commit."""
+    if not claude_code_available():
+        raise RuntimeError("Claude Code CLI not found on the runner")
+    s = d.suspect
+    first_fail = s["first_fail_sha"]
+    job_urls = [
+        f"{job_info[j]['run_url'].rstrip('/')}/job/{j}"
+        for j in d.jobs if (job_info.get(j) or {}).get("run_url")
+    ]
+    prompt = "\n".join([
+        "Task: Suspect PR Verification",
+        f"Cluster: {s['cluster']}",
+        f"Suspect PR: #{s['pr']} ({_pr_url(s['pr'])})",
+        f"PR commit: {d.full_sha or s['sha']}",
+        f"Last passing commit: {s['last_pass_sha']}",
+        f"First failing commit: {first_fail}",
+        "Failing jobs:",
+        *[f"- {u}" for u in job_urls[:MAX_JOBS_LISTED]],
+        "Source: current directory (sglang at the first failing commit)",
+        "GitHub API token: $GH_PAT",
+    ])
+    context = {"suspect.md": render_suspect_context(d, job_info)}
+
+    ensure_sglang_repo()
+    worktrees: list[Path] = []
+    outputs: list = []
+    try:
+        for i in range(1, VERIFIERS + 1):
+            wt = create_agent_worktree(f"suspect-{s['pr']}-v{i}", head_sha=first_fail)
+            worktrees.append(wt)
+            if not checkout_commit(wt, first_fail):
+                raise RuntimeError(f"could not check out {first_fail[:12]}")
+        with ThreadPoolExecutor(max_workers=VERIFIERS) as pool:
+            futures = [
+                pool.submit(
+                    claude_code_analyze,
+                    prompt=f"{prompt}\nVerifier: {i} of {VERIFIERS}",
+                    work_dir=wt,
+                    context_files=context,
+                    max_turns=VERIFY_MAX_TURNS,
+                    timeout_secs=VERIFY_TIMEOUT_SECS,
+                    output_must_contain=_VOTE_MARK,
+                )
+                for i, wt in enumerate(worktrees, 1)
+            ]
+            for fut in futures:
+                exc = fut.exception()
+                outputs.append(exc if exc is not None else fut.result())
+    finally:
+        for wt in worktrees:
+            remove_agent_worktree(wt)
+
+    votes = []
+    for out in outputs:
+        vote = None if isinstance(out, Exception) else parse_block(out, _VOTE_MARK)
+        if vote and vote.get("verdict") in ("confirmed", "refuted", "uncertain"):
+            votes.append(vote)
+        else:
+            log.warning("A verifier of #%d gave no vote (%s)", s["pr"], out if isinstance(out, Exception) else "no block")
+    if len(votes) < VOTES_REQUIRED:
+        raise RuntimeError(f"only {len(votes)} of {VERIFIERS} verifiers finished")
+    return tally_votes(votes, d.jobs)
+
+
+def tally_votes(votes: list[dict], jobs: list[int]) -> dict:
+    """Count confirmations. A confirmation that read none of the cluster's failing
+    logs counts as uncertain: the per-job analyses it would otherwise rest on are
+    the case under review (seen on #46705, where one verifier read only code)."""
+    confirmed, reasons = 0, []
+    for v in votes:
+        verdict = v["verdict"]
+        read = {int(j) for j in v.get("logs_read") or [] if str(j).isdigit()}
+        if verdict == "confirmed" and not read & set(jobs):
+            verdict = "uncertain (confirmed without reading a failing log)"
+        confirmed += verdict == "confirmed"
+        reasons.append(f"{verdict}: {' '.join(str(v.get('reason') or '').split())[:400]}")
+    return {"confirmed": confirmed, "voters": len(votes), "reasons": reasons}
+
+
+def find_log_comment(token: str, bot_repo: str, issue_num: int) -> dict | None:
+    for c in get_issue_comments(token, bot_repo, issue_num):
+        if LOG_COMMENT_MARKER in (c.get("body") or ""):
+            return c
+    return None
+
+
+def parse_vote_cache(body: str) -> dict:
+    data = parse_block(body or "", _VOTES_MARK)
+    return data if isinstance(data, dict) else {}
+
+
 def upsert_log_comment(token: str, bot_repo: str, issue_num: int, body: str, create: bool) -> None:
     for c in get_issue_comments(token, bot_repo, issue_num):
         if LOG_COMMENT_MARKER in (c.get("body") or ""):
@@ -446,7 +658,7 @@ def upsert_log_comment(token: str, bot_repo: str, issue_num: int, body: str, cre
         post_comment(token, bot_repo, issue_num, body)
 
 
-def run(token: str, bot_repo: str, mode: str, date_str: str | None = None) -> int:
+def run(token: str, bot_repo: str, mode: str, date_str: str | None = None, verify: bool = True) -> int:
     if mode == "off":
         log.info("SUSPECT_PR_COMMENTS=off; nothing to do")
         return 0
@@ -468,11 +680,18 @@ def run(token: str, bot_repo: str, mode: str, date_str: str | None = None) -> in
 
     gh = GitHub(token)
     decisions = decide_all(suspects, clusters, job_info, gh, now)
+    log_comment = find_log_comment(token, bot_repo, issue_num) if decisions else None
+    vote_cache = parse_vote_cache((log_comment or {}).get("body", ""))
+    if verify:
+        verify_decisions(decisions, lambda d: agent_verify(d, job_info), vote_cache)
+        for d in decisions:
+            if d.result == "post":
+                d.body = render_pr_comment(d, job_info)
     apply_decisions(token, decisions, post=mode == "post")
     for d in decisions:
         log.info("%s #%d: %s %s", d.suspect["cluster"], d.suspect["pr"], d.result, d.reason)
 
-    body = render_log_comment(decisions, mode, now.strftime("%Y-%m-%d %H:%M UTC"))
+    body = render_log_comment(decisions, mode, now.strftime("%Y-%m-%d %H:%M UTC"), vote_cache)
     upsert_log_comment(token, bot_repo, issue_num, body, create=bool(decisions))
     return 0
 
@@ -491,6 +710,12 @@ def main() -> int:
         default=os.environ.get("BOT_PAT", os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", ""))),
         help="GitHub token (default: BOT_PAT / GH_PAT / GITHUB_TOKEN)",
     )
+    parser.add_argument(
+        "--verify", action=argparse.BooleanOptionalAction,
+        default=(os.environ.get("SUSPECT_PR_VERIFY") or "on").strip().lower() not in ("off", "false", "0", "no"),
+        help="Have independent agents verify each suspect before it is commented on "
+             "(default: on; env SUSPECT_PR_VERIFY=off to disable)",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -504,7 +729,7 @@ def main() -> int:
     if mode not in MODES:
         log.warning("Unknown SUSPECT_PR_COMMENTS=%r; using %s", mode, DEFAULT_MODE)
         mode = DEFAULT_MODE
-    return run(args.github_token, args.bot_repo, mode, args.date)
+    return run(args.github_token, args.bot_repo, mode, args.date, verify=args.verify)
 
 
 if __name__ == "__main__":

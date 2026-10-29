@@ -341,6 +341,6 @@ Please provide a thorough code review covering:
 4. **Security**: Any security issues?
 5. **Testing**: Are the changes adequately tested? What tests should be added?
 6. **Suggestions**: Specific, actionable improvement suggestions with code examples where helpful.
-7. **Overall Assessment**: Approve / Request Changes / Comment, with reasoning.
+7. **Overall**: what most needs attention before merge, in one or two sentences. Do not approve or request changes; a maintainer decides.
 
 Format as clear Markdown. Be constructive and specific. Reference file names and line numbers when possible.

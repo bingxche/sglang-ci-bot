@@ -35,7 +35,7 @@ class TaskRegistryTest(unittest.TestCase):
 
     def test_each_task_gets_only_its_own_methodology(self):
         text = utils.agent_instructions("PR Code Review")
-        self.assertIn("## PR Code Review", text)
+        self.assertIn("## PR Code Review — Find", text)
         self.assertNotIn("## Job Failure Analysis", text)
         self.assertNotIn("## API Mode Prompts", text)
 
@@ -50,6 +50,7 @@ class TaskRegistryTest(unittest.TestCase):
         for name in ("focused-job-analysis", "cross-job-summary", "pr-correlation",
                      "cross-run-pattern-summary", "daily-cross-workflow-summary", "pr-review-api"):
             self.assertTrue(utils.load_prompt_template(name), name)
+        self.assertNotIn("Approve / Request Changes", utils.load_prompt_template("pr-review-api"))
 
 
 class TaskModelTest(unittest.TestCase):
@@ -60,14 +61,13 @@ class TaskModelTest(unittest.TestCase):
             self.assertIsNone(utils.task_model("Job Failure Analysis"))
 
     def test_sonnet_task_uses_the_alias_when_the_runner_maps_it(self):
-        env = {**self.GATEWAY, "ANTHROPIC_DEFAULT_SONNET_MODEL": "Claude-Sonnet-5.5",
-               "AGENT_MODEL_FAILURE_TRACKER_DATA": "sonnet"}
+        env = {**self.GATEWAY, "ANTHROPIC_DEFAULT_SONNET_MODEL": "Claude-Sonnet-5.5"}
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(utils.task_model("Failure Tracker Data"), "sonnet")
+            self.assertEqual(utils.task_model("PR Code Review Verification"), "sonnet")
 
     def test_unmapped_alias_falls_back_to_the_default(self):
-        env = {**self.GATEWAY, "AGENT_MODEL_FAILURE_TRACKER_DATA": "sonnet"}
-        with mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.dict(os.environ, self.GATEWAY, clear=True):
             self.assertIsNone(utils.task_model("Failure Tracker Data"))
 
     def test_env_override(self):
@@ -92,8 +92,7 @@ class ClaudeCommandTest(unittest.TestCase):
         return seen["cmd"]
 
     def test_instructions_settings_and_model(self):
-        env = {"ANTHROPIC_BASE_URL": "https://gw", "ANTHROPIC_DEFAULT_SONNET_MODEL": "S",
-               "AGENT_MODEL_FAILURE_TRACKER_DATA": "sonnet"}
+        env = {"ANTHROPIC_BASE_URL": "https://gw", "ANTHROPIC_DEFAULT_SONNET_MODEL": "S"}
         cmd = self.run_agent("Task: Failure Tracker Data\nDate: x", env)
         system = cmd[cmd.index("--append-system-prompt") + 1]
         self.assertIn("## Ground Rules", system)
@@ -117,11 +116,10 @@ class ClaudeCommandTest(unittest.TestCase):
                     '"AnthropicVertexChatCompletions" is not found!'))
             return subprocess.CompletedProcess(cmd, 0, stdout="votes", stderr="")
 
-        env = {"ANTHROPIC_BASE_URL": "https://gw", "ANTHROPIC_DEFAULT_SONNET_MODEL": "Claude-Sonnet-4.7",
-               "AGENT_MODEL_FAILURE_TRACKER_DATA": "sonnet"}
+        env = {"ANTHROPIC_BASE_URL": "https://gw", "ANTHROPIC_DEFAULT_SONNET_MODEL": "Claude-Sonnet-4.7"}
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(utils.subprocess, "run", side_effect=fake_run):
-            out = utils.claude_code_analyze("Task: Failure Tracker Data\nDate: x", work_dir=Path(tmp))
+            out = utils.claude_code_analyze("Task: PR Code Review Verification\nPR: #1", work_dir=Path(tmp))
         self.assertEqual(out, "votes")
         self.assertEqual(["--model" in c for c in cmds], [True, False])
 
@@ -132,8 +130,7 @@ class ClaudeCommandTest(unittest.TestCase):
             calls.append(cmd)
             return subprocess.CompletedProcess(cmd, 1, stdout="API Error: 500 overloaded", stderr="")
 
-        env = {"ANTHROPIC_BASE_URL": "https://gw", "ANTHROPIC_DEFAULT_SONNET_MODEL": "S",
-               "AGENT_MODEL_FAILURE_TRACKER_DATA": "sonnet"}
+        env = {"ANTHROPIC_BASE_URL": "https://gw", "ANTHROPIC_DEFAULT_SONNET_MODEL": "S"}
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(utils.subprocess, "run", side_effect=fake_run):
             with self.assertRaises(RuntimeError):
