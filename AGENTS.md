@@ -18,6 +18,8 @@ Specifically:
 
 If unsure whether a README update is needed, update it. Outdated docs are worse than no docs.
 
-## CLAUDE.md is the single source of AI instructions
+## agent/ is the single source of AI instructions
 
-All AI behavior — both agent mode (Claude Code CLI) and API mode (direct LLM calls) — is defined in `agent/CLAUDE.md`. Do NOT hardcode prompts or instructions in Python scripts. Scripts should only pass data (task type, metadata, URLs) to the AI; all methodology, output format, and constraints live in CLAUDE.md.
+All AI behavior — both agent mode (Claude Code CLI) and API mode (direct LLM calls) — is defined under `agent/`: the Ground Rules shared by every task in `agent/CLAUDE.md`, one file per task in `agent/tasks/`, and the API-mode templates in `agent/api-prompts.md`. Do NOT hardcode prompts or instructions in Python scripts. Scripts should only pass data (task type, metadata, URLs) to the AI; all methodology, output format, and constraints live in `agent/`.
+
+Keep `agent/CLAUDE.md` short: every agent run carries it. A rule that only one task needs belongs in that task's file. A new `Task:` needs a file in `agent/tasks/` and an entry in `AGENT_TASKS` (`scripts/utils.py`), which also sets its model.

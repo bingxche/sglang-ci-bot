@@ -13,7 +13,7 @@ Design — content (agent) vs state (code), and why they are decoupled
 --------------------------------------------------------------------
 
 - **Content (what failed)** is found by a small, dedicated agent task
-  (``Task: Failure Tracker Data`` in ``agent/CLAUDE.md``). It reads the SAME
+  (``Task: Failure Tracker Data`` in ``agent/tasks/failure-tracker-data.md``). It reads the SAME
   per-job analyses the daily report is built from, and emits ONLY a compact
   JSON array (one row per failing test, tagged with its ``workflow``). Because
   its output is tiny and singular — not appended to the giant Daily
