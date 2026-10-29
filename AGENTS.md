@@ -42,7 +42,7 @@ A change to an agent's instructions or model must be run on real data before mer
 
 Any change to behavior (a feature, refactor, fix, config, prompt or workflow) updates `README.md` in the same PR:
 
-- **New feature, script, workflow or trigger**: add a lane to the diagram in §1, a row to the feature map in §2, and a section in §5.
+- **New feature, script, workflow or trigger**: add a lane to the diagram (edit `docs/architecture.mmd`, then run `docs/render-diagram.sh`), a row to the feature map in §2, and a section in §5.
 - **Changed behavior of a feature**: update its section in §5 (purpose, flow, things to know).
 - **New or changed agent task, instructions or model**: update the task table in §4.
 - **New hidden marker or other state on GitHub**: add it to the markers table in §3.

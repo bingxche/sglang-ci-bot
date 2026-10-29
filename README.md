@@ -20,46 +20,9 @@ This README is the map of the repo: what each part does and why. Implementation 
 
 Each feature is one lane, read left to right: what starts it, which workflow runs, where the LLM is used, what code checks it, and where the result goes.
 
-```mermaid
-flowchart TB
-    classDef trigger fill:#e8eefc,stroke:#5b7bd5,color:#1b2a4a
-    classDef workflow fill:#f4f4f4,stroke:#888,color:#222
-    classDef agent fill:#fff4e0,stroke:#d99a2b,color:#3d2a00
-    classDef code fill:#eaf6ea,stroke:#4c9a4c,color:#173d17
-    classDef output fill:#f3e8fb,stroke:#9a5bc4,color:#341a47
+![The bot's features as lanes: trigger → workflow → LLM agents → code gate → output](docs/architecture.png)
 
-    subgraph L1["① CI monitor"]
-        direction LR
-        A1(["hourly timer<br/>(runner-1)"]):::trigger --> A2["ci-monitor.yml"]:::workflow --> A3{{"agents: per job →<br/>per workflow →<br/>daily summary"}}:::agent --> A4[("daily issue<br/>in this repo")]:::output --> A5["finalize: code checks<br/>+ 3 verifier agents"]:::code --> A6[("sglang: suspect-PR<br/>comments, trackers")]:::output
-    end
-
-    subgraph L2["② @amd-bot review"]
-        direction LR
-        B1(["@amd-bot review"]):::trigger --> B2["watcher →<br/>pr-review.yml"]:::workflow --> B3{{"4 reviewer agents"}}:::agent --> B4["code checks<br/>+ 3 verifier agents"]:::code --> B5[("review on<br/>the sglang PR")]:::output
-    end
-
-    subgraph L3["③ @amd-bot ci-status"]
-        direction LR
-        C1(["@amd-bot ci-status"]):::trigger --> C2["watcher →<br/>ci-status-check.yml"]:::workflow --> C3["evidence pack<br/>(code)"]:::code --> C4{{"attribution agent"}}:::agent --> C5["verdicts checked<br/>against evidence"]:::code --> C6[("comment on<br/>the sglang PR")]:::output
-    end
-
-    subgraph L4["④ On-demand analysis"]
-        direction LR
-        D1(["Actions tab:<br/>run or job URL"]):::trigger --> D2["analyze-ci.yml"]:::workflow --> D3{{"agents: each job,<br/>cross-job"}}:::agent --> D4[("Analyze issue<br/>in this repo")]:::output
-    end
-
-    subgraph L5["⑤ Notion staging"]
-        direction LR
-        E1(["daily schedule"]):::trigger --> E2["notion-staging.yml"]:::workflow --> E3{{"candidates agent<br/>(reads daily issues)"}}:::agent --> E4["stability gate<br/>+ dedup (code)"]:::code --> E5[("Notion<br/>staging table")]:::output
-    end
-
-    subgraph L6["⑥ Coverage audit"]
-        direction LR
-        F1(["weekly schedule"]):::trigger --> F2["coverage-audit.yml"]:::workflow --> F3{{"audit agents<br/>(prompt lives in<br/>ROCm/sglang-ci)"}}:::agent --> F4["validate + test<br/>(code)"]:::code --> F5[("PR merged into<br/>ROCm/sglang-ci")]:::output
-    end
-
-    L1 ~~~ L2 ~~~ L3 ~~~ L4 ~~~ L5 ~~~ L6
-```
+<sub>Source: [`docs/architecture.mmd`](docs/architecture.mmd) (Mermaid). After editing it, re-render the image with [`docs/render-diagram.sh`](docs/render-diagram.sh); `tests/test_readme.py` fails if the image is older than its source.</sub>
 
 **Colors.** 🔵 trigger · ⬜ GitHub Actions workflow · 🟧 LLM agents · 🟩 deterministic code · 🟪 where results go.
 
@@ -578,6 +541,7 @@ scripts/          everything that runs (see the feature map)
 tests/            unittest suites, one per script area; test_readme.py checks this README
 evals/            hand-labelled CI-status cases
 runner/           Dockerfile, setup.sh, entrypoint.sh for the self-hosted runners
+docs/             architecture.mmd (diagram source), architecture.png (rendered), render-diagram.sh
 .github/
   workflows/        one workflow per feature, plus pr-checks.yml
   pull_request_template.md   the README / Design rules / Validated lines

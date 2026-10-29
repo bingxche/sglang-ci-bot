@@ -59,6 +59,22 @@ class ReadmeLinksTest(unittest.TestCase):
         self.assertEqual(missing, [], "README names functions that are not defined in scripts/")
 
 
+class DiagramTest(unittest.TestCase):
+    def test_image_was_rendered_from_the_current_source(self):
+        import hashlib
+        source = (ROOT / "docs" / "architecture.mmd").read_bytes().replace(b"\r\n", b"\n")
+        recorded = (ROOT / "docs" / "architecture.png.source-sha256").read_text().strip()
+        self.assertEqual(
+            hashlib.sha256(source).hexdigest(), recorded,
+            "docs/architecture.mmd changed after docs/architecture.png was rendered; "
+            "run docs/render-diagram.sh and commit the new image",
+        )
+
+    def test_readme_shows_the_image(self):
+        self.assertIn("](docs/architecture.png)", README)
+        self.assertNotIn("```mermaid", README, "the diagram's source lives in docs/architecture.mmd only")
+
+
 class ReadmeCoverageTest(unittest.TestCase):
     def test_every_script_workflow_and_task_file_is_mentioned(self):
         names = [p.name for p in SCRIPTS]
