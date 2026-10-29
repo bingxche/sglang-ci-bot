@@ -301,6 +301,18 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(spc.parse_vote_cache(body), cache)
         self.assertEqual(spc.parse_vote_cache(spc.render_log_comment([], "post", "t")), {})
 
+    def test_a_confirmation_must_have_read_a_failing_log(self):
+        votes = [
+            {"verdict": "confirmed", "logs_read": [1, 99], "reason": "read job 1"},
+            {"verdict": "confirmed", "logs_read": [], "reason": "code only"},
+            {"verdict": "confirmed", "logs_read": ["2"], "reason": "read job 2"},
+            {"verdict": "refuted", "reason": "later pass"},
+        ]
+        out = spc.tally_votes(votes, [1, 2])
+        self.assertEqual((out["confirmed"], out["voters"]), (2, 4))
+        self.assertTrue(out["reasons"][1].startswith("uncertain (confirmed without reading a failing log)"))
+        self.assertEqual(spc.tally_votes([{"verdict": "confirmed", "logs_read": [7]}], [1, 2])["confirmed"], 0)
+
     def test_suspect_context_has_the_case_and_the_analyses(self):
         [d] = self.decisions()
         job_info = {1: {"run_url": RUN, "job_name": "stage-b", "analysis": "### Commit Info\nboom"}}

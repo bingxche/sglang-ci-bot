@@ -7,7 +7,7 @@ The prompt gives the cluster, the suspect PR and its commit, the last passing an
 Check:
 
 1. **The change.** Read the PR's diff (`git show <commit>`, or the GitHub API for the PR's files). Does it change code on the path the failing tests run or that appears in the stack traces? Name the file and function that connect the change to the failure.
-2. **The failures.** Read the logs of at least two failing jobs (GitHub API). Is the failure signature what that change would cause?
+2. **The failures.** Download and read the logs of at least two failing jobs yourself (GitHub API, `/actions/jobs/<id>/logs`). Is the failure signature what that change would cause? `suspect.md` is the case you are checking, not evidence for it: never confirm from its analyses alone. If you could not read any failing log, vote `uncertain`.
 3. **Other explanations.** List the commits in `last_pass..first_fail` (`git log --oneline`). Another commit touching the same path, a change of CI image or dependency (aiter, ROCm, torch), or a runner or infrastructure failure is an alternative. An alternative you cannot rule out is a reason not to confirm.
 4. **Later runs.** If a failing test passed on a commit after the suspect PR, without a fix in between, the attribution is wrong.
 
@@ -17,10 +17,11 @@ Vote:
 - `refuted`: the evidence contradicts the attribution.
 - `uncertain`: neither.
 
-Your final message is only this block:
+`logs_read` lists the job IDs whose logs you read. Your final message is only this block:
 
 ```
 <!-- suspect-vote
-{"verdict": "confirmed", "reason": "Two to four sentences citing file:function, commits and job links."}
+{"verdict": "confirmed", "logs_read": [122989040460, 122989040546],
+ "reason": "Two to four sentences citing file:function, commits and job links."}
 -->
 ```

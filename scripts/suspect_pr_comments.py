@@ -618,11 +618,22 @@ def agent_verify(d: Decision, job_info: dict[int, dict]) -> dict:
             log.warning("A verifier of #%d gave no vote (%s)", s["pr"], out if isinstance(out, Exception) else "no block")
     if len(votes) < VOTES_REQUIRED:
         raise RuntimeError(f"only {len(votes)} of {VERIFIERS} verifiers finished")
-    return {
-        "confirmed": sum(v["verdict"] == "confirmed" for v in votes),
-        "voters": len(votes),
-        "reasons": [f"{v['verdict']}: {' '.join(str(v.get('reason') or '').split())[:400]}" for v in votes],
-    }
+    return tally_votes(votes, d.jobs)
+
+
+def tally_votes(votes: list[dict], jobs: list[int]) -> dict:
+    """Count confirmations. A confirmation that read none of the cluster's failing
+    logs counts as uncertain: the per-job analyses it would otherwise rest on are
+    the case under review (seen on #46705, where one verifier read only code)."""
+    confirmed, reasons = 0, []
+    for v in votes:
+        verdict = v["verdict"]
+        read = {int(j) for j in v.get("logs_read") or [] if str(j).isdigit()}
+        if verdict == "confirmed" and not read & set(jobs):
+            verdict = "uncertain (confirmed without reading a failing log)"
+        confirmed += verdict == "confirmed"
+        reasons.append(f"{verdict}: {' '.join(str(v.get('reason') or '').split())[:400]}")
+    return {"confirmed": confirmed, "voters": len(votes), "reasons": reasons}
 
 
 def find_log_comment(token: str, bot_repo: str, issue_num: int) -> dict | None:

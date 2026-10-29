@@ -36,7 +36,8 @@ DATE = os.environ.get("VALIDATE_DATE") or datetime.now(timezone.utc).strftime("%
 def monitor():
     import monitor_ci
     wf = os.environ.get("VALIDATE_WORKFLOW", "nightly-amd-mi355x-disagg.yml")
-    failed = monitor_ci.run_oneshot(TOKEN, None, "stdout", [wf], 24, "main", use_agent=True)
+    hours = int(os.environ.get("VALIDATE_HOURS", "24"))
+    failed = monitor_ci.run_oneshot(TOKEN, None, "stdout", [wf], hours, "main", use_agent=True)
     print("FAILED WORKFLOWS:", failed)
 
 
