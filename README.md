@@ -18,7 +18,7 @@ This README is the map of the repo: what each part does and why. Implementation 
 
 ## 1. The big picture
 
-Each feature is one lane, read left to right: what starts it, which workflow runs, where the LLM is used, what code checks it, and where the result goes.
+Each feature is one lane. The bold box on the left says what it is for; the rest reads left to right: what starts it, which workflow runs, where the LLM is used, what code checks it, and where the result goes.
 
 ![The bot's features as lanes: trigger → workflow → LLM agents → code gate → output](docs/architecture.png)
 
@@ -347,7 +347,18 @@ The agent never receives the Notion token. Manual runs default to `dry-run`.
 
 ### 5.9 Coverage exclusion audit
 
-[`coverage-audit.yml`](.github/workflows/coverage-audit.yml) runs here only because these runners can reach the gateway; its code, prompt and ledger live in ROCm/sglang-ci (`upstream_ci/coverage_audit/`). Weekly, it decides which NVIDIA-only tests can never run on ROCm, and opens and merges (`--admin`) a PR adding them to `AMD_EXCLUSION_REASONS`. That keeps the AMD-vs-NVIDIA coverage number on ROCm/sglang-ci's `/coverage` page honest.
+**Purpose.** Keep the AMD test-coverage number honest.
+- ROCm/sglang-ci's `/coverage` page lists the sglang tests that run on NVIDIA CI but not on AMD CI, and computes AMD coverage from that list.
+- Some of those tests can never run on AMD (CUDA-only kernels, NVIDIA-only features). They are not real gaps, and counting them understates coverage and sends people after tests that should not be ported.
+
+**Flow** ([`coverage-audit.yml`](.github/workflows/coverage-audit.yml), every Monday):
+1. Find the tests that newly appeared in the gap list.
+2. Agents read each test file and decide whether it can ever run on ROCm, and why.
+3. Code validates the answers and adds the never-on-ROCm tests to `AMD_EXCLUSION_REASONS`.
+4. It runs ROCm/sglang-ci's tests, and checks that the gap list shrank by exactly those files.
+5. It opens a PR in ROCm/sglang-ci and merges it (`--admin`).
+
+It runs in this repo only because these runners can reach the LLM gateway. Its code, prompt and ledger live in ROCm/sglang-ci (`upstream_ci/coverage_audit/`).
 
 It is the most isolated job in this repo:
 - it works in `$RUNNER_TEMP`;
