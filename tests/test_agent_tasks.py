@@ -143,6 +143,30 @@ class ClaudeCommandTest(unittest.TestCase):
                 utils.claude_code_analyze("no task line", work_dir=Path(tempfile.gettempdir()))
 
 
+class BrokenRepoTest(unittest.TestCase):
+    def test_repo_without_a_valid_head_is_cloned_again(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd[:3])
+            if cmd[:2] == ["git", "clone"]:
+                (Path(cmd[-1]) / ".git").mkdir(parents=True)
+            bad_head = cmd[:2] == ["git", "rev-parse"]
+            return subprocess.CompletedProcess(cmd, 1 if bad_head else 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "sglang"
+            (repo / ".git").mkdir(parents=True)
+            (repo / "stale.txt").write_text("x")
+            with mock.patch.object(utils, "AGENT_WORKSPACE", Path(tmp)), \
+                    mock.patch.object(utils, "SGLANG_REPO_PATH", repo), \
+                    mock.patch.object(utils.subprocess, "run", side_effect=fake_run):
+                utils.ensure_sglang_repo()
+            self.assertFalse((repo / "stale.txt").exists())
+        self.assertEqual([c[:2] for c in calls],
+                         [["git", "fetch"], ["git", "reset"], ["git", "rev-parse"], ["git", "clone"]])
+
+
 class StaleClaudeMdTest(unittest.TestCase):
     def test_an_old_deployed_copy_is_removed(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -2098,7 +2098,17 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
                 ["git", "checkout", "FETCH_HEAD", "--force"],
                 cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
             )
-    else:
+        # Seen on runner-7: HEAD stopped resolving ("invalid reference: HEAD"),
+        # so every worktree failed. A fresh clone is cheap; a broken one stays broken.
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            cwd=SGLANG_REPO_PATH, capture_output=True, text=True, timeout=30,
+        )
+        if head.returncode != 0:
+            _agent_log.warning("sglang repo at %s has no valid HEAD; cloning it again", SGLANG_REPO_PATH)
+            shutil.rmtree(SGLANG_REPO_PATH)
+
+    if not (SGLANG_REPO_PATH / ".git").exists():
         if SGLANG_REPO_PATH.exists():
             shutil.rmtree(SGLANG_REPO_PATH)
         _agent_log.info("Cloning sglang repo to %s...", SGLANG_REPO_PATH)
