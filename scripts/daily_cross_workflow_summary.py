@@ -26,7 +26,7 @@ On each invocation:
     the legacy summary comment for issues that pre-date the body-pinning
     move) for trend / NEW-cluster detection.
   - Run the agent (``Task: Daily Cross-Workflow Summary``) which reads the
-    methodology in ``agent/CLAUDE.md`` and produces a Markdown report.
+    methodology in ``agent/tasks/daily-cross-workflow-summary.md`` and produces a Markdown report.
   - PATCH the issue body, replacing the content between the placeholder
     markers (matching the legacy ``ci-monitor-daily-status-board`` markers
     too, so older issues migrate in place). If the markers are missing,
@@ -36,7 +36,7 @@ On each invocation:
 
 Output methodology (cluster IDs, confidence labels, no-priority rule,
 in-flight-fix lookup, completed-runs-only filter) lives entirely in
-``agent/CLAUDE.md`` under ``## Daily Cross-Workflow Summary``.
+``agent/tasks/daily-cross-workflow-summary.md``.
 This script is a data-only harness.
 """
 
@@ -258,7 +258,7 @@ def build_agent_prompt(
 ) -> str:
     """Compose the data-only prompt for ``Task: Daily Cross-Workflow Summary``.
 
-    Methodology and output format live in ``agent/CLAUDE.md``. This prompt
+    Methodology and output format live in ``agent/tasks/daily-cross-workflow-summary.md``. This prompt
     only routes the task and points to the context files written into
     ``.ci-context/`` by ``claude_code_analyze``.
     """
@@ -336,7 +336,7 @@ def run_api(
     """
     template = load_prompt_template("daily-cross-workflow-summary")
     if not template:
-        log.error("daily-cross-workflow-summary template not found in CLAUDE.md")
+        log.error("daily-cross-workflow-summary template not found in agent/api-prompts.md")
         return None
 
     prompt = template.format(

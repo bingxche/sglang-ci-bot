@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -635,13 +636,13 @@ def render_miles_evidence(
         lines += [
             "",
             "The dashboard payload could not be fetched, so there is no evidence "
-            "beyond the job itself. Follow the Miles workflow fallback in CLAUDE.md.",
+            "beyond the job itself. Follow the Miles workflow fallback in your task instructions.",
         ]
     elif not rows:
         lines += [
             "",
             "The dashboard has no row for this job yet (its log may still be "
-            "queued there). Follow the Miles workflow fallback in CLAUDE.md.",
+            "queued there). Follow the Miles workflow fallback in your task instructions.",
         ]
 
     for n, row in enumerate(rows, 1):
@@ -1453,14 +1454,14 @@ def build_artifact_context_excerpt(
 
 
 # ---------------------------------------------------------------------------
-# Prompt template loading from CLAUDE.md
+# Agent instructions (agent/) and API-mode prompt templates
 # ---------------------------------------------------------------------------
 
-def _find_claude_md() -> Path | None:
-    """Locate the CLAUDE.md file (checks multiple candidate paths)."""
+def _find_agent_file(name: str) -> Path | None:
+    """Locate ``agent/<name>`` in the bot repo (checks multiple candidate roots)."""
     candidates = [
-        Path(__file__).resolve().parent.parent / "agent" / "CLAUDE.md",
-        Path("/tmp/bot/agent/CLAUDE.md"),
+        Path(__file__).resolve().parent.parent / "agent" / name,
+        Path("/tmp/bot/agent") / name,
     ]
     for p in candidates:
         if p.exists():
@@ -1468,18 +1469,89 @@ def _find_claude_md() -> Path | None:
     return None
 
 
+@dataclass(frozen=True)
+class AgentTask:
+    doc: str          # methodology file under agent/tasks/
+    model: str = ""   # "" = the runner's default (ANTHROPIC_MODEL)
+
+
+# Every agent task, keyed by the prompt's ``Task:`` line. All use the runner's
+# default model (ANTHROPIC_MODEL); give one its own with ``model=`` here, or
+# AGENT_MODEL_<TASK> (e.g. AGENT_MODEL_FAILURE_TRACKER_DATA=sonnet).
+AGENT_TASKS: dict[str, AgentTask] = {
+    "Job Failure Analysis": AgentTask("job-failure-analysis.md"),
+    "Cross-Job Summary": AgentTask("cross-job-summary.md"),
+    "Cross-Run Pattern Analysis": AgentTask("cross-run-pattern-analysis.md"),
+    "Daily Cross-Workflow Summary": AgentTask("daily-cross-workflow-summary.md"),
+    "Failure Tracker Data": AgentTask("failure-tracker-data.md"),
+    "SGLang AMD CI Staging Candidates": AgentTask("staging-candidates.md"),
+    "PR CI Status Check": AgentTask("pr-ci-status-check.md"),
+    "PR Code Review": AgentTask("pr-code-review.md"),
+}
+
+_MODEL_ALIASES = ("opus", "sonnet", "haiku")
+# The gateway's answer for a model name it has no deployment of, e.g.
+# 'API Error: 400 Deployment of "Claude-Sonnet-4.7" for "..." is not found!'
+_MODEL_UNAVAILABLE_RE = re.compile(
+    r"API Error: 40[04].*(?:Deployment of .* not found|model.*(?:not found|not_found|does not exist))",
+    re.IGNORECASE,
+)
+
+
+def task_name(prompt: str) -> str:
+    """The task named by the prompt's first line (``Task: <name>``)."""
+    first = prompt.split("\n", 1)[0]
+    return first.removeprefix("Task:").strip() if first.startswith("Task:") else ""
+
+
+def agent_instructions(task: str) -> str:
+    """Shared rules (agent/CLAUDE.md) followed by the task's methodology."""
+    spec = AGENT_TASKS.get(task)
+    if spec is None:
+        raise RuntimeError(f"Unknown agent task {task!r}; add it to AGENT_TASKS")
+    parts = []
+    for name in ("CLAUDE.md", f"tasks/{spec.doc}"):
+        path = _find_agent_file(name)
+        if path is None:
+            raise RuntimeError(f"agent/{name} not found")
+        parts.append(path.read_text().strip())
+    return "\n\n---\n\n".join(parts) + "\n"
+
+
+def task_model(task: str) -> str | None:
+    """The ``--model`` value for *task*, or None for the runner's default.
+
+    Through the LLM gateway an alias only works when the runner maps it
+    (ANTHROPIC_DEFAULT_<ALIAS>_MODEL); an unmapped alias would name a model
+    the gateway does not serve, so the task keeps the default instead.
+    """
+    spec = AGENT_TASKS.get(task)
+    slug = re.sub(r"[^A-Z0-9]+", "_", task.upper()).strip("_")
+    model = os.environ.get(f"AGENT_MODEL_{slug}") or (spec.model if spec else "")
+    if not model:
+        return None
+    if (model in _MODEL_ALIASES and os.environ.get("ANTHROPIC_BASE_URL")
+            and not os.environ.get(f"ANTHROPIC_DEFAULT_{model.upper()}_MODEL")):
+        logging.getLogger("claude-agent").warning(
+            "%s: model alias %r is not mapped on this runner; using the default model",
+            task, model,
+        )
+        return None
+    return model
+
+
 _TEMPLATE_HEADING_RE = re.compile(r"^### ([a-z][a-z0-9-]+)$", re.MULTILINE)
 
 
 def load_prompt_template(section_name: str) -> str | None:
-    """Load a prompt template from CLAUDE.md by section heading.
+    """Load a prompt template from agent/api-prompts.md by section heading.
 
     Looks for ``### <section_name>`` (kebab-case) under ``## API Mode Prompts``
     and returns the text up to the next kebab-case ``### `` heading or
     section end.  Content headings like ``### Failure Summary`` (Title Case)
     inside the template are preserved.
     """
-    path = _find_claude_md()
+    path = _find_agent_file("api-prompts.md")
     if path is None:
         return None
 
@@ -1518,7 +1590,7 @@ def analyze_job_with_agent(
     GitHub API (using ``$GH_PAT`` from the environment), parsing errors,
     reading sglang source code, checking git history, and producing a
     root-cause analysis.  Investigation methodology is defined in
-    ``CLAUDE.md`` which Claude Code reads automatically.
+    ``agent/tasks/job-failure-analysis.md``, appended to the system prompt.
 
     *run_jobs* (the failed jobs of the same run) only matter when this job's
     runner was lost: the other lost jobs are listed for the agent.
@@ -1715,7 +1787,7 @@ def focused_job_analysis(
 ) -> str:
     """Analyze a failed CI job using pre-extracted errors and pre-filtered logs.
 
-    Prompt template is loaded from CLAUDE.md ``### focused-job-analysis``.
+    Prompt template is loaded from agent/api-prompts.md ``### focused-job-analysis``.
     """
     if error_lines:
         errors_section = "\n".join(
@@ -1931,7 +2003,7 @@ def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
                 f"git worktree add failed: {result.stderr.decode(errors='replace')}"
             )
 
-    _deploy_claude_md(wt_path)
+    _remove_deployed_claude_md(wt_path)
     _agent_log.info("Worktree ready at %s", wt_path)
     return wt_path
 
@@ -2022,7 +2094,17 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
                 ["git", "checkout", "FETCH_HEAD", "--force"],
                 cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
             )
-    else:
+        # Seen on runner-7: HEAD stopped resolving ("invalid reference: HEAD"),
+        # so every worktree failed. A fresh clone is cheap; a broken one stays broken.
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            cwd=SGLANG_REPO_PATH, capture_output=True, text=True, timeout=30,
+        )
+        if head.returncode != 0:
+            _agent_log.warning("sglang repo at %s has no valid HEAD; cloning it again", SGLANG_REPO_PATH)
+            shutil.rmtree(SGLANG_REPO_PATH)
+
+    if not (SGLANG_REPO_PATH / ".git").exists():
         if SGLANG_REPO_PATH.exists():
             shutil.rmtree(SGLANG_REPO_PATH)
         _agent_log.info("Cloning sglang repo to %s...", SGLANG_REPO_PATH)
@@ -2042,30 +2124,22 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
                 cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
             )
 
-    _deploy_claude_md()
+    _remove_deployed_claude_md()
     _agent_log.info("sglang repo ready at %s", SGLANG_REPO_PATH)
     return SGLANG_REPO_PATH
 
 
-def _deploy_claude_md(target_dir: Path | None = None):
-    """Copy agent/CLAUDE.md to the workspace (or a specific directory).
+def _remove_deployed_claude_md(target_dir: Path | None = None):
+    """Delete a CLAUDE.md an older bot version copied above the worktrees.
 
-    Checks multiple possible locations for the bot repo source tree
-    (GitHub Actions checkout, daemon clone at /tmp/bot, relative to
-    this script).  Always overwrites so the latest version is used.
+    The agent's instructions now arrive through ``--append-system-prompt``
+    (see ``agent_instructions()``); a stale full copy left in the workspace
+    would be loaded alongside them.
     """
-    candidates = [
-        Path(__file__).resolve().parent.parent / "agent" / "CLAUDE.md",
-        Path("/tmp/bot/agent/CLAUDE.md"),
-    ]
-    dest_parent = target_dir.parent if target_dir else AGENT_WORKSPACE
-    for src in candidates:
-        if src.exists():
-            dst = dest_parent / "CLAUDE.md"
-            shutil.copy2(src, dst)
-            _agent_log.info("Deployed CLAUDE.md to %s", dst)
-            return
-    _agent_log.warning("agent/CLAUDE.md not found, skipping deployment")
+    stale = (target_dir.parent if target_dir else AGENT_WORKSPACE) / "CLAUDE.md"
+    if stale.exists():
+        stale.unlink()
+        _agent_log.info("Removed stale %s", stale)
 
 
 _SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS", "GH_PAT", "GH_TOKEN",
@@ -2096,7 +2170,9 @@ def _archive_agent_session(work_dir: Path, started_at: float, prompt: str) -> No
         return
     try:
         task = prompt.split("\n", 1)[0].removeprefix("Task:").strip() or "agent"
-        dest = Path(archive_root) / f"{time.strftime('%Y%m%d-%H%M%S')}-{_safe_name(task)}"
+        # Parallel agents (review verifiers) can finish in the same second.
+        stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(3).hex()}"
+        dest = Path(archive_root) / f"{stamp}-{_safe_name(task)}"
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "prompt.txt").write_text(redact_secrets(prompt))
         cwd = str(work_dir.resolve())
@@ -2339,15 +2415,24 @@ def claude_code_analyze(
     *work_dir* so the agent can read them, runs ``claude -p``, and
     returns the text output.
 
+    The prompt's ``Task:`` line picks the instructions (``agent/CLAUDE.md``
+    plus that task's file under ``agent/tasks/``), which are appended to the
+    system prompt, and the model (``task_model()``). Only user-level settings
+    are loaded: the working directory is an sglang checkout, often a PR's,
+    whose ``.claude/`` (settings, hooks, rules) anyone can write.
+
     If *output_must_contain* is set and the agent's final stdout does
     not contain that substring, scan the session log for the last
     assistant message that does — this catches the failure mode where
     the agent writes the canonical report and then overwrites it with
     a short reply like "already delivered above".
 
-    Raises ``RuntimeError`` on failure so callers can fall back to
-    the single-shot API approach.
+    Raises ``RuntimeError`` on failure, including an unknown task.
     """
+    task = task_name(prompt)
+    instructions = agent_instructions(task)
+    model = task_model(task)
+
     context_dir = work_dir / ".ci-context"
     context_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2366,11 +2451,14 @@ def claude_code_analyze(
         if context_files:
             for filename, content in context_files.items():
                 p = context_dir / filename
+                p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(content)
                 written.append(p)
 
         cmd = [
             "claude", "-p", prompt,
+            "--append-system-prompt", instructions,
+            "--setting-sources", "user",
             "--output-format", "text",
             "--max-turns", str(max_turns),
             "--dangerously-skip-permissions",
@@ -2378,21 +2466,37 @@ def claude_code_analyze(
             # fixes or rerun CI); none of the bot's tasks use skills.
             "--disable-slash-commands",
         ]
+        if model:
+            cmd += ["--model", model]
 
         _agent_log.info(
-            "Running Claude Code (max_turns=%d, timeout=%ds, cwd=%s)...",
-            max_turns, timeout_secs, work_dir,
+            "Running Claude Code (task=%s, model=%s, max_turns=%d, timeout=%ds, cwd=%s)...",
+            task, model or "default", max_turns, timeout_secs, work_dir,
         )
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(work_dir),
-            timeout=timeout_secs,
-            stdin=subprocess.DEVNULL,
-            env=env,
-        )
+        def run_cli() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(work_dir),
+                timeout=timeout_secs,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+
+        result = run_cli()
+        if (model and result.returncode != 0
+                and _MODEL_UNAVAILABLE_RE.search(f"{result.stdout}\n{result.stderr}")):
+            # A task model the gateway does not serve (e.g. a stale
+            # ANTHROPIC_DEFAULT_SONNET_MODEL) must not fail the task.
+            _agent_log.warning(
+                "%s: model %r is not served by the gateway (%s); retrying with the default model",
+                task, model, " ".join((result.stdout or result.stderr).split())[:200],
+            )
+            i = cmd.index("--model")
+            del cmd[i:i + 2]
+            result = run_cli()
 
         _agent_log.info(
             "Claude Code exit=%d, stdout=%d chars, stderr=%d chars",
@@ -2451,6 +2555,12 @@ def claude_code_analyze(
         _archive_agent_session(work_dir, started_at, prompt)
         for p in written:
             p.unlink(missing_ok=True)
+        subdirs = {d for p in written for d in p.parents if context_dir in d.parents}
+        for d in sorted(subdirs, key=lambda d: len(d.parts), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
         try:
             context_dir.rmdir()
         except OSError:

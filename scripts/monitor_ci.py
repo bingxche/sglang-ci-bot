@@ -1006,7 +1006,7 @@ def _render_cross_run_summary(
     )
     if agent_text:
         # Cross-Run Pattern Analysis output has no fixed anchor (starts
-        # with a free-form "headline sentence" per CLAUDE.md), so use
+        # with a free-form "headline sentence" per agent/tasks/cross-run-pattern-analysis.md), so use
         # _strip_llm_preamble directly. If the LLM ever drafts the report
         # multiple times here too, we'd need an anchor; for now, only the
         # plain preamble strip applies.
@@ -1029,8 +1029,8 @@ def _build_cross_run_prompt(
 ) -> str:
     """Compose a data-only prompt for ``Task: Cross-Run Pattern Analysis``.
 
-    Methodology and output format live in ``agent/CLAUDE.md`` under
-    ``## Cross-Run Pattern Analysis``. This function only assembles the
+    Methodology and output format live in
+    ``agent/tasks/cross-run-pattern-analysis.md``. This function only assembles the
     deterministic data the agent needs (per-run summary + pre-computed
     persistent / regression / flaky buckets) so the same instructions
     don't have to be maintained in two places.
