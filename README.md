@@ -187,7 +187,7 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 
 ### Changing this repo
 
-These rules apply to every change, whether typed by hand or written by an AI tool. [`AGENTS.md`](AGENTS.md) has the full text; Claude Code reads it through the root [`CLAUDE.md`](CLAUDE.md), and Cursor through [`.cursor/rules/`](.cursor/rules/update-readme.mdc).
+These rules apply to every change, whether typed by hand or written by an AI tool. [`AGENTS.md`](AGENTS.md) is the only file that holds them, for every tool. Codex, Cursor, Copilot and most others read it natively; Claude Code reads it through [`CLAUDE.md`](CLAUDE.md), which is the single line `@AGENTS.md`. Any tool-specific rules file may only point to `AGENTS.md` ([`tests/test_agent_rules.py`](tests/test_agent_rules.py) enforces this), so there is never a second copy to keep in sync. And whichever tool wrote a change, [`pr-checks.yml`](.github/workflows/pr-checks.yml) checks the result.
 
 1. **Read §1–§3 first.** Extend the existing patterns (the agent harness, hidden markers, code gates, dry-run variables) rather than inventing parallel ones.
 2. **Stay on direction.** Do not break a design rule silently. A change that bends one names it in the PR, says why, and updates the rule here, which needs the repo owner's approval.
@@ -581,7 +581,6 @@ runner/           Dockerfile, setup.sh, entrypoint.sh for the self-hosted runner
 .github/
   workflows/        one workflow per feature, plus pr-checks.yml
   pull_request_template.md   the README / Design rules / Validated lines
-AGENTS.md         rules for changing this repo, for people and AI tools
-CLAUDE.md         makes Claude Code read AGENTS.md (the bot's own agents never load it)
-.cursor/rules/    makes Cursor read AGENTS.md
+AGENTS.md         the only rules for changing this repo, read by every AI tool
+CLAUDE.md         the one line @AGENTS.md, for Claude Code (the bot's own agents never load it)
 ```

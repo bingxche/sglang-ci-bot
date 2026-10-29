@@ -1,6 +1,15 @@
 # Rules for changing sglang-ci-bot
 
-These rules apply to every change, whether typed by hand or written by an AI tool (Claude Code reads this file through `CLAUDE.md`, Cursor through `.cursor/rules/`, Codex directly). The goal is a repo that stays understandable however many people and agents change it. `pr-checks.yml` enforces the checkable parts on every pull request.
+These rules apply to every change, whether typed by hand or written by an AI tool. The goal is a repo that stays understandable however many people and agents change it. `pr-checks.yml` enforces the checkable parts on every pull request, whoever or whatever wrote the code.
+
+**This file is the only place these rules live.**
+- Codex, Cursor, GitHub Copilot, Windsurf, Zed and Jules read `AGENTS.md` natively.
+- Claude Code reads `CLAUDE.md`, which is the one line `@AGENTS.md`.
+- Other tools can be pointed here too; for example, Gemini CLI can be set to read `AGENTS.md` instead of `GEMINI.md`.
+
+Never write rules into a tool-specific file (`CLAUDE.md`, `GEMINI.md`, `.cursor/rules/`, `.github/copilot-instructions.md`, …). Such a file may only point here. `tests/test_agent_rules.py` fails otherwise, so there is never a second copy to keep in sync.
+
+(These rules are for people and tools changing this repo. The bot's own agents never read them: their instructions are `agent/ground-rules.md` plus `agent/tasks/`, passed explicitly.)
 
 ## 1. Read the map first
 
