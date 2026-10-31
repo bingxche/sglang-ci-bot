@@ -50,6 +50,7 @@ from utils import (
     ensure_sglang_repo,
     get_failed_jobs,
     get_run_jobs,
+    gh_get,
     gh_headers,
     is_gate_job,
     post_comment,
@@ -114,8 +115,15 @@ def workflow_event_filter(workflow_file: str) -> str | None:
 
 
 SUCCESS_CONCLUSIONS = {"success"}
+UNFINISHED_RUN_STATUSES = ("in_progress", "queued", "waiting", "requested", "pending")
+# AMD runs often last 20-40 h (MI35x jobs queue for a day; pr-test-amd 40503413710
+# took 41 h), so a run stays in view while unfinished, up to this age.
+MAX_RUN_AGE_HOURS = 72
 
 STATE_FILE = Path(__file__).parent.parent / ".state" / "ci_monitor.json"
+# Days of per-job analyses kept for reuse; covers MAX_RUN_AGE_HOURS, so a job
+# of a long run is not analysed again on each new day.
+STATE_DAYS_KEPT = 4
 MAX_PARALLEL_JOBS = 3
 
 
@@ -145,8 +153,8 @@ def load_state() -> dict:
 def save_state(state: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     dc = state.get("daily_comments", {})
-    if len(dc) > 3:
-        for d in sorted(dc.keys())[:-3]:
+    if len(dc) > STATE_DAYS_KEPT:
+        for d in sorted(dc.keys())[:-STATE_DAYS_KEPT]:
             del dc[d]
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
@@ -227,36 +235,60 @@ def get_workflow_runs(
     branch: str = "main",
     event: str | None = None,
 ) -> list[dict]:
-    """Fetch recent non-success completed runs AND in-progress runs.
+    """The runs whose failed jobs may need analysing, unfinished runs first.
 
-    In-progress runs are included so that already-failed jobs within them
-    can be analyzed immediately, without waiting for the entire workflow
-    to finish.
+    - Every unfinished run (in progress, queued, ...) created in the last
+      ``MAX_RUN_AGE_HOURS``, so a job that fails long after its run started is
+      still seen. Their already-failed jobs are analysed without waiting for
+      the rest of the run.
+    - Completed non-success runs that finished in the last ``hours_back``
+      (by ``updated_at``, not creation), newest first, at most ``max_runs``.
+      The cap never drops an unfinished run.
     """
-    since = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+    now = datetime.now(timezone.utc)
+    finished_since = now - timedelta(hours=hours_back)
+    created_since = now - timedelta(hours=max(hours_back, MAX_RUN_AGE_HOURS))
     url = f"https://api.github.com/repos/{REPO}/actions/workflows/{workflow_file}/runs"
     base_params = {
         "branch": branch,
-        "per_page": min(max_runs * 5, 100),
-        "created": f">={since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        "per_page": 100,
+        "created": f">={created_since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
     }
     if event:
         base_params["event"] = event
 
-    all_runs: list[dict] = []
-    seen_ids: set[int] = set()
-    for status in ("completed", "in_progress", "queued", "waiting", "requested"):
-        params = {**base_params, "status": status}
-        resp = requests.get(url, headers=gh_headers(token), params=params)
+    def fetch(status: str) -> list[dict]:
+        resp = gh_get(url, headers=gh_headers(token), params={**base_params, "status": status})
         resp.raise_for_status()
-        for r in resp.json().get("workflow_runs", []):
-            if r["id"] in seen_ids:
-                continue
-            if status != "completed" or r.get("conclusion") not in SUCCESS_CONCLUSIONS:
-                seen_ids.add(r["id"])
-                all_runs.append(r)
+        return resp.json().get("workflow_runs", [])
 
-    return all_runs[:max_runs]
+    unfinished: list[dict] = []
+    seen_ids: set[int] = set()
+    for status in UNFINISHED_RUN_STATUSES:
+        for r in fetch(status):
+            if r["id"] not in seen_ids and r.get("status") != "completed":
+                seen_ids.add(r["id"])
+                unfinished.append(r)
+
+    finished = [
+        r for r in fetch("completed")
+        if r["id"] not in seen_ids
+        and r.get("conclusion") not in SUCCESS_CONCLUSIONS
+        and _parse_time(r.get("updated_at")) >= finished_since
+    ]
+    finished.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+    return unfinished + finished[:max_runs]
+
+
+def _parse_time(value: str | None) -> datetime:
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _finished_since(job: dict, since: datetime) -> bool:
+    """Whether a finished job ended at or after *since* (no end time: assume it did)."""
+    return not job.get("completed_at") or _parse_time(job["completed_at"]) >= since
 
 
 
@@ -278,7 +310,7 @@ def get_issue_comments(token: str, bot_repo: str, issue_number: int) -> list[dic
     comments: list[dict] = []
     page = 1
     while True:
-        resp = requests.get(
+        resp = gh_get(
             url, headers=gh_headers(token), params={"per_page": 100, "page": page},
         )
         resp.raise_for_status()
@@ -432,7 +464,7 @@ def find_daily_issue(token: str, bot_repo: str, date_str: str) -> int | None:
     """Find the daily CI monitoring issue if it exists. Returns issue number or None."""
     url = f"https://api.github.com/repos/{bot_repo}/issues"
     params = {"state": "open", "labels": "ci-monitor", "per_page": 50}
-    resp = requests.get(url, headers=gh_headers(token), params=params)
+    resp = gh_get(url, headers=gh_headers(token), params=params)
     resp.raise_for_status()
 
     title = f"[CI Monitor] Daily Report - {date_str}"
@@ -1189,6 +1221,7 @@ def monitor_workflow(
     current GitHub lookup contains the exact same job ID.
     """
     log.info("Monitoring: %s (branch: %s, event: %s)", workflow_file, branch, event or "all")
+    recent_since = datetime.now(timezone.utc) - timedelta(hours=hours_back)
 
     runs = get_workflow_runs(token, workflow_file, hours_back=hours_back, branch=branch, event=event)
     if not runs:
@@ -1220,6 +1253,10 @@ def monitor_workflow(
 
         failed_jobs = get_failed_jobs(token, run_id)
         run_failed_jobs[run_url] = failed_jobs
+        # Failures from the lookback window only. A long run's earlier failures
+        # were analysed by earlier ticks, while it was unfinished and in view,
+        # and would only be replayed into today's report.
+        failed_jobs = [j for j in failed_jobs if _finished_since(j, recent_since)]
         if job_name_filter:
             failed_jobs = [j for j in failed_jobs if job_name_filter in j["name"]]
         if processed_job_ids:

@@ -208,7 +208,11 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 
 1. **prepare**: [`ensure_daily_issue.py`](scripts/ensure_daily_issue.py) creates today's issue, with the summary placeholder, once, before the matrix starts, so parallel jobs cannot create duplicates.
 2. **monitor** (a matrix of one job per workflow, up to 8 at a time), running [`run_oneshot()`](scripts/monitor_ci.py) → [`monitor_workflow()`](scripts/monitor_ci.py):
-   1. **Find the failed jobs.** It lists the workflow's failed and in-progress runs in the last 24 h. Most workflows count scheduled runs only; AMD AITER Scout also counts manual runs ([`workflow_event_filter()`](scripts/monitor_ci.py)). Gate and finish jobs are skipped ([`is_gate_job()`](scripts/utils.py)), and so are jobs already in `processed_job_ids`.
+   1. **Find the failed jobs** ([`get_workflow_runs()`](scripts/monitor_ci.py)). A job is analysed as soon as it fails, without waiting for the rest of its run.
+      - **Which runs are looked at.** Every unfinished run (in progress, queued, waiting, pending) up to 72 h old (`MAX_RUN_AGE_HOURS`), because AMD runs often last 20–40 h while MI35x jobs queue for a day. Also the failed runs that *finished* in the last 24 h, at most 5; this cap never drops an unfinished run.
+      - **Which failed jobs count.** Only those that ended in the last 24 h. A long run's earlier failures were analysed by earlier ticks, while the run was still in view.
+      - **Event filter.** Most workflows count scheduled runs only; AMD AITER Scout also counts manual runs ([`workflow_event_filter()`](scripts/monitor_ci.py)).
+      - **Skipped.** Gate and finish jobs ([`is_gate_job()`](scripts/utils.py)), and jobs already in `processed_job_ids`.
    2. **Analyse each new failed job.** Each gets a Job Failure Analysis agent at the run's commit, 3 in parallel. Some workflows get extra context:
       - `nightly-amd-mi355x-disagg.yml`: the run's server-log artifacts are downloaded ([`prepare_mi355x_artifact_context()`](scripts/utils.py)).
       - Miles workflows: the worktree is moved to the image's sglang commit, radixark/miles is added, and dashboard evidence is written ([`prepare_miles_context()`](scripts/utils.py)).
@@ -226,6 +230,8 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 - **Report order** follows [`MONITORED_WORKFLOWS`](scripts/monitor_ci.py): Docker builds, PR test, nightly, disagg, Miles, AITER Scout. Inside `pr-test-amd.yml`, jobs are grouped by ROCm version (`ROCM_REPORT_ORDER`), PRs' default first, then by stage (`JOB_REPORT_ORDER`).
 - **Every summary layer can fail independently.** If the summary agent fails, the last good summary stays up under a "not refreshed" note and the next tick retries it.
 - **The report date is pinned when a run starts**, so an agent that runs past midnight cannot write into the next day's issue.
+- **Analyses are kept for 4 days** (`STATE_DAYS_KEPT`), longer than the oldest run in view. A job of a long run that appears in a new day's report is therefore copied from the cache, not analysed again.
+- **GitHub reads are retried.** A 5xx or connection error from the GitHub API is retried 3 times, after 5, 15 and 45 s ([`gh_get()`](scripts/utils.py)), so a transient 502 no longer fails a whole monitor job. Writes are not retried: a write that seemed to fail may have succeeded, and a retry would post a duplicate.
 - **Miles workflows** test radixark/miles images. They appear in the report and summary, but not in Notion staging or the Failure Trackers; their failures are radixark/miles' to triage.
 
 ### 5.2 Suspect PR comments
