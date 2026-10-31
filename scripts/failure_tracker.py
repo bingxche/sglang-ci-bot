@@ -67,6 +67,7 @@ from utils import (
     create_github_issue,
     ensure_sglang_repo,
     get_issue,
+    gh_get,
     gh_headers,
     update_issue_body,
 )
@@ -409,7 +410,7 @@ def render_body(
 def find_tracker_issue(token: str, title: str) -> int | None:
     """Find an open issue with EXACTLY this title on the upstream repo."""
     q = f'repo:{REPO} is:issue is:open in:title "{title}"'
-    resp = requests.get(
+    resp = gh_get(
         "https://api.github.com/search/issues",
         headers=gh_headers(token), params={"q": q, "per_page": 20},
     )

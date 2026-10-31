@@ -749,3 +749,165 @@ class RunOneshotReuseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+
+
+def _iso(hours_ago: float) -> str:
+    return (NOW - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run(run_id: int, status: str, conclusion: str | None, created_h: float, updated_h: float) -> dict:
+    return {"id": run_id, "status": status, "conclusion": conclusion,
+            "created_at": _iso(created_h), "updated_at": _iso(updated_h)}
+
+
+class WorkflowRunSelectionTests(unittest.TestCase):
+    """Runs often last 20-40 h; failed jobs late in a run must still be analysed."""
+
+    def select(self, by_status: dict[str, list[dict]], **kwargs) -> tuple[list[dict], list[dict]]:
+        calls = []
+
+        def fake_get(url, headers=None, params=None, **_):
+            calls.append(params)
+            resp = Mock(status_code=200)
+            resp.json.return_value = {"workflow_runs": by_status.get(params["status"], [])}
+            return resp
+
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return NOW
+
+        with patch.object(monitor_ci.requests, "get", side_effect=fake_get), \
+                patch.object(monitor_ci, "datetime", FrozenDatetime):
+            runs = monitor_ci.get_workflow_runs("token", "pr-test-amd.yml", **kwargs)
+        return runs, calls
+
+    def test_unfinished_run_older_than_the_window_is_kept(self):
+        # pr-test-amd 40503413710: created 10-27 12:23, its last jobs ran 10-29 05:22.
+        runs, calls = self.select({"in_progress": [_run(1, "in_progress", None, 30, 0.5)]})
+        self.assertEqual([r["id"] for r in runs], [1])
+        self.assertEqual(calls[0]["created"], ">=" + _iso(monitor_ci.MAX_RUN_AGE_HOURS))
+
+    def test_pending_runs_are_queried(self):
+        runs, calls = self.select({"pending": [_run(2, "pending", None, 5, 5)]})
+        self.assertIn("pending", [c["status"] for c in calls])
+        self.assertEqual([r["id"] for r in runs], [2])
+
+    def test_completed_runs_are_chosen_by_when_they_finished(self):
+        completed = [
+            _run(10, "completed", "failure", 50, 2),     # long run, finished today: kept
+            _run(11, "completed", "failure", 30, 26),    # finished before the window: dropped
+            _run(12, "completed", "success", 3, 1),      # green: dropped
+            _run(13, "completed", "cancelled", 6, 4),
+        ]
+        runs, _ = self.select({"completed": completed})
+        self.assertEqual([r["id"] for r in runs], [10, 13])
+
+    def test_cap_applies_to_completed_runs_only(self):
+        completed = [_run(20 + i, "completed", "failure", 10 + i, i) for i in range(7)]
+        unfinished = [_run(1, "in_progress", None, 40, 1), _run(2, "queued", None, 2, 2)]
+        runs, _ = self.select(
+            {"completed": completed, "in_progress": unfinished[:1], "queued": unfinished[1:]},
+            max_runs=5,
+        )
+        self.assertEqual([r["id"] for r in runs], [1, 2, 20, 21, 22, 23, 24])
+
+
+class GitHubRetryTests(unittest.TestCase):
+    def setUp(self):
+        import utils
+        p = patch.object(utils.time, "sleep")
+        self.sleep = p.start()
+        self.addCleanup(p.stop)
+
+    def responses(self, *codes):
+        out = []
+        for code in codes:
+            resp = Mock(status_code=code)
+            resp.json.return_value = {"jobs": []}
+            out.append(resp)
+        return out
+
+    def test_502_is_retried_until_success(self):
+        import utils
+        with patch.object(utils.requests, "get", side_effect=self.responses(502, 503, 200)) as get:
+            resp = utils.gh_get("https://api.github.com/x", headers={})
+        self.assertEqual((resp.status_code, get.call_count), (200, 3))
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], list(utils.GH_RETRY_DELAYS[:2]))
+
+    def test_gives_up_and_returns_the_last_error(self):
+        import utils
+        codes = [502] * (len(utils.GH_RETRY_DELAYS) + 1)
+        with patch.object(utils.requests, "get", side_effect=self.responses(*codes)) as get:
+            resp = utils.gh_get("https://api.github.com/x", headers={})
+        self.assertEqual((resp.status_code, get.call_count), (502, len(codes)))
+
+    def test_client_errors_are_not_retried(self):
+        import utils
+        with patch.object(utils.requests, "get", side_effect=self.responses(404)) as get:
+            self.assertEqual(utils.gh_get("https://api.github.com/x", headers={}).status_code, 404)
+        self.assertEqual(get.call_count, 1)
+
+    def test_connection_errors_are_retried_then_raised(self):
+        import utils
+        err = utils.requests.ConnectionError("reset")
+        with patch.object(utils.requests, "get", side_effect=[err, self.responses(200)[0]]):
+            self.assertEqual(utils.gh_get("https://api.github.com/x", headers={}).status_code, 200)
+        with patch.object(utils.requests, "get", side_effect=err):
+            with self.assertRaises(utils.requests.ConnectionError):
+                utils.gh_get("https://api.github.com/x", headers={})
+
+    def test_a_502_no_longer_fails_the_monitor(self):
+        # 2026-10-29 18:02: one 502 on the jobs list failed the pr-test-amd monitor job.
+        import utils
+        jobs = Mock(status_code=200)
+        jobs.json.return_value = {"jobs": [{"id": 7, "status": "completed", "conclusion": "failure"}]}
+        with patch.object(utils.requests, "get", side_effect=[*self.responses(502), jobs]):
+            self.assertEqual([j["id"] for j in monitor_ci.get_failed_jobs("token", 1)], [7])
+
+
+class StateRetentionTests(unittest.TestCase):
+    def test_state_keeps_enough_days_for_the_oldest_run_in_view(self):
+        self.assertGreaterEqual(monitor_ci.STATE_DAYS_KEPT * 24, monitor_ci.MAX_RUN_AGE_HOURS)
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(monitor_ci, "STATE_FILE", Path(tmp) / "s.json"):
+            state = {"daily_comments": {f"2026-10-{d:02d}": {} for d in range(20, 31)}}
+            monitor_ci.save_state(state)
+        self.assertEqual(sorted(state["daily_comments"]), [f"2026-10-{d}" for d in (27, 28, 29, 30)])
+
+
+class LongRunJobWindowTests(unittest.TestCase):
+    def test_only_failures_from_the_window_are_analysed(self):
+        # disagg 40833167728: created 10-29 07:05; job 123418882508 queued 24 h and was
+        # cancelled 10-30 11:26, 28 h in. Earlier failures of the run were reported then.
+        now = datetime.now(timezone.utc)
+        run = {"id": 9100, "html_url": "https://example.test/long-run", "head_sha": "sha",
+               "status": "queued", "conclusion": None}
+
+        def job(job_id, hours_ago, conclusion="failure"):
+            return {"id": job_id, "name": f"job-{job_id}", "status": "completed",
+                    "conclusion": conclusion, "started_at": "2026-10-29T11:26:00Z",
+                    "completed_at": (now - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "steps": []}
+
+        jobs_response = _jobs_response([job(1, 30), job(2, 3, "cancelled"), job(3, 1)], total_count=3)
+        with (
+            patch.object(monitor_ci, "get_workflow_runs", return_value=[run]),
+            patch("utils.requests.get", return_value=jobs_response),
+            patch.object(monitor_ci, "get_pending_job_info", return_value={"count": 0, "run_id": 9100}),
+            patch.object(monitor_ci, "create_agent_worktree", return_value=Path("/tmp/wt")),
+            patch.object(monitor_ci, "analyze_job_with_agent",
+                         side_effect=lambda j, *a, **k: _analysis(j["id"], "analysis")) as analyze,
+            patch.object(monitor_ci, "remove_agent_worktree"),
+        ):
+            _, job_ids, _ = monitor_ci.monitor_workflow(
+                "token", "nightly-amd-mi355x-disagg.yml", hours_back=24,
+                use_agent=True, agent_repo_path=Path("/workspace/sglang"),
+            )
+
+        self.assertEqual(sorted(job_ids), [2, 3])
+        self.assertEqual(sorted(c.args[0]["id"] for c in analyze.call_args_list), [2, 3])

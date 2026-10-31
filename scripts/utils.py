@@ -162,7 +162,7 @@ def get_job_annotations(token: str, job_id: int) -> list[dict] | None:
     """The check-run annotations of a job, or None when they could not be read."""
     url = f"https://api.github.com/repos/{REPO}/check-runs/{job_id}/annotations"
     try:
-        resp = requests.get(url, headers=gh_headers(token), timeout=30)
+        resp = gh_get(url, headers=gh_headers(token), timeout=30)
     except requests.RequestException:
         return None
     return resp.json() if resp.status_code == 200 else None
@@ -264,10 +264,40 @@ def gh_headers(token: str) -> dict:
     }
 
 
+# GitHub's API returns the odd 502/503/504 under load; on 2026-10-29 and -30
+# a single 502 failed a whole monitor job. Reads are retried; writes are not,
+# because a write that timed out may still have happened (a duplicate comment).
+GH_RETRY_STATUSES = frozenset({500, 502, 503, 504})
+GH_RETRY_DELAYS = (5, 15, 45)
+
+
+def gh_get(url: str, headers: dict, **kwargs) -> requests.Response:
+    """``requests.get`` for GitHub reads, retried on 5xx and connection errors.
+
+    Returns the last response; callers check its status as before. A connection
+    error on the last attempt is raised.
+    """
+    for delay in (*GH_RETRY_DELAYS, None):
+        try:
+            resp = requests.get(url, headers=headers, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if delay is None:
+                raise
+            logging.getLogger("github").warning("GET %s failed (%s); retrying in %ds", url, exc, delay)
+        else:
+            if resp.status_code not in GH_RETRY_STATUSES or delay is None:
+                return resp
+            logging.getLogger("github").warning(
+                "GET %s returned %d; retrying in %ds", url, resp.status_code, delay,
+            )
+        time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def download_job_logs(token: str, job_id: int) -> str:
     """Download full logs for a GitHub Actions job."""
     url = f"https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs"
-    resp = requests.get(url, headers=gh_headers(token), allow_redirects=True)
+    resp = gh_get(url, headers=gh_headers(token), allow_redirects=True)
     if resp.status_code == 200:
         # The log response has no charset, so requests would decode it as
         # Latin-1 and garble markers such as "✗ FAILED".
@@ -344,7 +374,7 @@ def _list_run_artifacts(token: str, run_id: int) -> list[dict]:
     artifacts: list[dict] = []
     page = 1
     while True:
-        resp = requests.get(
+        resp = gh_get(
             url,
             headers=gh_headers(token),
             params={"per_page": 100, "page": page},
@@ -941,7 +971,7 @@ def checkout_sglang_for_miles(
     if ref:
         git("fetch", "origin", ref, "--depth", "300")
     if git("cat-file", "-t", sha).returncode != 0 and token:
-        resp = requests.get(
+        resp = gh_get(
             f"https://api.github.com/repos/{REPO}/commits/{sha}",
             headers=gh_headers(token), timeout=60,
         )
@@ -1039,7 +1069,7 @@ def update_comment(token: str, repo: str, comment_id: int, body: str) -> dict:
 def get_issue(token: str, repo: str, issue_number: int) -> dict:
     """Fetch an issue's full payload (title, body, labels, ...)."""
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
-    resp = requests.get(url, headers=gh_headers(token))
+    resp = gh_get(url, headers=gh_headers(token))
     resp.raise_for_status()
     return resp.json()
 
@@ -1093,7 +1123,7 @@ def get_workflow_runs_for_sha(token: str, head_sha: str) -> list[dict]:
     all_runs: list[dict] = []
     page = 1
     while True:
-        resp = requests.get(
+        resp = gh_get(
             url,
             headers=gh_headers(token),
             params={"head_sha": head_sha, "per_page": 100, "page": page},
@@ -1116,7 +1146,7 @@ def get_run_jobs(token: str, run_id: int) -> list[dict]:
     seen_job_ids: set[int] = set()
     page = 1
     while True:
-        resp = requests.get(
+        resp = gh_get(
             url,
             headers=gh_headers(token),
             params={"filter": "latest", "per_page": 100, "page": page},
@@ -1143,7 +1173,7 @@ def get_pr_diff(token: str, pr_number: int) -> str:
     url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}"
     headers = gh_headers(token)
     headers["Accept"] = "application/vnd.github.diff"
-    resp = requests.get(url, headers=headers)
+    resp = gh_get(url, headers=headers)
     if resp.status_code == 200:
         return resp.text
     return ""
@@ -1155,7 +1185,7 @@ def get_pr_changed_files(token: str, pr_number: int) -> list[dict]:
     all_files: list[dict] = []
     page = 1
     while True:
-        resp = requests.get(
+        resp = gh_get(
             url,
             headers=gh_headers(token),
             params={"per_page": 100, "page": page},
@@ -1176,7 +1206,7 @@ def get_file_content_at_ref(token: str, path: str, ref: str) -> str | None:
     url = f"https://api.github.com/repos/{REPO}/contents/{path}"
     headers = gh_headers(token)
     headers["Accept"] = "application/vnd.github.raw"
-    resp = requests.get(url, headers=headers, params={"ref": ref})
+    resp = gh_get(url, headers=headers, params={"ref": ref})
     if resp.status_code == 200:
         return resp.text
     return None

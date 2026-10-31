@@ -54,7 +54,7 @@ from daily_cross_workflow_summary import (
     parse_suspect_prs_comment,
 )
 from monitor_ci import find_daily_issue, get_issue_comments
-from utils import REPO, get_issue, gh_headers, post_comment, update_comment
+from utils import REPO, get_issue, gh_get, gh_headers, post_comment, update_comment
 
 log = logging.getLogger("suspect-prs")
 
@@ -105,7 +105,7 @@ class GitHub:
         self._comments: dict[int, list[dict]] = {}
 
     def _get(self, path: str) -> dict | list | None:
-        resp = requests.get(
+        resp = gh_get(
             f"https://api.github.com/repos/{REPO}/{path}", headers=gh_headers(self.token),
         )
         if resp.status_code in (404, 422):
