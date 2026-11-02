@@ -40,7 +40,7 @@ Three more things the picture does not show:
 
 | Feature | Trigger | Workflow → script | Agent tasks | Writes to |
 |---|---|---|---|---|
-| [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) | runner-1, hourly | [`ci-monitor.yml`](.github/workflows/ci-monitor.yml) → [`monitor_ci.py`](scripts/monitor_ci.py), [`daily_cross_workflow_summary.py`](scripts/daily_cross_workflow_summary.py), [`order_daily_comments.py`](scripts/order_daily_comments.py) | Job Failure Analysis, Cross-Job Summary, Cross-Run Pattern Analysis, Daily Cross-Workflow Summary | Daily issue in this repo |
+| [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) | runner-1, hourly | [`ci-monitor.yml`](.github/workflows/ci-monitor.yml) → [`monitor_ci.py`](scripts/monitor_ci.py), [`daily_cross_workflow_summary.py`](scripts/daily_cross_workflow_summary.py), [`order_daily_comments.py`](scripts/order_daily_comments.py), [`runner_health.py`](scripts/runner_health.py) | Job Failure Analysis, Cross-Job Summary, Cross-Run Pattern Analysis, Daily Cross-Workflow Summary | Daily issue in this repo |
 | [Suspect PR comments](#52-suspect-pr-comments) | `finalize` job of the CI monitor | [`suspect_pr_comments.py`](scripts/suspect_pr_comments.py) | — | Comments on merged sglang PRs; a log comment on the daily issue |
 | [Failure Trackers](#53-failure-trackers) | `finalize` job of the CI monitor | [`failure_tracker.py`](scripts/failure_tracker.py) | Failure Tracker Data | One issue per tracked workflow on sgl-project/sglang |
 | [PR commands](#54-pr-commands-the-comment-watcher) | `@amd-bot …` on a sglang PR | runner-1 daemon + [`comment-watcher.yml`](.github/workflows/comment-watcher.yml) → [`watch_comments.py`](scripts/watch_comments.py) | — | Dispatches the two workflows below; help replies |
@@ -140,6 +140,7 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 | `<!-- ci-monitor-part: i/n -->` | workflow comments | a report split over several comments (60 KB limit) |
 | `<details data-job-id data-run-url data-started-at>` | inside workflow comments | one per-job analysis; the only thing [`parse_job_analyses_from_comment()`](scripts/monitor_ci.py) reads back |
 | `<!-- daily-cross-workflow-summary:start/end -->` | daily issue body | the summary, pinned above all comments |
+| `<!-- ci-monitor-runner-health:start/end -->` | daily issue body, above the summary | the Runner health section, rewritten every tick |
 | `<!-- ci-monitor-job-clusters:v1 … -->`, `<!-- ci-monitor-suspect-prs:v1 … -->` | inside the summary | job → cluster map and suspect PRs, for the finalize steps |
 | `<!-- ci-monitor-cross-run-summary: <wf> -->` | daily issue | a workflow's cross-run comment |
 | `<!-- ci-monitor-suspect-pr-log -->` | daily issue | every suspect decision this tick, and why |
@@ -202,7 +203,7 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 
 ### 5.1 CI monitor and the daily report
 
-**Purpose.** One GitHub issue per UTC day in this repo, `[CI Monitor] Daily Report - <date>`. It holds a per-workflow failure report for every monitored AMD workflow, plus a cross-workflow summary pinned at the top of the issue body.
+**Purpose.** One GitHub issue per UTC day in this repo, `[CI Monitor] Daily Report - <date>`. It holds a per-workflow failure report for every monitored AMD workflow, plus a cross-workflow summary pinned at the top of the issue body, under a Runner health line that flags workflows whose jobs are not getting runners.
 
 **Flow** ([`ci-monitor.yml`](.github/workflows/ci-monitor.yml), dispatched hourly by runner-1's [`entrypoint.sh`](runner/entrypoint.sh)):
 
@@ -223,8 +224,14 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
    5. **Refresh the summary.** If anything was new, it rebuilds the Daily Cross-Workflow Summary in the issue body ([`build_and_publish_summary()`](scripts/daily_cross_workflow_summary.py)). This step reads every workflow's comments back, adds yesterday's summary for trends, and keeps the summary's `job-clusters` and `suspect-prs` blocks as hidden comments.
 3. **finalize** (once, after the matrix):
    1. [`order_daily_comments.py`](scripts/order_daily_comments.py) puts the reports in priority order.
-   2. [Suspect PR comments](#52-suspect-pr-comments).
-   3. [Failure Trackers](#53-failure-trackers).
+   2. **Runner health** ([`runner_health.py`](scripts/runner_health.py), code only). A workflow whose runners are offline has no failed jobs, so the reports above never mention it: its jobs sit queued, and each newer scheduled run is cancelled before it starts (`nightly-amd-mi355x-disagg.yml` went four days like that). For every monitored workflow this lists, at the top of the issue body:
+      - jobs waiting for a runner for 24 h (`QUEUE_STALL_HOURS`), or for 30 min (`OFFLINE_GRACE_MINUTES`) while every runner with their labels is offline ([`check_workflow()`](scripts/runner_health.py)); unfinished runs up to 14 days old are checked, past the reports' 72 h window;
+      - runs cancelled in the last 24 h before any self-hosted job got a runner ([`never_started()`](scripts/runner_health.py));
+      - each label set's runners: online, busy, and the offline ones by name ([`runner_status()`](scripts/runner_health.py)). This needs a token that can list sglang's runners (`RUNNER_STATUS_TOKEN`); amd-bot's cannot, so without it only queue times are used.
+
+      With nothing to report, the section is one ✅ line.
+   3. [Suspect PR comments](#52-suspect-pr-comments).
+   4. [Failure Trackers](#53-failure-trackers).
 
 **Things to know**
 - **Report order** follows [`MONITORED_WORKFLOWS`](scripts/monitor_ci.py): Docker builds, PR test, nightly, disagg, Miles, AITER Scout. Inside `pr-test-amd.yml`, jobs are grouped by ROCm version (`ROCM_REPORT_ORDER`), PRs' default first, then by stage (`JOB_REPORT_ORDER`).
@@ -371,6 +378,7 @@ It acts as the owner of `SGLANG_CI_TOKEN` (or `GH_PAT`), who must be an admin on
 | `BOT_PAT` given to `setup.sh` (`--bot-pat`, optional) | runner-1's comment watcher. Without it the watcher uses the `--pat` token, so its 🚀 claims come from that account (the current deployment) |
 | `secrets.AGENT_GH_TOKEN` (optional, read-only) | Handed to agents in place of `GH_PAT` |
 | `secrets.SGLANG_CI_TOKEN` (optional) | Coverage audit, in place of `GH_PAT` |
+| `secrets.RUNNER_STATUS_TOKEN` (optional) | Runner health: listing sglang's runners, which amd-bot's read access cannot |
 
 ### Repository secrets and variables
 
@@ -383,6 +391,7 @@ Settings → Secrets and variables → Actions.
 | `AGENT_GH_TOKEN` | Recommended: a read-only token for the CI-status agents, which read content anyone can write |
 | `NOTION_TOKEN` | Notion connection with Read + Insert, no Update, shared only with the two databases |
 | `SGLANG_CI_TOKEN` | Optional: another ROCm/sglang-ci admin's PAT for the coverage audit |
+| `RUNNER_STATUS_TOKEN` | Optional: a token that can list sgl-project/sglang's self-hosted runners (`GET /repos/sgl-project/sglang/actions/runners`), for the runner health check. Read only; never given to an agent |
 
 | Variable | Value |
 |---|---|
@@ -481,6 +490,7 @@ Every script prints its options with `--help`. The common ones:
 ```bash
 python scripts/monitor_ci.py --output stdout --hours-back 24 --workflows pr-test-amd.yml
 python scripts/daily_cross_workflow_summary.py --bot-repo bingxche/sglang-ci-bot [--date YYYY-MM-DD]
+python scripts/runner_health.py --output stdout [--workflows nightly-amd-mi355x-disagg.yml]
 python scripts/suspect_pr_comments.py --bot-repo bingxche/sglang-ci-bot --mode dry-run
 python scripts/failure_tracker.py --bot-repo bingxche/sglang-ci-bot [--no-use-agent]
 python scripts/review_pr.py 1234 --no-post [--focus "..."]
@@ -497,7 +507,8 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 | Variable | Used by | Description |
 |---|---|---|
 | `GH_PAT` / `BOT_PAT` / `GITHUB_TOKEN` | all scripts | GitHub token, in that order of preference by most scripts |
-| `BOT_REPO` | `ensure_daily_issue.py`, `order_daily_comments.py` | The bot repo hosting the daily issue |
+| `BOT_REPO` | `ensure_daily_issue.py`, `order_daily_comments.py`, `runner_health.py` | The bot repo hosting the daily issue |
+| `RUNNER_STATUS_TOKEN` | `runner_health.py` | Token for listing sglang's runners (default: the GitHub token; without access, only queue times are used) |
 | `LLM_GATEWAY_KEY` / `LLM_GATEWAY_URL` | API mode | AMD LLM Gateway key and endpoint |
 | `USE_AGENT` | all scripts | `false` / `0` / `no` selects API mode (default: agent mode) |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` / `ANTHROPIC_MODEL` | Claude Code | Gateway access and default model, from `claude.env` |
