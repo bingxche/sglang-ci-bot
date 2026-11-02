@@ -225,9 +225,9 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 3. **finalize** (once, after the matrix):
    1. [`order_daily_comments.py`](scripts/order_daily_comments.py) puts the reports in priority order.
    2. **Runner health** ([`runner_health.py`](scripts/runner_health.py), code only). A workflow whose runners are offline has no failed jobs, so the reports above never mention it: its jobs sit queued, and each newer scheduled run is cancelled before it starts (`nightly-amd-mi355x-disagg.yml` went four days like that). For every monitored workflow this lists, at the top of the issue body:
-      - jobs waiting for a runner for 24 h (`QUEUE_STALL_HOURS`), or for 30 min (`OFFLINE_GRACE_MINUTES`) while every runner with their labels is offline ([`check_workflow()`](scripts/runner_health.py)); unfinished runs up to 14 days old are checked, past the reports' 72 h window;
+      - jobs waiting for a runner for 24 h (`QUEUE_STALL_HOURS`), for 30 min (`OFFLINE_GRACE_MINUTES`) while every runner with their labels is offline, or for 2 h (`NO_PICKUP_HOURS`) while no job on their labels is running or was picked up after they queued ([`check_workflow()`](scripts/runner_health.py)); unfinished runs up to 14 days old are checked, past the reports' 72 h window;
       - runs cancelled in the last 24 h before any self-hosted job got a runner ([`never_started()`](scripts/runner_health.py));
-      - each label set's runners: online, busy, and the offline ones by name ([`runner_status()`](scripts/runner_health.py)). This needs a token that can list sglang's runners (`RUNNER_STATUS_TOKEN`); amd-bot's cannot, so without it only queue times are used.
+      - each label set's runners: online, busy, and the offline ones by name ([`runner_status()`](scripts/runner_health.py)). This needs a token that can list sglang's runners (`RUNNER_STATUS_TOKEN`); amd-bot's cannot. Without it, whether a label is picking up jobs at all is read from the jobs ([`label_activity()`](scripts/runner_health.py)): jobs running on it in any in-progress run of a monitored workflow, whatever its event, and its latest pickup. This is the same reading as the dashboard's Runner Health page, which calls a pool offline when it has queued jobs and nothing running. A job of an unmonitored workflow on the same labels is not seen, hence the 2 h wait.
 
       With nothing to report, the section is one ✅ line.
    3. [Suspect PR comments](#52-suspect-pr-comments).
@@ -508,7 +508,7 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 |---|---|---|
 | `GH_PAT` / `BOT_PAT` / `GITHUB_TOKEN` | all scripts | GitHub token, in that order of preference by most scripts |
 | `BOT_REPO` | `ensure_daily_issue.py`, `order_daily_comments.py`, `runner_health.py` | The bot repo hosting the daily issue |
-| `RUNNER_STATUS_TOKEN` | `runner_health.py` | Token for listing sglang's runners (default: the GitHub token; without access, only queue times are used) |
+| `RUNNER_STATUS_TOKEN` | `runner_health.py` | Token for listing sglang's runners (default: the GitHub token; without access, pickups are read from the jobs) |
 | `LLM_GATEWAY_KEY` / `LLM_GATEWAY_URL` | API mode | AMD LLM Gateway key and endpoint |
 | `USE_AGENT` | all scripts | `false` / `0` / `no` selects API mode (default: agent mode) |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` / `ANTHROPIC_MODEL` | Claude Code | Gateway access and default model, from `claude.env` |

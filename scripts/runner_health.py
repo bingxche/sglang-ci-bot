@@ -9,14 +9,17 @@ like that (both ``linux-sglang-mi35x-di`` runners offline from 2026-10-29)
 without a word in the daily report.
 
 For each monitored workflow this finds:
-  - jobs waiting for a runner for ``QUEUE_STALL_HOURS``, or for
-    ``OFFLINE_GRACE_MINUTES`` while every runner with their labels is offline;
+  - jobs waiting for a runner for ``QUEUE_STALL_HOURS``, for
+    ``OFFLINE_GRACE_MINUTES`` while every runner with their labels is offline,
+    or for ``NO_PICKUP_HOURS`` while no job on their labels is running or was
+    picked up after they queued;
   - runs cancelled in the lookback window before any job got a runner;
 and writes a "Runner health" section at the top of today's daily issue body,
 between ``RUNNER_HEALTH_START`` / ``RUNNER_HEALTH_END``. Code only, no agent.
 
 Runner online/offline status needs a token that can list sgl-project/sglang's
-runners (``RUNNER_STATUS_TOKEN``). Without one, only queue times are used.
+runners (``RUNNER_STATUS_TOKEN``). Without one, whether a label is picking up
+jobs at all is read from the jobs themselves (``label_activity``).
 
 Env:
   GH_PAT               - GitHub token (fallback: BOT_PAT, GITHUB_TOKEN)
@@ -50,6 +53,10 @@ QUEUE_STALL_HOURS = 24
 # Every runner for the job's labels offline: reported once the job has waited
 # this long, to ride out a runner restart.
 OFFLINE_GRACE_MINUTES = 30
+# Without the runner list: reported once the job has waited this long while
+# no job on its labels is running and none was picked up after it queued.
+# The dashboard's Runner Health page calls such a pool offline at once.
+NO_PICKUP_HOURS = 2
 # Unfinished runs this old are still checked; a run stuck on a dead runner
 # outlives the monitor's MAX_RUN_AGE_HOURS window.
 LOOKBACK_DAYS = 14
@@ -76,7 +83,7 @@ def list_runners(token: str) -> list[dict] | None:
     while True:
         resp = gh_get(url, headers=gh_headers(token), params={"per_page": 100, "page": page})
         if resp.status_code in (401, 403, 404):
-            log.warning("Cannot list %s runners (HTTP %d); using queue times only",
+            log.warning("Cannot list %s runners (HTTP %d); reading pickups from the jobs instead",
                         REPO, resp.status_code)
             return None
         resp.raise_for_status()
@@ -154,10 +161,47 @@ def all_offline(status: dict | None) -> bool:
     return bool(status) and not status["autoscaled"] and status["total"] > 0 and status["online"] == 0
 
 
-def is_stalled(waited: timedelta, status: dict | None) -> bool:
+def note_activity(activity: dict, jobs: list[dict]) -> None:
+    """Add *jobs*' running count and latest pickup to *activity*, per label set."""
+    for job in jobs:
+        labels = sorted(job.get("labels") or [])
+        if not job.get("runner_name") or is_hosted(labels):
+            continue
+        a = activity.setdefault(tuple(labels), {"running": 0, "last_pickup": None})
+        if job.get("status") == "in_progress":
+            a["running"] += 1
+        started = _parse_time(job.get("started_at"))
+        if started and (a["last_pickup"] is None or started > a["last_pickup"]):
+            a["last_pickup"] = started
+
+
+def not_picking_up(activity: dict | None, queued_at: datetime) -> bool:
+    """No job on the labels is running, and none was picked up after *queued_at*.
+
+    The same reading as the dashboard's Runner Health page, which calls a pool
+    offline when it has queued jobs and nothing running: no admin token needed.
+    """
+    if activity is None:
+        return True
+    return activity["running"] == 0 and (
+        activity["last_pickup"] is None or activity["last_pickup"] < queued_at
+    )
+
+
+def is_stalled(waited: timedelta, status: dict | None,
+               activity: dict | None = None, queued_at: datetime | None = None) -> bool:
     if waited >= timedelta(hours=QUEUE_STALL_HOURS):
         return True
-    return all_offline(status) and waited >= timedelta(minutes=OFFLINE_GRACE_MINUTES)
+    if all_offline(status) and waited >= timedelta(minutes=OFFLINE_GRACE_MINUTES):
+        return True
+    # Runners we can see are busy: they are working, just not on this job.
+    if status is not None and status["busy"] > 0:
+        return False
+    return (
+        queued_at is not None
+        and waited >= timedelta(hours=NO_PICKUP_HOURS)
+        and not_picking_up(activity, queued_at)
+    )
 
 
 def never_started(jobs: list[dict]) -> bool:
@@ -174,15 +218,33 @@ def never_started(jobs: list[dict]) -> bool:
 # Per-workflow check
 # ---------------------------------------------------------------------------
 
+def label_activity(token: str, workflows: list[str], now: datetime) -> dict:
+    """Jobs running and the latest pickup per label set, across *workflows*.
+
+    Read from every in-progress run, whatever its event: a PR run holding the
+    MI35x runners is what keeps a scheduled job waiting, and is not a sign of
+    a dead pool.
+    """
+    activity: dict = {}
+    since = now - timedelta(days=LOOKBACK_DAYS)
+    for wf in workflows:
+        for run in get_runs(token, wf, "in_progress", since):
+            note_activity(activity, get_run_jobs(token, run["id"]))
+    return activity
+
+
 def check_workflow(token: str, workflow_file: str, runners: list[dict] | None,
-                   now: datetime, hours_back: int = 24) -> dict:
+                   now: datetime, hours_back: int = 24,
+                   activity: dict | None = None) -> dict:
     """Stalled job groups and never-started cancelled runs of one workflow.
 
     Runs are filtered by event like the failure reports
     (``workflow_event_filter``): PR runs of pr-test-amd.yml queue for
     reasons of their own, and a stuck manual run that blocks the scheduled
     ones still shows, as scheduled runs cancelled before they started.
+    *activity* (``label_activity``) is updated with these runs' own jobs.
     """
+    activity = {} if activity is None else activity
     created_since = now - timedelta(days=LOOKBACK_DAYS)
     event = workflow_event_filter(workflow_file)
     unfinished: dict[int, dict] = {}
@@ -191,9 +253,16 @@ def check_workflow(token: str, workflow_file: str, runners: list[dict] | None,
             if run.get("status") != "completed":
                 unfinished[run["id"]] = run
 
+    run_jobs = [
+        (run, get_run_jobs(token, run["id"]))
+        for run in sorted(unfinished.values(), key=lambda r: r.get("created_at") or "")
+    ]
+    for _, jobs in run_jobs:
+        note_activity(activity, jobs)
+
     groups: dict[tuple[str, ...], dict] = {}
-    for run in sorted(unfinished.values(), key=lambda r: r.get("created_at") or ""):
-        for job in get_run_jobs(token, run["id"]):
+    for run, jobs in run_jobs:
+        for job in jobs:
             if job.get("status") != "queued" or job.get("runner_name"):
                 continue
             labels = sorted(job.get("labels") or [])
@@ -207,12 +276,13 @@ def check_workflow(token: str, workflow_file: str, runners: list[dict] | None,
                 groups[key] = {
                     "labels": labels,
                     "runners": runner_status(labels, runners),
+                    "activity": activity.get(key),
                     "jobs": 0,
                     "queued_since": queued_at,
                     "runs": [],
                 }
             g = groups[key]
-            if not is_stalled(now - queued_at, g["runners"]):
+            if not is_stalled(now - queued_at, g["runners"], g["activity"], queued_at):
                 continue
             g["queued_since"] = min(g["queued_since"], queued_at) if g["jobs"] else queued_at
             g["jobs"] += 1
@@ -254,8 +324,13 @@ def _run_link(run: dict) -> str:
     return f"[{run['created_at'][:10] or 'run'}]({run['url']})"
 
 
-def _runners_cell(status: dict | None) -> str:
+def _runners_cell(status: dict | None, activity: dict | None = None,
+                  queued_since: datetime | None = None) -> str:
     if status is None:
+        if queued_since is not None and not_picking_up(activity, queued_since):
+            last = (activity or {}).get("last_pickup")
+            when = f"last pickup {last.strftime('%Y-%m-%d %H:%M')} UTC" if last else "no pickup in view"
+            return f"**nothing running or picked up since these queued**; {when}"
         return "not readable"
     if status["total"] == 0:
         return "none registered with these labels"
@@ -305,7 +380,7 @@ def render_section(results: list[dict], now: datetime, runners_known: bool,
                 f"| {', '.join(f'`{l}`' for l in g['labels']) or '—'} "
                 f"| {g['jobs']} "
                 f"| {since.strftime('%Y-%m-%d %H:%M')} UTC ({_duration(now - since)}) "
-                f"| {_runners_cell(g['runners'])} "
+                f"| {_runners_cell(g['runners'], g.get('activity'), g['queued_since'])} "
                 f"| {', '.join(_run_link(r) for r in g['runs'])} |"
             )
         lines.append("")
@@ -318,12 +393,14 @@ def render_section(results: list[dict], now: datetime, runners_known: bool,
         "Runner status is from sglang's runner list."
         if runners_known else
         "Runner status is not readable with the bot's token (set `RUNNER_STATUS_TOKEN`), "
-        "so only queue times are used."
+        "so it is read from the jobs: whether any job on the labels is running or was "
+        "picked up after the waiting ones queued."
     )
     lines.append(
         f"<sub>Checked {checked} by code. A job is listed after waiting "
-        f"{QUEUE_STALL_HOURS} h for a runner, or {OFFLINE_GRACE_MINUTES} min while every "
-        f"runner with its labels is offline. {status_note}</sub>"
+        f"{QUEUE_STALL_HOURS} h for a runner, {OFFLINE_GRACE_MINUTES} min while every "
+        f"runner with its labels is offline, or {NO_PICKUP_HOURS} h while no job on its "
+        f"labels is running or was picked up after it queued. {status_note}</sub>"
     )
     return f"{RUNNER_HEALTH_START}\n" + "\n".join(lines) + f"\n{RUNNER_HEALTH_END}\n\n"
 
@@ -366,9 +443,11 @@ def main() -> int:
 
     now = datetime.now(timezone.utc)
     runners = list_runners(os.environ.get("RUNNER_STATUS_TOKEN") or token)
+    activity = label_activity(token, args.workflows, now)
     results = []
     for wf in args.workflows:
-        result = check_workflow(token, wf, runners, now, hours_back=args.hours_back)
+        result = check_workflow(token, wf, runners, now, hours_back=args.hours_back,
+                                activity=activity)
         for g in result["stalled"]:
             log.warning("%s: %d job(s) on %s waiting since %s", wf, g["jobs"],
                         ",".join(g["labels"]), g["queued_since"].isoformat())
