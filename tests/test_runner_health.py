@@ -83,6 +83,33 @@ class StallRuleTests(unittest.TestCase):
         self.assertFalse(rh.is_stalled(timedelta(minutes=rh.OFFLINE_GRACE_MINUTES - 1), offline))
         self.assertTrue(rh.is_stalled(timedelta(minutes=rh.OFFLINE_GRACE_MINUTES), offline))
 
+    def test_no_pickup_needs_nothing_running_and_no_later_pickup(self):
+        queued_at = NOW - timedelta(hours=rh.NO_PICKUP_HOURS)
+        waited = NOW - queued_at
+        self.assertTrue(rh.is_stalled(waited, None, None, queued_at))
+        self.assertFalse(rh.is_stalled(waited - timedelta(minutes=1), None, None, queued_at))
+        running = {"running": 1, "last_pickup": queued_at - timedelta(hours=5)}
+        self.assertFalse(rh.is_stalled(waited, None, running, queued_at))
+        picked_later = {"running": 0, "last_pickup": queued_at + timedelta(minutes=10)}
+        self.assertFalse(rh.is_stalled(waited, None, picked_later, queued_at))
+        picked_before = {"running": 0, "last_pickup": queued_at - timedelta(minutes=10)}
+        self.assertTrue(rh.is_stalled(waited, None, picked_before, queued_at))
+
+    def test_visible_busy_runners_are_never_read_as_not_picking_up(self):
+        queued_at = NOW - timedelta(hours=rh.NO_PICKUP_HOURS + 1)
+        busy = {"total": 2, "online": 2, "busy": 2, "offline": [], "autoscaled": False}
+        self.assertFalse(rh.is_stalled(NOW - queued_at, busy, None, queued_at))
+
+    def test_note_activity_counts_running_jobs_and_latest_pickup(self):
+        activity = {}
+        rh.note_activity(activity, [
+            {**_job(["linux-mi35x-gpu-1"], "in_progress", "arc-1"), "started_at": _iso(NOW - timedelta(hours=1))},
+            {**_job(["linux-mi35x-gpu-1"], "completed", "arc-2"), "started_at": _iso(NOW - timedelta(hours=3))},
+            _job(["linux-mi35x-gpu-1"]),  # queued, no runner
+            _job(["ubuntu-latest"], "in_progress", "GitHub Actions 1"),
+        ])
+        self.assertEqual(activity, {("linux-mi35x-gpu-1",): {"running": 1, "last_pickup": NOW - timedelta(hours=1)}})
+
     def test_never_started_ignores_a_hosted_setup_job(self):
         setup = _job(["ubuntu-latest"], "completed", "GitHub Actions 1")
         self.assertTrue(rh.never_started([]))
@@ -130,6 +157,32 @@ class CheckWorkflowTests(unittest.TestCase):
         self.assertEqual([r["url"] for r in group["runs"]], [stuck["html_url"]])
         # Run 3 was cancelled outside the 24 h window.
         self.assertEqual([r["url"] for r in result["cancelled"]], [_run(2, NOW)["html_url"]])
+
+    def test_without_the_runner_list_a_pool_that_picks_nothing_up_is_reported(self):
+        queued_at = NOW - timedelta(hours=3)
+        result = self._check(
+            {"queued": [_run(1, queued_at - timedelta(minutes=1))]},
+            {1: [
+                _job(["ubuntu-latest"], "completed", "GitHub Actions 1"),
+                _job(["linux-sglang-mi35x-di"], created=queued_at),
+                _job(["linux-sglang-mi35x-di"], created=queued_at),
+            ]},
+            None,
+        )
+        self.assertEqual([g["jobs"] for g in result["stalled"]], [2])
+        cell = rh._runners_cell(None, result["stalled"][0]["activity"], queued_at)
+        self.assertIn("nothing running or picked up", cell)
+        self.assertIn("no pickup in view", cell)
+
+    def test_without_the_runner_list_a_pool_running_other_jobs_is_not_reported(self):
+        queued_at = NOW - timedelta(hours=3)
+        activity = {("linux-mi35x-gpu-1",): {"running": 3, "last_pickup": NOW - timedelta(hours=4)}}
+        def get_runs(token, wf, status, since, event=None):
+            return [_run(1, queued_at)] if status == "queued" else []
+        with patch.object(rh, "get_runs", side_effect=get_runs), \
+             patch.object(rh, "get_run_jobs", return_value=[_job(["linux-mi35x-gpu-1"], created=queued_at)]):
+            result = rh.check_workflow("tok", "pr-test-amd.yml", None, NOW, activity=activity)
+        self.assertEqual(result["stalled"], [])
 
     def test_a_short_queue_on_busy_runners_is_not_reported(self):
         busy = [_runner("di-01", "online", busy=True)]
