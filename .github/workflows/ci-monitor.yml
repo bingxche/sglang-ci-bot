@@ -172,6 +172,15 @@ jobs:
           BOT_REPO: ${{ github.repository }}
         run: python scripts/order_daily_comments.py
 
+      # Writes only the daily issue; must not hold back the trackers either.
+      - name: Check runner health
+        continue-on-error: true
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RUNNER_STATUS_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+          BOT_REPO: ${{ github.repository }}
+        run: python scripts/runner_health.py --output daily-issue
+
       # dry-run unless the SUSPECT_PR_COMMENTS repository variable is "post".
       - name: Comment on suspect PRs
         continue-on-error: true
