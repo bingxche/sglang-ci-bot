@@ -351,7 +351,7 @@ The agent never receives the Notion token. Manual runs default to `dry-run`.
 4. It runs ROCm/sglang-ci's tests, and checks that the gap list shrank by exactly those files.
 5. It opens a PR in ROCm/sglang-ci and merges it (`--admin`).
 
-It runs in this repo only because these runners can reach the LLM gateway. Its code, prompt and ledger live in ROCm/sglang-ci (`upstream_ci/coverage_audit/`).
+It runs in this repo only because these runners can reach the LLM gateway. Its code and prompt live in ROCm/sglang-ci (`upstream_ci/coverage_audit/`). Its ledger, `reviewed.json`, is at the same path on that repo's `coverage-ledger` branch.
 
 It is the most isolated job in this repo:
 - it works in `$RUNNER_TEMP`;
