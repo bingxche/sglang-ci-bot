@@ -32,7 +32,7 @@ All AI behavior, in agent mode (Claude Code CLI) and API mode (direct LLM calls)
 - one file per task: `agent/tasks/`;
 - the API-mode templates: `agent/api-prompts.md`.
 
-Do NOT hardcode prompts or instructions in Python scripts. Scripts pass only data (task type, metadata, URLs).
+Don't put prompts or instructions in Python scripts: scripts pass only data (task type, metadata, URLs), so all agent behavior can be reviewed as prose in one place (design rule R7).
 
 Keep `agent/ground-rules.md` short: every agent run carries it. A rule that only one task needs belongs in that task's file. A new `Task:` needs a file in `agent/tasks/` and an entry in `AGENT_TASKS` (`scripts/utils.py`), which also sets its model.
 
@@ -57,12 +57,17 @@ How the README is written:
 
 If unsure whether a README update is needed, update it. Outdated docs are worse than no docs.
 
-## 5. What the pull request must contain
+## 5. Test script changes in the same PR
 
-Fill in the three lines of `.github/pull_request_template.md`:
+A change to a Python script under `scripts/` adds or updates a test under `tests/` in the same PR: for a fix, a test that fails without it; for new behavior, a test that covers it. If no test fits (a log message, a comment), say why in the PR's `Tests:` line. Agent instructions are measured with `Validated:` instead (§3).
+
+## 6. What the pull request must contain
+
+Fill in the four lines of `.github/pull_request_template.md`:
 
 ```
 README: <sections updated, or "not needed — reason">
+Tests: <tests added or changed, or "not needed — reason">
 Design rules: <none | rule IDs touched, e.g. "R2, R4 — what changes and why">
 Validated: <for agent/ or model changes: how it ran on real data>
 ```
@@ -71,6 +76,7 @@ Validated: <for agent/ or model changes: how it ran on real data>
 - the unit tests fail. These include `tests/test_readme.py`, which checks that the README's links, function names and lists match the code, and that every script, workflow, agent task and environment variable is mentioned;
 - `scripts/check_pr_rules.py` finds a problem:
   - a behavior change without a README change or a reason;
+  - a `scripts/*.py` change without a `tests/` change or a reason;
   - a missing or unknown `Design rules:` entry;
   - an agent change without a `Validated:` line.
 

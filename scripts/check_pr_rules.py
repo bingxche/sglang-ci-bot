@@ -6,6 +6,9 @@ Run by ``pr-checks.yml`` on every pull request. A PR fails when:
   - it changes behavior (``scripts/``, ``agent/``, ``runner/``,
     ``.github/workflows/``) but not ``README.md``, and its description has no
     ``README: not needed — <reason>`` line;
+  - it changes a Python script (``scripts/*.py``) but nothing under
+    ``tests/``, and its description has no ``Tests: not needed — <reason>``
+    line;
   - its description has no ``Design rules:`` line naming the rules it
     touches (``R1``..``Rn`` from README §3), or ``none``;
   - it changes an agent's instructions (``agent/``) or models (``AGENT_TASKS``)
@@ -28,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 BEHAVIOR_PATHS = ("scripts/", "agent/", "runner/", ".github/workflows/")
 AGENT_PATHS = ("agent/",)
+TEST_PATHS = ("tests/",)
 _RULE_ID_RE = re.compile(r"\*\*(R\d+)\.")
 _PLACEHOLDER_RE = re.compile(r"<[^>]*>")
 
@@ -57,6 +61,17 @@ def check(changed: list[str], body: str, readme: str, agent_tasks_changed: bool)
                 + (" …" if len(behavior) > 5 else "") + ") but not README.md. "
                 "Update the matching README section, or add a line "
                 "'README: not needed — <reason>' to the description."
+            )
+
+    scripts = [f for f in changed if f.startswith("scripts/") and f.endswith(".py")]
+    tests_note = _field(body, "Tests")
+    if scripts and not any(f.startswith(TEST_PATHS) for f in changed):
+        if not tests_note or "not needed" not in tests_note.lower():
+            problems.append(
+                "This PR changes scripts (" + ", ".join(scripts[:5])
+                + (" …" if len(scripts) > 5 else "") + ") but nothing under tests/. "
+                "Add or update a test, or add a line "
+                "'Tests: not needed — <reason>' to the description."
             )
 
     rules = _field(body, "Design rules")
