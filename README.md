@@ -155,9 +155,11 @@ These rules apply to every change, whether typed by hand or written by an AI too
 1. **Read §1–§3 first.** Extend the existing patterns (the agent harness, hidden markers, code gates, dry-run variables) rather than inventing parallel ones.
 2. **Stay on direction.** Do not break a design rule silently. A change that bends one names it in the PR, says why, and updates the rule here, which needs the repo owner's approval.
 3. **One concern per PR.** No drive-by refactors, renames or reformatting, so every diff is reviewable.
-4. **Update this README in the same PR**, following the section map in `AGENTS.md`, along with tests for the new behavior.
-5. **Fill in the three lines of the [PR template](.github/pull_request_template.md):**
+4. **Update this README in the same PR**, following the section map in `AGENTS.md`.
+5. **Test script changes in the same PR.** A change to `scripts/*.py` adds or updates a test in `tests/`, or the PR says why none fits.
+6. **Fill in the four lines of the [PR template](.github/pull_request_template.md):**
    - `README:` the sections updated, or `not needed — <reason>`;
+   - `Tests:` the tests added or changed, or `not needed — <reason>`;
    - `Design rules:` `none`, or the rule IDs touched;
    - `Validated:` how an agent change ran on real data (R10).
 
@@ -547,7 +549,7 @@ runner/           Dockerfile, setup.sh, entrypoint.sh for the self-hosted runner
 docs/             architecture.mmd (diagram source), architecture.png (rendered), render-diagram.sh
 .github/
   workflows/        one workflow per feature, plus pr-checks.yml
-  pull_request_template.md   the README / Design rules / Validated lines
+  pull_request_template.md   the README / Tests / Design rules / Validated lines
 AGENTS.md         the only rules for changing this repo, read by every AI tool
 CLAUDE.md         the one line @AGENTS.md, for Claude Code (the bot's own agents never load it)
 ```
