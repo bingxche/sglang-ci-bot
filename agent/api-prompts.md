@@ -239,20 +239,21 @@ You are a CI/CD expert. Produce the **top-of-issue Daily Cross-Workflow Summary*
 
 {workflows_block}
 
-**Yesterday's clusters** (for trend / NEW detection): {yesterday_clusters_summary_or_none}
+**Yesterday's summary** (for trend / NEW detection; its hidden `<!-- R… -->` comments hold the problem IDs): {yesterday_clusters_summary_or_none}
 
 **Hard rules**:
 - Your output MUST start with the `# Daily Cross-Workflow Summary — {date_str}` heading on its very first non-empty line. No "thinking aloud" preamble — anything before the first heading will be stripped, but better to never emit it.
-- Only `status == "completed"` runs are counted in trends. Mark in-flight runs `(IN-FLIGHT)` and exclude from trend numbers.
-- Cluster jobs by **same Failure Cluster name + same top stack-trace frames**, not by error keyword alone.
-- Assign cluster IDs `R1`, `R2`, ... — NEW clusters today get fresh IDs (mark `🆕`).
+- Only `status == "completed"` runs are counted in trends. Call a run that is still going "still running" and leave it out of trend numbers.
+- Group jobs into problems by **same Failure Cluster name + same top stack-trace frames**, not by error keyword alone.
+- Give each problem an internal ID `R1`, `R2`, …, reusing yesterday's ID for the same problem; a problem new today gets the next free ID (mark `🆕`).
+- **Plain language.** IDs are for code only: never write one in visible text. Put it in a hidden comment at the start of the problem's heading or table row (`<!-- R386 -->`) and name the problem in words. Never invent run labels (`BC`, `N35a`, `ML10o`); name a run by workflow, start time (UTC) and ROCm version, linked. Write "still running", "continuing", "problem" instead of `IN-FLIGHT`, "carry-over", "cluster".
 - Confidence labels (`FACT`/`HIGH`/`MEDIUM`/`LOW`/`SPECULATION`) REQUIRED for every cited commit. Default `LOW`.
 - Bot does NOT assign Priority — no "P0/P1/Critical/High" anywhere.
 - Every workflow listed in the prompt MUST appear in the Workflow status table, even if 0 failures.
 - Every cluster MUST list ALL `(workflow, job, test_file, test_function)` rows.
-- Every `Job (shard)` cell in the cluster tables MUST be a clickable link to the upstream sglang job page: ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)``, or for several legs of one job the backticked job name followed by one link per leg labelled with its matrix values (`` `nightly-8-gpu-mi35x-deepseek-v4-pro` [rocm10](url) · [rocm720](url) ``). Never use in-issue `#job-<id>` anchors here. The job label is the job's GitHub name without the runner label or a reusable-workflow caller prefix (`nightly-test-1-gpu-kernel (rocm720, linux-mi300-1gpu-sglang)` → `nightly-test-1-gpu-kernel (rocm720)`), always in backticks; never a nickname (`v4-pro`, `mmgen-1-gpu`) or a bare lane/shard/run label (`720`, `(1)`, `N21`). Run labels go in the Workflow column. Write jobs in prose the same way.
+- Every `Job (shard)` cell in the cluster tables MUST be a clickable link to the upstream sglang job page: ``[`<job label>`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)``, or for several legs of one job the backticked job name followed by one link per leg labelled with its matrix values (`` `nightly-8-gpu-mi35x-deepseek-v4-pro` [rocm10](url) · [rocm720](url) ``). Never use in-issue `#job-<id>` anchors here. The job label is the job's GitHub name without the runner label or a reusable-workflow caller prefix (`nightly-test-1-gpu-kernel (rocm720, linux-mi300-1gpu-sglang)` → `nightly-test-1-gpu-kernel (rocm720)`), always in backticks; never a nickname (`v4-pro`, `mmgen-1-gpu`) or a bare ROCm version or shard (`720`, `(1)`). Write jobs in prose the same way.
 - When a hypothesis blames a change, open it with the PR and commit side by side (`` [#<num>](pr-url) ([`<sha>`](commit-url)) ``) before the explanation; a change you rule out goes under disconfirming, not in the hypothesis.
-- Name every cluster ID on its own (`R239 · R240 · R241`), never as a range (`R239–R241`).
+- Write every ID on its own in the hidden comments (`<!-- R239 · R240 · R241 -->`), never as a range (`R239–R241`).
 - After the footer, end with a ```` ```json job-clusters ```` block mapping each cluster ID to its numeric job IDs, e.g. `{{"R25": [117742354635], "R209": [117742355001]}}`. Every job ID in the per-job analyses above MUST appear under at least one cluster. The block is stripped before publishing and does not count toward the line budget.
 - Then end with a ```` ```json suspect-prs ```` block: a list with one entry per cluster whose top hypothesis names a merged sglang PR, e.g. `[{{"cluster": "R281", "pr": 42229, "sha": "<sha>", "confidence": "HIGH", "evidence": "<one or two plain sentences>", "last_pass_sha": "<sha or null>", "first_fail_sha": "<sha or null>", "fix_pr": null, "related_prs": []}}]`, or `[]` if none. Use the same confidence as the cluster's top hypothesis, no `@`-mentions in `evidence`, and `null` for any SHA you could not establish.
 
@@ -263,46 +264,46 @@ You are a CI/CD expert. Produce the **top-of-issue Daily Cross-Workflow Summary*
 **Snapshot**: {snapshot_utc} · Only completed runs counted
 
 ## TL;DR
-<🟢 GREEN | 🟡 YELLOW | 🔴 RED> · N clusters · X NEW · Y carrying over · Z in-flight fix(es)
-👉 **Today's ask**: <one sentence concrete action>
+<🟢 GREEN | 🟡 YELLOW | 🔴 RED> · **N problems** (**X new today** · Y continuing) · Z with a fix PR
+👉 **Today's ask**: <one sentence concrete action, naming the problem in words>
 
 ## Workflow status
-| Workflow | Runs | ✅ | ❌ | 7d trend (completed only) | Δ vs yesterday |
+| Workflow | Runs | ✅ | ❌ | Trend, completed runs (oldest → newest, with dates) | Δ vs yesterday |
 |---|---|---|---|---|---|
 ... one row per monitored workflow ...
 
-## Failure clusters (deduplicated across all workflows)
+## Failures by problem
 
-### R1 · 🆕 · <Cluster name> — <Status>
+### <!-- R1 --> 🆕 <Problem in plain words> — <workflows> · <✅ fix open | ❌ no fix>
 - **Status**: facts only
-- **Top hypothesis**: `[CONFIDENCE]` <suspected change first, if any> <hypothesis>; **disconfirming**: <one line> or `(none found)`
+- **Top hypothesis**: `[CONFIDENCE]` <suspected change first, if any> <hypothesis>; **What argues against it**: <one line> or `none found`
 - **In-flight fix**: ✅ [#N](url) | ❌ none
 - **Suggested triage**: <one or two concrete steps>
 
-| Workflow | Job (shard) | Test File | Test Function | Error | Log |
+| Workflow | Job | Test File | Test Function | Error | Log |
 |---|---|---|---|---|---|
 ... ALL affected (workflow, job, test_file, test_function) rows ...
 
-### R2 · ... (repeat for each cluster)
+### <!-- R2 --> ... (repeat for each problem)
 
-<details><summary><b>Known stable clusters (no action today)</b></summary>
-| ID | Cluster | Workflows × Jobs | First seen | In-flight fix |
-... one row per known cluster ...
+<details><summary><b>Quiet problems (no action today)</b></summary>
+| Problem | Workflows × Jobs | First seen | In-flight fix |
+... one row per quiet problem, starting `<!-- R5 --> <problem in words>` ...
 </details>
 
 ## Workflow drill-down
-<details><summary><b>pr-test-amd</b> · latest completed run [<id>] · N failures</summary>
-| Job (shard) | Test File | Test Function | Cluster | Error |
-... per-job rows with Cluster column referencing R1/R2/... ...
+<details><summary><b>pr-test-amd</b> · latest completed run [<date time, rocm>](run-url) · N failures</summary>
+| Job | Test File | Test Function | Problem | Error |
+... per-job rows; the Problem cell is `<!-- R1 --> <problem in words>` ...
 </details>
 ... one <details> block per workflow with failures ...
 
 ## How this report is generated
-- Only completed runs counted; in-flight labelled `(IN-FLIGHT)`.
-- Cluster IDs stable within the week; NEW clusters get the next available ID.
+- Only completed runs counted; runs still going are listed but left out of trends.
 - Confidence: FACT/HIGH/MEDIUM/LOW/SPECULATION. Default LOW.
 - Bot does not assign Priority.
-- In-flight fix lookup performed for every cluster.
+- In-flight fix lookup performed for every problem.
+<!-- next-free-id: R<n> -->
 
 ---
 *Generated by amd-bot · last updated {snapshot_utc}*

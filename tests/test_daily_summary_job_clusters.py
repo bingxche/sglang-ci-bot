@@ -109,6 +109,37 @@ class MarkdownFallbackTests(unittest.TestCase):
         # TL;DR links sit outside any cluster section.
         self.assertNotIn(9, by_job)
 
+    def test_reads_ids_from_hidden_comments(self):
+        # The plain-language format keeps IDs out of the visible text.
+        report = f"""## Failures by problem
+
+### <!-- R386 --> 🆕 GPU 0 on `mia1-p02-g28` is faulty — miles · ❌ no fix
+
+| Workflow | Job | Test File | Error |
+|---|---|---|---|
+| miles ([Nov 4 22:10, rocm10]({RUN})) | {_link(1)} | `test_a.py` | memory fault |
+
+### <!-- R332 · R269 --> Nightly: failures continuing from earlier days — nightly · ✅ fix open
+
+| Problem | Job | Test File |
+|---|---|---|
+| <!-- R332 --> Qwen3.8-Flash-Next FP8 crashes on MI300 | {_link(2)} | `test_b.py` |
+| ROCm 7.2.x only, either problem | {_link(3)} | `test_c.py` |
+
+<details><summary><b>Quiet problems (no action today)</b></summary>
+
+| Problem | Workflows × Jobs | In-flight fix |
+|---|---|---|
+| <!-- R5 --> VLM perf threshold too high, last seen {_link(4)} | pr-test ×1 | ❌ |
+
+</details>
+"""
+        by_job = summary.job_clusters_from_markdown(report)
+        self.assertEqual(by_job[1], ["R386"])
+        self.assertEqual(by_job[2], ["R332"])
+        self.assertEqual(by_job[3], ["R332", "R269"])
+        self.assertEqual(by_job[4], ["R5"])
+
 
 class AttachJobClusterMapTests(unittest.TestCase):
     def _map(self, body: str) -> dict:

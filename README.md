@@ -142,6 +142,7 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 | `<!-- daily-cross-workflow-summary:start/end -->` | daily issue body | the summary, pinned above all comments |
 | `<!-- ci-monitor-runner-health:start/end -->` | daily issue body, above the summary | the Runner health section, rewritten every tick |
 | `<!-- ci-monitor-job-clusters:v1 … -->`, `<!-- ci-monitor-suspect-prs:v1 … -->` | inside the summary | job → cluster map and suspect PRs, for the finalize steps |
+| `<!-- R386 -->`, `<!-- next-free-id: R387 -->` | inside the summary, at each problem's heading or row, and in its footer | the problem (cluster) IDs, which the summary keeps out of its visible text; tomorrow's summary reuses them |
 | `<!-- ci-monitor-cross-run-summary: <wf> -->` | daily issue | a workflow's cross-run comment |
 | `<!-- ci-monitor-suspect-pr-log -->` | daily issue | every suspect decision this tick, and why |
 | `<!-- amd-bot-suspect-pr:<cluster> -->`, `<!-- amd-bot-suspect-fix:<pr> -->` | sglang PRs | a suspect comment / a fix-review request was posted |
@@ -237,6 +238,7 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 
 **Things to know**
 - **Report order** follows [`MONITORED_WORKFLOWS`](scripts/monitor_ci.py): Docker builds, PR test, nightly, disagg, Miles, AITER Scout. Inside `pr-test-amd.yml`, jobs are grouped by ROCm version (`ROCM_REPORT_ORDER`), PRs' default first, then by stage (`JOB_REPORT_ORDER`).
+- **The summary is written in plain language.** It names each problem in words and each run by workflow, start time and ROCm version. The problem IDs (`R386`) that tie a problem to its jobs, to suspect PRs and to tomorrow's report sit only in hidden comments ([`job_clusters_from_markdown()`](scripts/daily_cross_workflow_summary.py) reads them there), and runs get no short labels. The rules are under **Plain language** in [`daily-cross-workflow-summary.md`](agent/tasks/daily-cross-workflow-summary.md); the run-name rule is in the Ground Rules.
 - **Every summary layer can fail independently.** If the summary agent fails, the last good summary stays up under a "not refreshed" note and the next tick retries it.
 - **The report date is pinned when a run starts**, so an agent that runs past midnight cannot write into the next day's issue.
 - **Analyses are kept for 4 days** (`STATE_DAYS_KEPT`), longer than the oldest run in view. A job of a long run that appears in a new day's report is therefore copied from the cache, not analysed again.
