@@ -131,6 +131,7 @@ class MarkdownFallbackTests(unittest.TestCase):
 | Problem | Workflows × Jobs | In-flight fix |
 |---|---|---|
 | <!-- R5 --> VLM perf threshold too high, last seen {_link(4)} | pr-test ×1 | ❌ |
+| <!-- R261 --> DeepSeek R1 MXFP4 GSM8K below the bar, last seen {_link(5)} | nightly ×1 | ❌ |
 
 </details>
 """
@@ -139,6 +140,8 @@ class MarkdownFallbackTests(unittest.TestCase):
         self.assertEqual(by_job[2], ["R332"])
         self.assertEqual(by_job[3], ["R332", "R269"])
         self.assertEqual(by_job[4], ["R5"])
+        # A visible model name is not read as a cluster when a hidden ID is there.
+        self.assertEqual(by_job[5], ["R261"])
 
 
 class AttachJobClusterMapTests(unittest.TestCase):

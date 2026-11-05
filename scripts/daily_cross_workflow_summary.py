@@ -388,6 +388,7 @@ _JOB_LINK_RE = re.compile(r"/actions/runs/\d+/job/(\d+)")
 # `R25`, but not the model names `DeepSeek-R1` or `R1-MXFP4`.
 _CLUSTER_ID_RE = re.compile(r"(?<![\w-])R\d+(?![\w-])")
 _MD_LINK_TARGET_RE = re.compile(r"\]\([^)]*\)")
+_HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->")
 _HOW_GENERATED_RE = re.compile(r"^##\s+How this report is generated", re.MULTILINE)
 
 
@@ -427,6 +428,18 @@ def split_job_cluster_block(report: str) -> tuple[str, dict[int, list[str]] | No
     return stripped, by_job
 
 
+def _cluster_ids(text: str) -> list[str]:
+    """Cluster IDs on one line: the hidden ``<!-- R386 -->`` ones when present.
+
+    The plain-language summary names problems in words, so visible text
+    can hold a model name such as ``R1`` that is not a cluster.
+    """
+    hidden = _HTML_COMMENT_RE.findall(text)
+    if hidden:
+        return _CLUSTER_ID_RE.findall(" ".join(hidden))
+    return _CLUSTER_ID_RE.findall(_MD_LINK_TARGET_RE.sub("]", text))
+
+
 def job_clusters_from_markdown(report: str) -> dict[int, list[str]]:
     """Best-effort job -> cluster map read from the report's own tables.
 
@@ -441,7 +454,7 @@ def job_clusters_from_markdown(report: str) -> dict[int, list[str]]:
     for line in report.splitlines():
         stripped = line.strip()
         if stripped.startswith("### "):
-            section_ids = _CLUSTER_ID_RE.findall(_MD_LINK_TARGET_RE.sub("]", stripped))
+            section_ids = _cluster_ids(stripped)
             continue
         if stripped.startswith(("## ", "# ", "<details")):
             section_ids = []
@@ -451,7 +464,7 @@ def job_clusters_from_markdown(report: str) -> dict[int, list[str]]:
             continue
         ids = section_ids
         if stripped.startswith("|"):
-            ids = _CLUSTER_ID_RE.findall(_MD_LINK_TARGET_RE.sub("]", stripped)) or section_ids
+            ids = _cluster_ids(stripped) or section_ids
         for job_id in job_ids:
             entry = by_job.setdefault(int(job_id), [])
             entry.extend(i for i in dict.fromkeys(ids) if i not in entry)

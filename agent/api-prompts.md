@@ -276,7 +276,7 @@ You are a CI/CD expert. Produce the **top-of-issue Daily Cross-Workflow Summary*
 
 ### <!-- R1 --> 🆕 <Problem in plain words> — <workflows> · <✅ fix open | ❌ no fix>
 - **Status**: facts only
-- **Top hypothesis**: `[CONFIDENCE]` <suspected change first, if any> <hypothesis>; **What argues against it**: <one line> or `none found`
+- **Top hypothesis**: `[CONFIDENCE]` <suspected change first, if any> <hypothesis>; **disconfirming**: <one line> or `none found`
 - **In-flight fix**: ✅ [#N](url) | ❌ none
 - **Suggested triage**: <one or two concrete steps>
 
