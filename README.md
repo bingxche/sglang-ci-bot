@@ -75,7 +75,7 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 <a id="r2"></a>**R2. Every write outside this repo passes a code gate.**
 - New writers start in dry-run behind a repository variable.
 - Posts are capped per tick and made at most once per PR (hidden markers).
-- The bot @-mentions only the person who ran a command, and the author of a suspect PR asked to review a fix.
+- The bot @-mentions only the person who ran a command, and on a suspect PR comment the people who made that PR: its author, plus a cc to whoever merged it, its co-authors and its reviewers (bots dropped, at most [`MAX_CC`](scripts/suspect_pr_comments.py)), so a break reaches someone even when the author is away.
 
 *Why:* a wrong comment on someone else's PR costs trust that is hard to win back. *Kept by:* [`tests/test_suspect_pr_comments.py`](tests/test_suspect_pr_comments.py).
 
@@ -259,7 +259,8 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
    - the compare API puts the commit inside the window;
    - an open fix PR, if one is linked, is by someone else (a merged fix skips the suspect);
    - the PR has no earlier suspect comment, for any cluster ID, since cluster IDs change daily.
-2. **Post**: at most 3 comments per tick, strongest first. A comment states what fails, the commit window, and up to 8 job links, and asks the author to say so if their PR is not the cause. With an open fix PR, the comment instead @-mentions the author and asks them to review the fix, once per fix PR.
+2. **Post**: at most 3 comments per tick, strongest first. A comment states what fails, the commit window, and up to 8 job links, and asks the author to say so if their PR is not the cause. With an open fix PR, the comment instead asks the author to review the fix, once per fix PR.
+   - **Who is mentioned** ([`pr_people()`](scripts/suspect_pr_comments.py)): the PR's author, then a `cc` line naming, with their role, whoever merged the PR, the authors of its commits and of `Co-authored-by` trailers with a GitHub noreply address, and everyone who submitted a review. Bots (account type `Bot`, `[bot]` logins, AI-tool trailers) are dropped, and the cc stops at 6 people. Mentions inside the agent's evidence stay neutralized.
 3. **Log**: one comment on the daily issue records every decision and why.
 
 **Modes**, set by the repository variable `SUSPECT_PR_COMMENTS`: `dry-run` (the default: nothing is posted upstream, only the log), `post`, or `off`.

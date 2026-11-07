@@ -36,8 +36,16 @@ def _suspect(**overrides) -> dict:
 
 class FakeGitHub:
     def __init__(self, merged_at="2026-10-21T05:32:30Z", merge_sha=SHA,
-                 statuses=None, comments=None, fixes=None):
+                 statuses=None, comments=None, fixes=None, author="pr-author",
+                 merged_by="merger", commits=None, reviews=None, user_types=None):
         self.merged_at = merged_at
+        self.author = author
+        self.merged_by = merged_by
+        self.commits = commits or []
+        self.reviews = reviews or []
+        # login -> account type, for co-author trailers
+        self.user_types = user_types or {}
+        self.user_lookups = []
         # fix PR number -> its pull payload
         self.fixes = fixes or {}
         self.merge_sha = merge_sha
@@ -51,7 +59,8 @@ class FakeGitHub:
         if pr in self.fixes:
             return self.fixes[pr]
         return {"number": pr, "merged_at": self.merged_at, "merge_commit_sha": self.merge_sha,
-                "user": {"login": "pr-author"}}
+                "user": {"login": self.author, "type": "User"},
+                "merged_by": {"login": self.merged_by, "type": "User"} if self.merged_by else None}
 
     def full_sha(self, sha):
         return SHA if SHA.startswith(sha) else None
@@ -64,6 +73,18 @@ class FakeGitHub:
 
     def pr_comments(self, pr):
         return self.comments
+
+    def pr_commits(self, pr):
+        self.calls += 1
+        return self.commits
+
+    def pr_reviews(self, pr):
+        self.calls += 1
+        return self.reviews
+
+    def user_type(self, login):
+        self.user_lookups.append(login)
+        return self.user_types.get(login, "")
 
 
 class SuspectBlockTest(unittest.TestCase):
@@ -125,7 +146,8 @@ class CheckSuspectTest(unittest.TestCase):
         self.assertTrue(body.startswith(spc.fix_marker(45656)))
         self.assertIn("@pr-author AMD CI jobs started failing", body)
         self.assertIn("#45656 proposes a fix. Could you review it?", body)
-        # The author is the only mention; the evidence's are still neutralized.
+        self.assertIn("\ncc @merger (merged)\n", body)
+        # Only the PR's people are mentioned; the evidence's are still neutralized.
         self.assertIn("`@someone`", body)
         log_body = spc.render_log_comment([d], "post", "2026-10-28 18:00 UTC")
         self.assertIn("would comment (review request for #45656)", log_body)
@@ -202,6 +224,69 @@ class RenderTest(unittest.TestCase):
         self.assertIn("Also involved: #45112.", body)
         self.assertIn("Posted automatically by [amd-bot](https://github.com/amd-bot)", body)
         self.assertNotIn("sglang-ci-bot", body)
+
+    def test_mentions_the_author_and_ccs_who_worked_on_the_pr(self):
+        def commit(login, message="Change", type_="User"):
+            return {"author": {"login": login, "type": type_} if login else None,
+                    "commit": {"message": message}}
+
+        def review(login, state, type_="User"):
+            return {"user": {"login": login, "type": type_}, "state": state}
+
+        gh = FakeGitHub(
+            # sgl-project/sglang#48547: merged by a maintainer who also pushed commits.
+            merged_by="hnyls2002",
+            commits=[
+                commit("pr-author"),
+                commit("HNYLS2002"),
+                commit(None, "Fix\n\nCo-authored-by: Pair <123+pair@users.noreply.github.com>\n"
+                             "Co-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>\n"
+                             "Co-authored-by: Claude <noreply@anthropic.com>"),
+                commit("dependabot[bot]", type_="Bot"),
+            ],
+            reviews=[
+                review("claude[bot]", "COMMENTED", "Bot"),
+                review("rev1", "APPROVED"),
+                review("hnyls2002", "APPROVED"),
+                review("drafty", "PENDING"),
+                review("pr-author", "COMMENTED"),
+            ],
+            user_types={"pair": "User", "Copilot": "Bot"},
+        )
+        d = spc.check_suspect(_suspect(), [1, 2], gh, NOW)
+        self.assertEqual(d.cc, [
+            ("hnyls2002", ["merged", "co-author", "reviewed"]),
+            ("pair", ["co-author"]),
+            ("rev1", ["reviewed"]),
+        ])
+        self.assertEqual(gh.user_lookups, ["pair", "Copilot"])
+        body = spc.render_pr_comment(d, {})
+        self.assertIn("@pr-author AMD CI jobs started failing", body)
+        self.assertIn(
+            "\ncc @hnyls2002 (merged, co-author, reviewed), @pair (co-author), @rev1 (reviewed)\n",
+            body,
+        )
+        self.assertNotIn("@Copilot", body)
+        self.assertNotIn("@claude", body)
+        self.assertNotIn("@drafty", body)
+
+    def test_cc_is_capped(self):
+        reviews = [{"user": {"login": f"r{i}", "type": "User"}, "state": "APPROVED"} for i in range(10)]
+        d = spc.check_suspect(_suspect(), [1, 2], FakeGitHub(reviews=reviews), NOW)
+        self.assertEqual(len(d.cc), spc.MAX_CC)
+        self.assertEqual(d.cc[0], ("merger", ["merged"]))
+
+    def test_bot_author_is_not_mentioned(self):
+        d = spc.check_suspect(_suspect(), [1, 2], FakeGitHub(author="sglang-bot[bot]", merged_by=None), NOW)
+        body = spc.render_pr_comment(d, {})
+        self.assertIn(spc.pr_marker("R281") + "\nAMD CI jobs started failing", body)
+        self.assertNotIn("cc @", body)
+
+    def test_people_are_not_looked_up_unless_posting(self):
+        gh = FakeGitHub(comments=[{"body": spc.pr_marker("R281"), "html_url": "u"}])
+        d = spc.check_suspect(_suspect(), [1, 2], gh, NOW)
+        self.assertEqual((d.result, d.cc), ("already", []))
+        self.assertEqual(gh.calls, 1)  # the PR itself only
 
     def test_mentions(self):
         self.assertEqual(
