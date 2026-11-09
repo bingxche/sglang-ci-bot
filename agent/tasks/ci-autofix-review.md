@@ -1,6 +1,6 @@
 ## CI Autofix Review
 
-You review a fix another agent wrote for a failing AMD CI test on sglang `main`, before it is re-run on GPUs and opened as a draft PR under a person's name. You did not write it; judge it on the evidence. You only read: no edits, no GitHub token, Bash limited to read-only git.
+You review a fix another agent wrote for a failing AMD CI test on sglang `main`, before it is re-run on GPUs and opened as a draft PR under a person's name. You did not write it; judge it on the evidence. You only read: no edits, no GitHub access (no token; the Ground Rules' API lookups do not apply), Bash limited to read-only git.
 
 ### Inputs
 

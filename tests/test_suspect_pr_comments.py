@@ -177,10 +177,12 @@ class CheckSuspectTest(unittest.TestCase):
     def test_autofix_workaround_gets_no_review_request(self):
         # ci-autofix asks the suspect PR's author to review only a fix of the root cause.
         fixes = self._fix(author="bingxche")
-        fixes[45656]["body"] = "## Modifications\n\n### Workaround\n\nskip\n\n<!-- amd-bot-autofix: R281 -->"
+        data = '<!-- amd-bot-autofix-data:v1 {"problem":"R281","fix_kind":"%s","workflow":"pr-test-amd.yml"} -->'
+        fixes[45656]["body"] = "## Modifications\n\nskip\n\n<!-- amd-bot-autofix: R281 -->\n" + data % "workaround"
         d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=fixes))
         self.assertEqual((d.result, d.fix), ("post", None))
-        fixes[45656]["body"] = "## Modifications\n\nUse the 64-bit mask.\n\n<!-- amd-bot-autofix: R281 -->"
+        # A root-cause fix is reviewed, even if its prose mentions a workaround heading.
+        fixes[45656]["body"] = "### Workaround\n\n<!-- amd-bot-autofix: R281 -->\n" + data % "root-cause"
         d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=fixes))
         self.assertEqual(d.fix["number"], 45656)
 

@@ -23,7 +23,7 @@ from autofix_ci import (
     recipe_for,
     test_outcome,
 )
-from autofix_config import AUTOFIX_WORKFLOWS, HISTORY_RUNS, NOT_FIXED
+from autofix_config import AUTOFIX_WORKFLOWS, HISTORY_RUNS, HISTORY_SCAN, NOT_FIXED
 from autofix_github import GitHub
 from daily_cross_workflow_summary import (
     _cluster_ids,
@@ -60,10 +60,18 @@ def problem_sections(summary: str) -> dict[str, dict]:
     """Per problem ID: its plain-language name and whether the report shows a fix."""
     out: dict[str, dict] = {}
     current: list[str] = []
+    # Hidden `<!-- R386 -->` IDs; reports before 2026-11-06 wrote them as visible text. A report
+    # with hidden IDs is never read for visible ones: there `R1` can be a model name.
+    hidden = _HEADING_ID_RE.search(summary) is not None
     for line in summary.splitlines():
         s = line.strip()
-        # Hidden `<!-- R386 -->` IDs; reports before 2026-11-06 wrote them as visible text.
-        ids = _cluster_ids(s) if s.startswith(("### ", "|")) else []
+        if not s.startswith(("### ", "|")):
+            ids = []
+        elif hidden:
+            m = _HEADING_ID_RE.search(s)
+            ids = re.findall(r"R\d+", m.group(1)) if m else []
+        else:
+            ids = _cluster_ids(s)
         if s.startswith("### ") or ids:
             text = _HEADING_ID_RE.sub("", s.lstrip("#").strip()).strip()
             cells = [c.strip() for c in re.split(r" — | \| ", text.strip("| "))]
@@ -244,7 +252,7 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
         if not job_tests:
             continue
         statuses: list[tuple[str, dict]] = []
-        for run in gh.scheduled_runs(j["workflow"]):
+        for run in gh.scheduled_runs(j["workflow"])[:HISTORY_SCAN]:
             if len(statuses) >= HISTORY_RUNS:
                 break
             match = next((x for x in gh.jobs(run["id"]) if x["name"] == j["job_name"]), None)
@@ -256,7 +264,8 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
                 outs = [test_outcome(gh.job_log(match["id"]), f, fn) for f, fn in job_tests]
                 status = "failed" if outs and all(o.status == "failed" for o in outs) else "other"
             statuses.append((status, {"run_id": run["id"], "run_url": run["html_url"], "sha": run["head_sha"],
-                                      "date": run["created_at"][:10], "job_url": match["html_url"]}))
+                                      "date": run["created_at"][:10], "at": run["created_at"],
+                                      "job_url": match["html_url"]}))
             if status != "failed":
                 break
         if not fails_for_sure([s for s, _ in statuses]):
@@ -266,8 +275,8 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
         if ff and (first_fail is None or ff["date"] < first_fail["date"]):
             first_fail, last_pass, streak = ff, lp, n
 
-    since = (first_fail or {}).get("date") or (now - timedelta(days=14)).strftime("%Y-%m-%d")
-    fix = find_fix_pr(gh, tests, since)
+    since = (first_fail or {}).get("at") or (now - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fix = find_fix_pr(gh, tests, since, exclude={(p.suspect or {}).get("pr")})
     if fix:
         return None, f"fix PR #{fix} names the test file"
 
@@ -307,27 +316,32 @@ def plan_recipe(group: list[tuple[Recipe, dict]]) -> dict:
             "families": list(dict.fromkeys(job_family(j["job_name"]) for _, j in group))}
 
 
-def find_fix_pr(gh: GitHub, tests: list[tuple[str, str]], since: str) -> int | None:
-    """An open or merged sglang PR created since *since* whose title, body or diff names a test file.
+def find_fix_pr(gh: GitHub, tests: list[tuple[str, str]], since: str, exclude=frozenset()) -> int | None:
+    """An open or merged sglang PR since the first failure (*since*, the failing run's ISO start time)
+    whose title, body or diff names a test file. PRs in *exclude* (the suspect PR) do not count.
 
-    Title and body: the search API. Diff: the files and patches of open PRs
-    created since then, and the commits on main that touched the test file.
+    Cheapest first: the commits on main that touched the test file after the
+    failing run started (the commit that broke it came before), then the
+    search API for titles and bodies, then the files of open PRs.
     """
     names = sorted({Path(f).name for f, _ in tests})
-    for name in names:
-        for item in gh.search_prs(f'"{Path(name).stem}" created:>={since}'):
-            pr = item.get("pull_request") or {}
-            if item.get("state") == "open" or pr.get("merged_at"):
-                return item["number"]
-    for pr in gh.open_prs(since):
-        for f in gh.pr_files(pr["number"]):
-            if Path(f.get("filename", "")).name in names or any(n in (f.get("patch") or "") for n in names):
-                return pr["number"]
+    day = since[:10]
     for f, _ in tests:
         for c in gh.commits_touching(f, since):
             m = re.search(r"\(#(\d+)\)\s*$", c["commit"]["message"].split("\n", 1)[0])
-            if m:
+            if m and int(m.group(1)) not in exclude:
                 return int(m.group(1))
+    for name in names:
+        for item in gh.search_prs(f'"{Path(name).stem}" created:>={day}'):
+            pr = item.get("pull_request") or {}
+            if item["number"] not in exclude and (item.get("state") == "open" or pr.get("merged_at")):
+                return item["number"]
+    for pr in gh.open_prs(day):
+        if pr["number"] in exclude:
+            continue
+        for f in gh.pr_files(pr["number"]):
+            if Path(f.get("filename", "")).name in names or any(n in (f.get("patch") or "") for n in names):
+                return pr["number"]
     return None
 
 

@@ -18,11 +18,11 @@ The prompt starts with a `Task:` line naming the task; the remaining lines are m
 
 ## Ground Rules
 
-- **READ-ONLY workspace.** Do NOT modify, create, or delete any source files under `/workspace/sglang`. The one exception is the CI Autofix task, which edits its own worktree as its instructions say.
+- **READ-ONLY workspace.** Do NOT modify, create, or delete any source files under `/workspace/sglang`, unless your task's instructions give you a worktree to edit.
 - **No git write commands.** Do NOT run `git checkout`, `git reset`, `git commit`, `git branch`, `git merge`, `git rebase`, or `git stash`.
 - **Read-only git is fine.** You may freely run `git log`, `git blame`, `git diff`, `git show`, `git log --all`, etc.
 - **Each invocation is atomic.** Do not assume any state from previous runs. Start fresh every time.
-- **GitHub API via curl.** Use `curl -H "Authorization: token $GH_PAT"` for all API calls. When `$GH_PAT` is not set (the CI Autofix tasks), there is no GitHub access: work from `.ci-context/` and the local git history, and skip the lookups below that need the API.
+- **GitHub API via curl.** Use `curl -H "Authorization: token $GH_PAT"` for all API calls, unless your task's instructions say you have no GitHub access.
 - **Be evidence-based.** Always cite specific file paths, line numbers, and commit SHAs. Do not speculate without evidence.
 - **All analysis is at the test file + test function level.** Never report failures at just the job or run level. Always identify the specific test file (e.g. `test/srt/test_mla.py`) and test function (e.g. `test_mla_correctness`) that failed. This applies to everything: failure identification, regression tracking, PR correlation, and cross-job summaries.
 - **Verify every commit SHA.** Before citing a commit, run `git show <sha> --stat` or `git log --oneline <sha> -1` to confirm it exists. If the SHA is not in the local repo (shallow clone), use the GitHub API: `curl -s -H "Authorization: token $GH_PAT" https://api.github.com/repos/sgl-project/sglang/commits/<sha> | head -5`. NEVER fabricate or guess a commit SHA.

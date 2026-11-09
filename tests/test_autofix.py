@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -741,7 +743,7 @@ class TickTest(unittest.TestCase):
                  recipe={**VerifyRunTest.PLAN["recipe"], "inputs": {"target_stage": "x"}},
                  first_fail=None, failing_runs=2)
         record = {"branch": "bingxche/autofix-r386-x", "base_sha": "base", "fix": fix_report(),
-                  "title": "[Fix] [AMD] attention: x", "message": "m", "patch": "diff --git a/x b/x\n",
+                  "title": "[Fix] [AMD] attention: x", "message": "m", "patch": b"diff --git a/x b/x\r\n\xff",
                   "diff": "d", "checks": {"pre_commit": True, "review": "PASS"}}
         gh = mock.Mock()
         common = dict(
@@ -760,13 +762,15 @@ class TickTest(unittest.TestCase):
                                      build_plan=mock.Mock(return_value=(p, "")), start_attempt=start, **common):
                 autofix.fix_phase("t", "o/r", "live", 3, gh, handoff, NOW)
             self.assertEqual((posted, updated), ([], []))
-            self.assertEqual(autofix.patch_path(handoff, "R386").read_text(), record["patch"])
+            # Byte for byte: CRLF and non-UTF-8 text survive the handover.
+            self.assertEqual(autofix.patch_path(handoff, "R386").read_bytes(), record["patch"])
             data = json.loads((handoff / autofix.STATE_FILE).read_text())
             self.assertEqual(data["state"]["problems"]["R386"]["status"], "ready")
             self.assertNotIn("patch", data["state"]["problems"]["R386"]["attempt"])
 
             # The publish job: pushes the patch and dispatches the job.
-            pushed = mock.Mock(return_value={"head_sha": "abc", "dispatched_at": NOW.isoformat()})
+            pushed = mock.Mock(side_effect=lambda plan, rec, patch, gh: rec.update(
+                head_sha="abc", dispatched_at=NOW.isoformat()))
             with mock.patch.multiple(autofix, push_and_dispatch=pushed, **common):
                 autofix.publish_phase("t", "o/r", "live", 3, gh, handoff, NOW)
             self.assertEqual(pushed.call_args.args[2], record["patch"])
@@ -794,6 +798,7 @@ class TickTest(unittest.TestCase):
         gh = mock.Mock()
         state = autofix.new_day_state({}, "2026-11-09", NOW)
         entry = {"name": "x", "attempts": 1, "status": "dispatched", "updated": NOW.isoformat(),
+                 "pushed": ["bingxche/autofix-r1-x"],
                  "plan": {"tests": []}, "attempt": {"branch": "bingxche/autofix-r1-x", "head_sha": "a", "diff": ""}}
         state["problems"]["R1"] = entry
         failed = {"done": True, "ok": False, "reasons": ["`t.py::f` failed"], "results": []}
@@ -823,6 +828,7 @@ class AttemptTest(unittest.TestCase):
                 af_agents, git=mock.Mock(return_value="base\n"), create_agent_worktree=mock.Mock(return_value=Path(tmp)),
                 remove_agent_worktree=mock.Mock(), collect_ci_runtime_env=mock.Mock(return_value=""),
                 run_fix_agent=mock.Mock(return_value=fix_report()), staged_diff=mock.Mock(return_value=self.DIFF),
+                staged_patch=mock.Mock(return_value=self.DIFF.encode()),
                 run_checks=mock.Mock(return_value=([], {"pre_commit": True})), run_review_agent=review):
             result = af_agents.start_attempt(self.PLAN, 1, mock.Mock(), "base")
         return result, review
@@ -841,6 +847,135 @@ class AttemptTest(unittest.TestCase):
         result, review = self.attempt([fail, fail])
         self.assertEqual((result.status, review.call_count), ("failed", 2))
         self.assertIn("root cause not shown", result.reason)
+
+
+class ReviewFixesTest(unittest.TestCase):
+    """The second code review's findings, one test each."""
+
+    def test_the_culprit_and_the_suspect_are_not_a_fix(self):
+        gh = FakeGitHub(["failed", "failed"])
+        culprit = {"commit": {"message": "[Fix] dsa: add indexer RoPE (#48547)\n\nbody"}}
+        gh.commits_touching = mock.Mock(return_value=[culprit])
+        self.assertIsNone(af_select.find_fix_pr(gh, [(TEST_FILE, TEST_FUNC)], "2026-11-06T13:10:00Z", exclude={48547}))
+        # Commits are looked up from the failing run's start time, not from midnight.
+        self.assertEqual(gh.commits_touching.call_args.args[1], "2026-11-06T13:10:00Z")
+
+    def test_a_later_stage_not_listed_yet_is_waited_for(self):
+        plan = {**VerifyRunTest.PLAN, "recipe": {"workflow": "pr-test-amd.yml", "families": [
+            af_ci.job_family(SMALL), af_ci.job_family("stage-c-test-4-gpu-amd (rocm10, linux-mi300-4gpu-sglang, 0)")]}}
+        run = {**VerifyRunTest.RUN, "status": "in_progress"}
+        v = af_ci.verify_run(plan, VerifyRunTest.REC, run, VerifyRunTest().jobs(), lambda _: PASSED_LOG)
+        self.assertFalse(v["done"])
+        v = af_ci.verify_run(plan, VerifyRunTest.REC, VerifyRunTest.RUN, VerifyRunTest().jobs(), lambda _: PASSED_LOG)
+        self.assertTrue(v["done"])
+        self.assertIn("has no", " ".join(v["reasons"]))
+
+    def test_the_job_that_names_the_test_decides(self):
+        jobs = [{"id": i, "name": SMALL.replace(", 3)", f", {i})"), "status": "completed",
+                 "labels": ["linux-mi300-1gpu-sglang"], "html_url": f"https://j/{i}"} for i in (1, 2)]
+        logs = {1: "no suite markers here\nRan 3 tests\nOK (skipped=1)",
+                2: "test_first_chunk_reads_fp8_pool (__main__.TestMiniMaxHD128AsmPrefill.test_first_chunk_reads_fp8_pool) ... ok"}
+        v = af_ci.verify_run(VerifyRunTest.PLAN, VerifyRunTest.REC, VerifyRunTest.RUN, jobs, logs.get)
+        self.assertTrue(v["ok"], v["reasons"])
+        self.assertEqual(v["results"][0]["job_url"], "https://j/2")
+
+    def test_an_interrupted_attempt_counts(self):
+        state = af_state.new_day_state({}, "2026-11-09", NOW)
+        p = {"id": "R1", "name": "x"}
+        autofix.mark_running(state, p, 1, NOW)
+        autofix.mark_running(state, {"id": "R2", "name": "y"}, 2, NOW)
+        autofix.finish_interrupted(state, NOW)
+        self.assertEqual((state["problems"]["R1"]["status"], state["problems"]["R1"]["attempts"]), ("retry", 1))
+        self.assertEqual(state["problems"]["R2"]["status"], "gave-up")
+
+    def test_an_unavailable_model_is_not_an_attempt(self):
+        state = af_state.new_day_state({}, "2026-11-09", NOW)
+        p = {"id": "R1", "name": "x"}
+        autofix.mark_running(state, p, 2, NOW)
+        autofix.record_attempt(state, "R1", p, 2, af_agents.AttemptResult("model-unavailable", "404"), NOW)
+        self.assertEqual((state["problems"]["R1"]["status"], state["problems"]["R1"]["attempts"]), ("retry", 1))
+
+    def test_a_branch_pushed_before_a_failed_dispatch_is_deleted_on_give_up(self):
+        state = af_state.new_day_state({}, "2026-11-09", NOW)
+        state["problems"]["R1"] = {"name": "x", "attempts": 2, "status": "ready", "updated": NOW.isoformat(),
+                                   "plan": {"id": "R1", "tests": []},
+                                   "attempt": {"branch": "bingxche/autofix-r1-x", "base_sha": "b"}}
+        gh = mock.Mock()
+
+        def push_then_fail(plan, rec, patch, gh):
+            rec["head_sha"] = "abc"
+            raise requests.HTTPError("422 dispatch refused")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            handoff = Path(tmp)
+            autofix.patch_path(handoff, "R1").parent.mkdir(parents=True)
+            autofix.patch_path(handoff, "R1").write_bytes(b"diff")
+            autofix.save_handoff(handoff, 5, state)
+            with mock.patch.multiple(autofix, push_and_dispatch=push_then_fail, ensure_sglang_repo=mock.Mock(),
+                                     pr_template=mock.Mock(return_value=TEMPLATE), find_log_comment=mock.Mock(),
+                                     write_log=mock.Mock()):
+                autofix.publish_phase("t", "o/r", "live", 3, gh, handoff, NOW)
+        gh.delete_branch.assert_called_once_with("bingxche/autofix-r1-x")
+        self.assertEqual(state["problems"]["R1"]["status"], "ready")  # the saved copy; publish read its own
+
+    def test_publish_git_has_no_token_and_no_user_config(self):
+        env = af_github.clean_git_env(Path("/tmp/x"))
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertFalse({"GH_PAT", "AUTOFIX_TOKEN", "GITHUB_TOKEN"} & set(env))
+
+    def test_commit_and_push_run_no_hooks(self):
+        gh = mock.Mock(write_token="t")
+        gh.identity.return_value = ("bingxche", "1+bingxche@users.noreply.github.com")
+        calls = []
+        with mock.patch.object(af_github, "git", side_effect=lambda wt, *a, **k: calls.append(a) or "sha\n"):
+            af_github.push_branch(Path("."), "bingxche/autofix-r1-x", "m", gh)
+        commit = next(a for a in calls if "commit" in a)
+        push = next(a for a in calls if "push" in a)
+        for args in (commit, push):
+            self.assertIn("core.hooksPath=/dev/null", args)
+            self.assertIn("--no-verify", args)
+
+    def test_an_old_pr_from_the_same_branch_name_is_not_ours(self):
+        gh = af_github.GitHub("t")
+        old = {"number": 1, "state": "closed", "head": {"sha": "old"}}
+        with mock.patch.object(gh, "_get", return_value=[old]):
+            self.assertIsNone(gh.pr_for_branch("bingxche/autofix-r1-x", "new"))
+            self.assertEqual(gh.pr_for_branch("bingxche/autofix-r1-x", "old"), old)
+
+    def test_checks_run_agent_code_without_tokens(self):
+        envs = []
+
+        def fake_run(cmd, **kw):
+            envs.append(kw.get("env"))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"GH_PAT": "ghp_x", "AUTOFIX_TOKEN": "ghp_y", "PATH": "/bin"}), \
+                mock.patch.object(af_agents.subprocess, "run", side_effect=fake_run):
+            (Path(tmp) / "test").mkdir()
+            (Path(tmp) / "test" / "test_x.py").write_text("x = 1\n")
+            af_agents.run_checks(Path(tmp), ["test/test_x.py"])
+        self.assertEqual(len(envs), 2)  # pre-commit and pytest --collect-only
+        for env in envs:
+            self.assertNotIn("GH_PAT", env)
+            self.assertNotIn("AUTOFIX_TOKEN", env)
+
+    def test_a_malformed_problem_does_not_stop_the_others(self):
+        bad = af_select.Problem("R9", "bad", [{"job_id": 1, "job_name": SMALL, "run_url": "not-a-run",
+                                               "workflow": "pr-test-amd.yml", "analysis": ""}],
+                                tests=[(TEST_FILE, TEST_FUNC)])
+        good = problem()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.multiple(
+                autofix, find_issue=mock.Mock(return_value=5), read_state=mock.Mock(return_value=({}, None)),
+                ensure_sglang_repo=mock.Mock(), workflow_yaml_at=mock.Mock(return_value=YAMLS.get),
+                load_problems=mock.Mock(return_value=[bad, good]),
+                start_attempt=mock.Mock(return_value=af_agents.AttemptResult("failed", "x")),
+                deepen_clone=mock.Mock()):
+            autofix.fix_phase("t", "o/r", "live", 3, FakeGitHub(["failed", "failed", "passed"]), Path(tmp), NOW)
+            state = json.loads((Path(tmp) / autofix.STATE_FILE).read_text())["state"]
+        self.assertIn("could not plan it", state["problems"]["R9"]["skip"])
+        self.assertEqual(state["problems"]["R386"]["attempts"], 1)
 
 
 class PushGuardTest(unittest.TestCase):
@@ -904,6 +1039,7 @@ class PinnedModelTest(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--model") + 1], "Claude-Opus-5.5[1m]", task)
             self.assertEqual(cmd[cmd.index("--effort") + 1], "max", task)
             self.assertNotIn("--dangerously-skip-permissions", cmd)
+            self.assertIn("--restricted", cmd)
             self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
             allowed = cmd[cmd.index("--allowedTools") + 1:]
             self.assertNotIn("Bash", allowed)

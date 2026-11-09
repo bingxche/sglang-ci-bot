@@ -22,6 +22,7 @@ SCRIPTS = sorted((ROOT / "scripts").glob("*.py"))
 # Read by code but not ours to document.
 ENV_NOT_DOCUMENTED = {
     "GITHUB_OUTPUT",  # set by GitHub Actions
+    "PATH",           # passed through to git by autofix_github.clean_git_env
     "FOO",            # an example inside a prompt string in utils.py
 }
 

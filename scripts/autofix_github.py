@@ -3,6 +3,7 @@ dispatch, draft PR, branch deletion) only with ``AUTOFIX_TOKEN`` and only on
 ``BRANCH_PREFIX`` branches (``check_branch()``)."""
 
 import base64
+import os
 import subprocess
 import threading
 from datetime import datetime, timedelta
@@ -11,7 +12,10 @@ from pathlib import Path
 import requests
 
 from autofix_config import API, AUTOFIX_LOGIN, BRANCH_PREFIX, MAX_OPEN_PRS_SCANNED
-from utils import REPO, download_job_logs, get_pr_diff, get_run_jobs, gh_get, gh_headers
+from utils import REPO, download_job_logs, get_pr_changed_files, get_pr_diff, get_run_jobs, gh_get, gh_headers
+
+# Reads that hang would hold the hourly job (and every tick queued behind it).
+TIMEOUT = 60
 
 
 class GitHub:
@@ -28,7 +32,7 @@ class GitHub:
 
     # reads ---------------------------------------------------------------
     def _get(self, endpoint: str, **params):
-        resp = gh_get(f"{API}/{endpoint}", headers=gh_headers(self.token), params=params or None)
+        resp = gh_get(f"{API}/{endpoint}", headers=gh_headers(self.token), params=params or None, timeout=TIMEOUT)
         if resp.status_code in (404, 422):
             return None
         resp.raise_for_status()
@@ -59,7 +63,7 @@ class GitHub:
 
     def search_prs(self, query: str) -> list[dict]:
         resp = gh_get("https://api.github.com/search/issues", headers=gh_headers(self.token),
-                      params={"q": f"repo:{REPO} is:pr {query}", "per_page": 50})
+                      params={"q": f"repo:{REPO} is:pr {query}", "per_page": 50}, timeout=TIMEOUT)
         if resp.status_code == 422:
             return []
         resp.raise_for_status()
@@ -80,11 +84,12 @@ class GitHub:
 
     def pr_files(self, number: int) -> list[dict]:
         if number not in self._files:
-            self._files[number] = self._get(f"pulls/{number}/files", per_page=100) or []
+            self._files[number] = get_pr_changed_files(self.token, number)
         return self._files[number]
 
     def commits_touching(self, path: str, since: str) -> list[dict]:
-        return self._get("commits", path=path, since=f"{since}T00:00:00Z", sha="main", per_page=50) or []
+        """Commits on main that changed *path* after *since* (an ISO time)."""
+        return self._get("commits", path=path, since=since, sha="main", per_page=50) or []
 
     def pull(self, number: int) -> dict | None:
         return self._get(f"pulls/{number}")
@@ -101,10 +106,11 @@ class GitHub:
                          event="workflow_dispatch", per_page=20) or {}
         return data.get("workflow_runs") or []
 
-    def pr_for_branch(self, branch: str) -> dict | None:
-        """A PR already opened from *branch* (a tick that died after opening it)."""
-        prs = self._get("pulls", head=f"{REPO.split('/')[0]}:{branch}", state="all", per_page=5) or []
-        return prs[0] if prs else None
+    def pr_for_branch(self, branch: str, sha: str) -> dict | None:
+        """The PR already opened from *branch* at commit *sha* (a tick that died after opening it);
+        an older PR from a branch of the same name does not count."""
+        prs = self._get("pulls", head=f"{REPO.split('/')[0]}:{branch}", state="all", per_page=10) or []
+        return next((p for p in prs if (p.get("head") or {}).get("sha") == sha), None)
 
     # writes (AUTOFIX_TOKEN) ------------------------------------------------
     def _write(self, method: str, path: str, **kwargs) -> requests.Response:
@@ -117,7 +123,7 @@ class GitHub:
 
     def identity(self) -> tuple[str, str]:
         """(login, noreply email) of the token's owner, for commits."""
-        resp = gh_get("https://api.github.com/user", headers=gh_headers(self.write_token))
+        resp = gh_get("https://api.github.com/user", headers=gh_headers(self.write_token), timeout=TIMEOUT)
         resp.raise_for_status()
         user = resp.json()
         return user["login"], f"{user['id']}+{user['login']}@users.noreply.github.com"
@@ -149,33 +155,66 @@ def check_branch(branch: str) -> None:
         raise RuntimeError(f"refusing to touch {branch!r}: autofix branches start with {BRANCH_PREFIX}")
 
 
-def git(wt: Path, *args: str, timeout: int = 300, check: bool = True, env: dict | None = None) -> str:
-    result = subprocess.run(["git", *args], cwd=wt, capture_output=True, text=True, timeout=timeout,
-                            env=env)
+def git_bytes(wt: Path, *args: str, timeout: int = 300, check: bool = True, env: dict | None = None,
+              input: bytes | None = None) -> bytes:
+    """git, in bytes: a patch must reach the publish job byte for byte (CRLF, non-UTF-8 text)."""
+    result = subprocess.run(["git", *args], cwd=wt, capture_output=True, timeout=timeout, env=env, input=input)
     if check and result.returncode != 0:
-        raise RuntimeError(f"git {args[0]} failed: {result.stderr.strip()[:300]}")
+        raise RuntimeError(f"git {args[0]} failed: {result.stderr.decode(errors='replace').strip()[:300]}")
     return result.stdout
 
 
-def staged_diff(wt: Path, binary: bool = False) -> str:
-    """Everything the agent changed, new files included, without .ci-context."""
+def git(wt: Path, *args: str, timeout: int = 300, check: bool = True, env: dict | None = None,
+        input: bytes | None = None) -> str:
+    return git_bytes(wt, *args, timeout=timeout, check=check, env=env, input=input).decode(errors="replace")
+
+
+def staged_diff(wt: Path) -> str:
+    """Everything the agent changed, new files included, without .ci-context (for reading)."""
+    return staged_patch(wt).decode(errors="replace")
+
+
+def staged_patch(wt: Path) -> bytes:
+    """The same, as the binary patch the publish job applies."""
     git(wt, "add", "-A", "--", ".", ":(exclude).ci-context")
-    diff = git(wt, "diff", "--cached", *(["--binary"] if binary else []))
+    patch = git_bytes(wt, "diff", "--cached", "--binary")
     git(wt, "reset", "-q")
-    return diff
+    return patch
 
 
-def push_branch(wt: Path, branch: str, message: str, gh: GitHub) -> str:
-    """Commit the worktree's staged changes as the token's owner and push *branch*; returns the commit SHA."""
+def clean_git_env(home: Path) -> dict:
+    """Git with no user or system config and no token in the environment.
+
+    The fix job's agents run code on the same runners, so the home directory
+    and the shared clone may hold hooks or config (a filter, an fsmonitor)
+    that would run during the publish job's commit.
+    """
+    return {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "LANG": "C.UTF-8",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+
+
+def clean_checkout(repo: Path, sha: str, env: dict) -> None:
+    """A fresh clone holding only *sha*, for the publish job."""
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", env=env)
+    git(repo, "fetch", "-q", "--depth", "1", f"https://github.com/{REPO}.git", sha, timeout=900, env=env)
+    git(repo, "-c", "core.hooksPath=/dev/null", "checkout", "-q", "--detach", "FETCH_HEAD", env=env)
+
+
+def push_branch(wt: Path, branch: str, message: str, gh: GitHub, env: dict | None = None) -> str:
+    """Commit the worktree's staged changes as the token's owner and push *branch*; returns the commit SHA.
+    No hook runs: the commit is made with ``core.hooksPath=/dev/null`` and ``--no-verify``."""
     check_branch(branch)
     login, email = gh.identity()
     if login != AUTOFIX_LOGIN:
         raise RuntimeError(f"AUTOFIX_TOKEN belongs to {login}, not {AUTOFIX_LOGIN}; refusing to push")
-    git(wt, "-c", f"user.name={login}", "-c", f"user.email={email}", "commit", "-q", "-m", message)
-    sha = git(wt, "rev-parse", "HEAD").strip()
+    git(wt, "-c", "core.hooksPath=/dev/null", "-c", f"user.name={login}", "-c", f"user.email={email}",
+        "commit", "-q", "--no-verify", "-m", message, env=env)
+    sha = git(wt, "rev-parse", "HEAD", env=env).strip()
     auth = base64.b64encode(f"x-access-token:{gh.write_token}".encode()).decode()
-    git(wt, "-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {auth}",
-        "push", "--force", f"https://github.com/{REPO}.git", f"HEAD:refs/heads/{branch}", timeout=600)
+    git(wt, "-c", "core.hooksPath=/dev/null", "-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {auth}",
+        "push", "--no-verify", "--force", f"https://github.com/{REPO}.git", f"HEAD:refs/heads/{branch}",
+        timeout=600, env=env)
     return sha
 
 

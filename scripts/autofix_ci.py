@@ -413,7 +413,9 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
         return out
     families = set(plan["recipe"]["families"])
     mine = [j for j in jobs if job_family(j["name"]) in families]
-    if any(j.get("status") != "completed" for j in mine) or (not mine and run.get("status") != "completed"):
+    # A family with no job yet may be a later stage still waiting on `needs`: only a finished run says it is absent.
+    all_listed = families <= {job_family(j["name"]) for j in mine}
+    if any(j.get("status") != "completed" for j in mine) or (not all_listed and run.get("status") != "completed"):
         return out
     out["done"] = True
     want_labels = {job_family(j["job_name"]): sorted(j.get("labels") or []) for j in plan["jobs"]}
@@ -430,10 +432,11 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
             before.setdefault(tuple(t), f"{j['run_url']}/job/{j['job_id']}")
     accuracy, speed = [], []
     for f, fn in plan["tests"]:
-        # The job that ran the file; a job that died before running any file says nothing.
+        # The job that ran the file and says how the test ended; a job that died before running
+        # any file, or does not name the test, says nothing.
         outcomes = [(test_outcome(job_log(j["id"]), f, fn), j) for j in mine]
-        best = next((x for x in outcomes if x[0].ran_file and x[0].status != "not-run"), None) or \
-            next((x for x in outcomes if x[0].status != "not-run"), None)
+        ran = [x for x in outcomes if x[0].status != "not-run"]
+        best = min(ran, key=lambda x: (x[0].status == "unknown", not x[0].ran_file), default=None)
         if not best:
             out["reasons"].append(f"`{f}` did not run")
             continue

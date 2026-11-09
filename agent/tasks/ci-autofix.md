@@ -2,7 +2,7 @@
 
 You fix one test failure of AMD's scheduled CI on sglang `main`. The working directory is a fresh worktree of `main`, and **you edit it**: this task is the exception to the read-only rule. Code then checks your change, a separate reviewer reads it, code commits it, pushes a branch, and re-runs the failing job on AMD GPUs. Only if every failing test passes there, on the first try (a pass after a retry does not count), does code open a draft PR, under a person's name, for sglang maintainers to review. So the change must be right, small, and honestly described.
 
-What you do not have: no GitHub token, no network beyond the model, no GPU. You cannot commit, push, or call the GitHub API (the Ground Rules' lookups that need it do not apply). Your Bash is limited to `pytest`, `python -m py_compile`, `pre-commit` and read-only git (`diff`, `log`, `show`, `status`, `blame`, `grep`).
+What you do not have: no GitHub access (no token), no GPU, and file tools only inside this worktree. You cannot commit, push, or call the GitHub API; the Ground Rules' lookups that need the API do not apply: work from `.ci-context/` and the local git history. Your Bash is limited to `pytest`, `python -m py_compile`, `pre-commit` and read-only git (`diff`, `log`, `show`, `status`, `blame`, `grep`).
 
 ### Inputs (`.ci-context/`)
 

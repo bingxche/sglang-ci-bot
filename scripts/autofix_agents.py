@@ -4,7 +4,6 @@ patch for the publish job; nothing here writes to GitHub."""
 
 import json
 import logging
-import os
 import re
 import subprocess
 import sys
@@ -21,7 +20,7 @@ from autofix_config import (
     REVIEW_MAX_TURNS,
     REVIEW_TIMEOUT_SECS,
 )
-from autofix_github import REPO_LOCK, GitHub, git, staged_diff
+from autofix_github import REPO_LOCK, GitHub, git, staged_diff, staged_patch
 from autofix_pr import (
     TEST_PATH_RE,
     build_title,
@@ -38,6 +37,7 @@ from utils import (
     claude_code_analyze,
     collect_ci_runtime_env,
     create_agent_worktree,
+    env_without_tokens,
     remove_agent_worktree,
 )
 
@@ -114,13 +114,15 @@ def run_checks(wt: Path, files: list[str]) -> tuple[list[str], dict]:
     ``pytest --collect-only`` on changed test files; a test that needs a GPU-only
     package falls back to compiling it."""
     problems, checks = [], {"pre_commit": False, "tests_changed": False}
+    # These run code the agent wrote (its tests, its hook config): no token may be in reach.
+    env = env_without_tokens()
     existing = [f for f in files if (wt / f).exists()]
     if existing:
         out = ""
         for _ in range(2):
             try:
                 pc = subprocess.run(["pre-commit", "run", "--files", *existing], cwd=wt, capture_output=True,
-                                    text=True, timeout=1800)
+                                    text=True, timeout=1800, env=env)
             except FileNotFoundError:
                 out = "pre-commit is not installed on the runner"
                 break
@@ -135,13 +137,14 @@ def run_checks(wt: Path, files: list[str]) -> tuple[list[str], dict]:
     for f in tests:
         r = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", f], cwd=wt,
                            capture_output=True, text=True, timeout=600,
-                           env={**os.environ, "PYTHONPATH": str(wt / "python")})
+                           env={**env, "PYTHONPATH": str(wt / "python")})
         out = r.stdout + r.stderr
         if r.returncode == 0:
             continue
         missing = re.search(r"No module named '([\w.]+)'", out)
         if missing and not missing.group(1).startswith("sglang"):
-            c = subprocess.run([sys.executable, "-m", "py_compile", f], cwd=wt, capture_output=True, text=True)
+            c = subprocess.run([sys.executable, "-m", "py_compile", f], cwd=wt, capture_output=True, text=True,
+                               env=env)
             if c.returncode == 0:
                 continue
         problems.append(f"{f} does not collect: " + " ".join(out.split())[-300:])
@@ -150,26 +153,33 @@ def run_checks(wt: Path, files: list[str]) -> tuple[list[str], dict]:
 
 @dataclass
 class AttemptResult:
-    status: str                  # dispatched / failed / model-unavailable / no-fix
+    status: str                  # ready / failed / model-unavailable / no-fix
     reason: str = ""
     record: dict = field(default_factory=dict)
 
 
+def deepen_clone(plans: list[dict]) -> None:
+    """Fetch main back to the oldest failure window of *plans*, once, before the attempts start.
+
+    ``--shallow-since`` can also make history shorter, so it must not run while
+    an agent reads the clone's history.
+    """
+    dates = [d for p in plans for d in [(p.get("last_pass") or p.get("first_fail") or {}).get("date")] if d]
+    if dates:
+        git(SGLANG_REPO_PATH, "fetch", "-q", "origin", "main", f"--shallow-since={min(dates)}",
+            timeout=900, check=False)
+
+
 def start_attempt(plan: dict, attempt: int, gh: GitHub, base_ref: str = "origin/main",
-                  previous: str = "", branch_tag: str = "", fetch_main: bool = True) -> AttemptResult:
+                  previous: str = "", branch_tag: str = "") -> AttemptResult:
     """Run the fix and review agents and gate the result; ``ready`` carries the patch.
 
     Runs in the ``fix`` job, which holds no token that can write anywhere; the
     ``publish`` job pushes the patch (``push_and_dispatch()``). The caller has
-    run ``ensure_sglang_repo()``; attempts run in parallel threads. The smoke
-    test passes ``fetch_main=False``: its clone ends at a past commit, and
-    fetching main would show the agents the human fix.
+    run ``ensure_sglang_repo()`` and ``deepen_clone()``; attempts run in
+    parallel threads.
     """
     with REPO_LOCK:  # `git worktree add` on the shared clone is not safe to run concurrently
-        since = (plan.get("last_pass") or plan.get("first_fail") or {}).get("date")
-        if since and fetch_main:  # the shallow clone must reach back to the failure window for `git show`
-            git(SGLANG_REPO_PATH, "fetch", "-q", "origin", "main", f"--shallow-since={since}",
-                timeout=600, check=False)
         base_sha = git(SGLANG_REPO_PATH, "rev-parse", base_ref).strip()
         wt = create_agent_worktree(f"autofix-{plan['id']}-{attempt}{branch_tag}", base_sha)
     try:
@@ -233,7 +243,7 @@ def start_attempt(plan: dict, attempt: int, gh: GitHub, base_ref: str = "origin/
         return AttemptResult("ready", record={
             "branch": f"{BRANCH_PREFIX}{branch_tag}{plan['id'].lower()}-{_slug(plan['name'])}",
             "base_sha": base_sha, "fix": fix, "title": title, "message": message,
-            "patch": staged_diff(wt, binary=True), "diff": final[-MAX_STATE_DIFF:],
+            "patch": staged_patch(wt), "diff": final[-MAX_STATE_DIFF:],
             "checks": {**checks, "review": review.get("verdict", "")},
         })
     except ModelUnavailable as exc:

@@ -215,11 +215,14 @@ def pr_people(pr: int, pull: dict, author: str, gh: GitHub) -> list[tuple[str, l
     return list(roles.values())[:MAX_CC]
 
 
+_AUTOFIX_DATA_RE = re.compile(r'<!-- amd-bot-autofix-data:v1 \{.*?"fix_kind":"([\w-]+)"')
+
+
 def is_autofix_workaround(pull: dict) -> bool:
-    """A draft PR from ci-autofix (``autofix.py``) that works around the failure instead of fixing its cause."""
-    body = pull.get("body") or ""
-    labels = {lb.get("name") for lb in pull.get("labels") or []}
-    return "<!-- amd-bot-autofix: " in body and ("### Workaround" in body or "workaround" in labels)
+    """A draft PR from ci-autofix (``autofix.py``) that works around the failure instead of fixing its cause.
+    Its hidden data block says so (``fix_kind``); edited prose or labels do not change it."""
+    m = _AUTOFIX_DATA_RE.search(pull.get("body") or "")
+    return bool(m) and m.group(1) == "workaround"
 
 
 def check_fix(fix_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:

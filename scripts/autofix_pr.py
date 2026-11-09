@@ -283,7 +283,7 @@ def render_test_plan(plan: dict, verification: dict) -> str:
 
 def open_pr(plan: dict, rec: dict, verification: dict, gh: GitHub, template: str) -> dict:
     """Open the draft PR, unless an earlier tick already did (R8)."""
-    existing = gh.pr_for_branch(rec["branch"])
+    existing = gh.pr_for_branch(rec["branch"], rec["head_sha"])
     if existing:
         return existing
     body = render_pr_body(template, plan, rec["fix"], verification, rec["checks"])

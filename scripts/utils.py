@@ -2220,6 +2220,11 @@ _SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS", "GH_PAT", "GH_TO
 # ``github_token=False`` gets none of them.
 _TOKEN_ENV = ("GH_PAT", "GH_TOKEN", "GITHUB_TOKEN", "AGENT_GH_TOKEN", "BOT_PAT", "AUTOFIX_TOKEN",
               "RUNNER_STATUS_TOKEN", "SGLANG_CI_TOKEN", "NOTION_TOKEN")
+
+
+def env_without_tokens() -> dict:
+    """This process's environment minus every GitHub and Notion token and the LLM gateway key."""
+    return {k: v for k, v in os.environ.items() if k not in (*_TOKEN_ENV, "LLM_GATEWAY_KEY")}
 _TOKEN_RE = re.compile(r"\b(ghp_|gho_|ghs_|github_pat_|sk-)[A-Za-z0-9_\-]{16,}")
 
 
@@ -2548,11 +2553,8 @@ def claude_code_analyze(
 
     # The agent reads PR content written by anyone; when a read-only token is
     # configured, it replaces the bot's posting token in the agent's env.
-    env = dict(os.environ)
-    if not spec.github_token:
-        for name in _TOKEN_ENV:
-            env.pop(name, None)
-    elif env.get("AGENT_GH_TOKEN"):
+    env = dict(os.environ) if spec.github_token else env_without_tokens()
+    if spec.github_token and env.get("AGENT_GH_TOKEN"):
         env["GH_PAT"] = env["GH_TOKEN"] = env["AGENT_GH_TOKEN"]
         env.pop("GITHUB_TOKEN", None)
     for name in ("BOT_PAT", "LLM_GATEWAY_KEY", "AUTOFIX_TOKEN"):
@@ -2579,8 +2581,9 @@ def claude_code_analyze(
             "--disable-slash-commands",
         ]
         if spec.tools:
-            # dontAsk denies every tool call the allowlist does not cover.
-            cmd += ["--tools", ",".join(dict.fromkeys(t.split("(")[0] for t in spec.tools)),
+            # dontAsk denies every tool call the allowlist does not cover; --restricted keeps
+            # the file tools inside the working directory (no ~/.claude, no shared clone's .git).
+            cmd += ["--restricted", "--tools", ",".join(dict.fromkeys(t.split("(")[0] for t in spec.tools)),
                     "--permission-mode", "dontAsk", "--allowedTools", *spec.tools]
         else:
             cmd.append("--dangerously-skip-permissions")

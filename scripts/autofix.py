@@ -42,8 +42,8 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,7 +52,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from autofix_agents import AttemptResult, previous_attempt_text, start_attempt  # noqa: E402
+from autofix_agents import AttemptResult, deepen_clone, previous_attempt_text, start_attempt  # noqa: E402
 from autofix_ci import (  # noqa: E402
     Recipe,
     recipe_for,
@@ -68,7 +68,15 @@ from autofix_config import (  # noqa: E402
     max_per_hour_from_env,
     mode_from_env,
 )
-from autofix_github import REPO_LOCK, GitHub, check_branch, find_dispatched_run, git, push_branch  # noqa: E402
+from autofix_github import (  # noqa: E402
+    GitHub,
+    check_branch,
+    clean_checkout,
+    clean_git_env,
+    find_dispatched_run,
+    git,
+    push_branch,
+)
 from autofix_pr import open_pr, pr_template, render_pr_body  # noqa: E402
 from autofix_select import (  # noqa: E402
     build_plan,
@@ -93,10 +101,8 @@ from failure_tracker import deterministic_rows  # noqa: E402
 from utils import (  # noqa: E402
     REPO,
     SGLANG_REPO_PATH,
-    create_agent_worktree,
     ensure_sglang_repo,
     post_comment,
-    remove_agent_worktree,
     update_comment,
 )
 
@@ -136,26 +142,39 @@ def poll_dispatched(pid: str, entry: dict, gh: GitHub, now: datetime) -> tuple[s
     return ("verified" if v["ok"] else "failed"), v
 
 
-def push_and_dispatch(plan: dict, rec: dict, patch: str, gh: GitHub) -> dict:
-    """Commit the fix job's *patch* on its base as the token's owner, push the branch, dispatch the job."""
+def push_and_dispatch(plan: dict, rec: dict, patch: bytes, gh: GitHub) -> None:
+    """Commit the fix job's *patch* on its base as the token's owner, push the branch, dispatch the job.
+
+    Sets ``rec["head_sha"]`` as soon as the branch is pushed (so a failed
+    dispatch still leaves a record of the branch to delete) and
+    ``rec["dispatched_at"]`` after the dispatch. The commit is made in a
+    fresh clone with no hooks and no user or system git config: the shared
+    clone and the home directory are writable by code the fix job's agent ran.
+    """
     check_branch(rec["branch"])
-    with REPO_LOCK:
-        git(SGLANG_REPO_PATH, "fetch", "-q", "origin", rec["base_sha"], "--depth", "1", check=False)
-        wt = create_agent_worktree(f"publish-{plan['id']}", rec["base_sha"])
-    try:
-        if git(wt, "rev-parse", "HEAD").strip() != rec["base_sha"]:
-            raise RuntimeError(f"could not check out {rec['base_sha']}")
-        applied = subprocess.run(["git", "apply", "--binary", "--index", "-"], cwd=wt, input=patch,
-                                 capture_output=True, text=True, timeout=120)
-        if applied.returncode != 0:
-            raise RuntimeError(f"the patch does not apply: {applied.stderr.strip()[:300]}")
-        sha = push_branch(wt, rec["branch"], rec["message"], gh)
-    finally:
-        with REPO_LOCK:
-            remove_agent_worktree(wt)
-    dispatched_at = datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory() as tmp:
+        env = clean_git_env(Path(tmp))
+        repo = Path(tmp) / "sglang"
+        clean_checkout(repo, rec["base_sha"], env)
+        git(repo, "-c", "core.hooksPath=/dev/null", "apply", "--binary", "--index", "-", input=patch,
+            timeout=120, env=env)
+        rec["head_sha"] = push_branch(repo, rec["branch"], rec["message"], gh, env=env)
     gh.dispatch(plan["recipe"]["workflow"], rec["branch"], plan["recipe"]["inputs"])
-    return {"head_sha": sha, "dispatched_at": dispatched_at.isoformat()}
+    rec["dispatched_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def delete_pushed(entry: dict, gh: GitHub) -> None:
+    """Delete every branch this problem pushed (the publish job holds the token for it)."""
+    for branch in entry.get("pushed") or []:
+        gh.delete_branch(branch)
+    entry.pop("pushed", None)
+
+
+def give_up(state: dict, pid: str, entry: dict, now: datetime, event: str, reason: str) -> None:
+    """The one way a problem ends without a PR. Its branches are deleted by the next publish job."""
+    entry.update(status="gave-up", reason=reason, updated=now.isoformat(timespec="seconds"))
+    add_event(state, now, pid, event, reason)
+    _slim(entry)
 
 
 def end_attempt(state: dict, pid: str, entry: dict, now: datetime, what: str, reason: str,
@@ -163,11 +182,8 @@ def end_attempt(state: dict, pid: str, entry: dict, now: datetime, what: str, re
     """An attempt failed: try again, or after ``MAX_ATTEMPTS`` give up and delete the branch."""
     entry["updated"] = now.isoformat(timespec="seconds")
     if entry["attempts"] >= MAX_ATTEMPTS:
-        if entry.get("attempt", {}).get("head_sha"):
-            gh.delete_branch(entry["attempt"]["branch"])
-        entry.update(status="gave-up", reason=f"{what}: {reason}")
-        add_event(state, now, pid, f"{what} on attempt {entry['attempts']}; gave up", reason)
-        _slim(entry)
+        give_up(state, pid, entry, now, f"{what} on attempt {entry['attempts']}; gave up", f"{what}: {reason}")
+        delete_pushed(entry, gh)
     else:
         entry.update(status="retry", reason=f"{what}: {reason}",
                      previous=previous or f"# Previous attempt: {what}\n\n{reason}\n")
@@ -182,16 +198,16 @@ def check_dispatched(pid: str, entry: dict, gh: GitHub, state: dict, now: dateti
     entry["updated"] = now.isoformat(timespec="seconds")
     plan, rec = entry["plan"], entry["attempt"]
     if result == "verified":
-        if not gh.pr_for_branch(rec["branch"]):
-            other = find_fix_pr(gh, [tuple(t) for t in plan["tests"]],
-                                plan.get("failing_since") or now.strftime("%Y-%m-%d"))
+        if not gh.pr_for_branch(rec["branch"], rec["head_sha"]):
+            since = (plan.get("first_fail") or {}).get("at") or rec["dispatched_at"]
+            other = find_fix_pr(gh, [tuple(t) for t in plan["tests"]], since,
+                                exclude={(plan.get("suspect") or {}).get("pr")})
             if other is not None:
-                gh.delete_branch(rec["branch"])
-                entry.update(status="gave-up", reason=f"#{other} came first")
-                add_event(state, now, pid, "fix passed, but another fix PR came first", f"#{other}")
-                _slim(entry)
+                give_up(state, pid, entry, now, "fix passed, but another fix PR came first", f"#{other} came first")
+                delete_pushed(entry, gh)
                 return
         pr = open_pr(plan, rec, v, gh, template)
+        entry.pop("pushed", None)  # the PR's branch stays
         entry.update(status="opened", pr=pr["html_url"])
         add_event(state, now, pid, "fix passed on AMD GPUs; draft PR opened", pr["html_url"])
         _slim(entry)
@@ -200,28 +216,51 @@ def check_dispatched(pid: str, entry: dict, gh: GitHub, state: dict, now: dateti
                 previous=previous_attempt_text(rec, v, gh, plan))
 
 
+def mark_running(state: dict, plan: dict, n: int, now: datetime) -> None:
+    """Count attempt *n* before it runs: a fix job that is killed mid-attempt has still used it."""
+    entry = state["problems"].setdefault(plan["id"], {"attempts": 0})
+    entry.update(status="running", attempts=n, name=plan["name"], plan=plan, updated=now.isoformat(timespec="seconds"))
+    entry.pop("skip", None)
+
+
+def finish_interrupted(state: dict, now: datetime) -> None:
+    """Attempts a killed fix job left `running` count as failed: try again, or give up."""
+    for pid, entry in state["problems"].items():
+        if entry.get("status") != "running":
+            continue
+        reason = "the fix job stopped before the attempt finished"
+        if entry["attempts"] >= MAX_ATTEMPTS:
+            give_up(state, pid, entry, now, f"attempt {entry['attempts']} did not finish; gave up", reason)
+        else:
+            entry.update(status="retry", reason=reason, updated=now.isoformat(timespec="seconds"),
+                         previous=f"# Previous attempt: did not finish\n\n{reason}\n")
+            add_event(state, now, pid, f"attempt {entry['attempts']} did not finish; trying again", reason)
+
+
 def record_attempt(state: dict, pid: str, plan: dict, n: int, result: AttemptResult, now: datetime) -> None:
-    entry = state["problems"].setdefault(pid, {"attempts": 0})
-    entry.update(name=plan["name"], plan=plan, updated=now.isoformat(timespec="seconds"))
+    entry = state["problems"].setdefault(pid, {"attempts": n})
+    entry.update(name=plan["name"], plan=plan, attempts=n, updated=now.isoformat(timespec="seconds"))
     entry.pop("skip", None)
     if result.status == "model-unavailable":
+        # Not an attempt: the agent never ran. Back to where the problem was.
+        entry["attempts"] = n - 1
         entry["unavailable"] = entry.get("unavailable", 0) + 1
         if entry["unavailable"] >= MAX_UNAVAILABLE:
-            entry.update(status="gave-up", reason=f"model unavailable {entry['unavailable']} times: {result.reason}")
-            add_event(state, now, pid, "model unavailable again; gave up", result.reason)
-            _slim(entry)
+            give_up(state, pid, entry, now, "model unavailable again; gave up",
+                    f"model unavailable {entry['unavailable']} times: {result.reason}")
+        elif n > 1:
+            entry["status"] = "retry"
+            add_event(state, now, pid, "model unavailable; not fixed this hour", result.reason)
         else:
+            entry.pop("status", None)
             add_event(state, now, pid, "model unavailable; not fixed this hour", result.reason)
         return
-    entry["attempts"] = n
     entry.pop("previous", None)
     if result.status == "ready":
         entry.update(status="ready", attempt={k: v for k, v in result.record.items() if k != "patch"}, reason="")
         add_event(state, now, pid, f"attempt {n}: the fix passed the checks and the review")
     elif n >= MAX_ATTEMPTS or result.status == "no-fix":
-        entry.update(status="gave-up", reason=result.reason)
-        add_event(state, now, pid, f"attempt {n}: gave up", result.reason)
-        _slim(entry)
+        give_up(state, pid, entry, now, f"attempt {n}: gave up", result.reason)
     else:
         entry.update(status="retry", reason=result.reason,
                      previous=f"# Previous attempt: rejected before the GPU re-run\n\n{result.reason}\n")
@@ -249,6 +288,7 @@ def fix_phase(token: str, bot_repo: str, mode: str, cap: int, gh: GitHub, handof
         return 0
     old, _ = read_state(token, bot_repo, issue_num, now)
     state = new_day_state(old, now.strftime("%Y-%m-%d"), now)
+    finish_interrupted(state, now)
     ensure_sglang_repo()
     yaml = workflow_yaml_at("origin/main")
 
@@ -261,13 +301,18 @@ def fix_phase(token: str, bot_repo: str, mode: str, cap: int, gh: GitHub, handof
             plan, why = build_plan(p, gh, yaml, now)
         except requests.RequestException as exc:
             plan, why = None, f"GitHub API error ({exc.__class__.__name__})"
+        except Exception as exc:  # one malformed problem must not stop the others
+            log.exception("%s: planning failed", p.id)
+            plan, why = None, f"could not plan it ({exc.__class__.__name__}: {exc})"[:300]
         if plan:
             (retries if entry.get("status") == "retry" else eligible).append(plan)
             continue
         entry = state["problems"].setdefault(p.id, {"attempts": 0})
         if entry.get("skip") != why:
             add_event(state, now, p.id, "not fixed", why)
-        entry.update(skip=why, name=p.name, updated=now.isoformat(timespec="seconds"))
+        entry.update(skip=why, name=p.name)
+        if not entry.get("status"):  # a waiting retry keeps its time, so a stale one ends after 3 days
+            entry["updated"] = now.isoformat(timespec="seconds")
     start, new_waiting = plan_hour(state, eligible, now, cap)
     state["pending_notices"] = new_waiting
     # Saved before the long attempts, so a crash cannot forget who started this hour.
@@ -279,6 +324,10 @@ def fix_phase(token: str, bot_repo: str, mode: str, cap: int, gh: GitHub, handof
     work += [(plan, state["problems"].get(plan["id"], {}).get("attempts", 0) + 1, "") for plan in start]
     if not work:
         return 0
+    for plan, n, _ in work:
+        mark_running(state, plan, n, now)
+    save_handoff(handoff, issue_num, state)
+    deepen_clone([plan for plan, _, _ in work])
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(work)) as pool:
         futures = {pool.submit(start_attempt, plan, n, gh, "origin/main", prev): (plan, n)
                    for plan, n, prev in work}
@@ -292,7 +341,7 @@ def fix_phase(token: str, bot_repo: str, mode: str, cap: int, gh: GitHub, handof
             if result.status == "ready":
                 path = patch_path(handoff, plan["id"])
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(result.record["patch"])
+                path.write_bytes(result.record["patch"])
             record_attempt(state, plan["id"], plan, n, result, now)
             save_handoff(handoff, issue_num, state)
     return 0
@@ -331,22 +380,24 @@ def publish_phase(token: str, bot_repo: str, mode: str, cap: int, gh: GitHub, ha
                 if not path.exists():
                     end_attempt(state, pid, entry, now, "lost the patch", "the fix job's artifact has no patch", gh)
                     continue
+                rec = entry["attempt"]
                 try:
-                    entry["attempt"].update(push_and_dispatch(entry["plan"], entry["attempt"], path.read_text(), gh))
-                except (RuntimeError, requests.RequestException) as exc:
+                    push_and_dispatch(entry["plan"], rec, path.read_bytes(), gh)
+                except Exception as exc:  # git timeouts too: the entry must not stay `ready`
+                    if rec.get("head_sha"):
+                        entry["pushed"] = sorted({*entry.get("pushed", []), rec["branch"]})
                     end_attempt(state, pid, entry, now, "push or dispatch failed", str(exc)[:300], gh)
                     continue
+                entry["pushed"] = sorted({*entry.get("pushed", []), rec["branch"]})
                 entry.update(status="dispatched", run_id=None, run_url="", updated=now.isoformat(timespec="seconds"))
-                add_event(state, now, pid, f"attempt {entry['attempts']}: fix pushed, job dispatched",
-                          entry["attempt"]["branch"])
+                add_event(state, now, pid, f"attempt {entry['attempts']}: fix pushed, job dispatched", rec["branch"])
             elif status == "dispatched":
                 check_dispatched(pid, entry, gh, state, now, template)
             elif status == "retry" and now - datetime.fromisoformat(entry["updated"]) > timedelta(days=3):
-                if entry.get("attempt", {}).get("head_sha"):
-                    gh.delete_branch(entry["attempt"]["branch"])
-                entry.update(status="gave-up", updated=now.isoformat(timespec="seconds"))
-                add_event(state, now, pid, "no longer in the daily report; gave up")
-                _slim(entry)
+                give_up(state, pid, entry, now, "waited 3 days for another attempt; gave up",
+                        entry.get("skip") or "no second attempt started")
+            if entry.get("status") == "gave-up" and entry.get("pushed"):
+                delete_pushed(entry, gh)
         except Exception as exc:  # one problem's error must not lose the others' state
             log.exception("%s: publishing failed", pid)
             add_event(state, now, pid, "publishing failed", str(exc))
@@ -355,7 +406,7 @@ def publish_phase(token: str, bot_repo: str, mode: str, cap: int, gh: GitHub, ha
 
 
 def _slim(entry: dict) -> None:
-    """A finished problem keeps only what the log and the audit read."""
+    """A finished problem keeps only what the log and the audit read (and `pushed`, for clean-up)."""
     for key in ("plan", "attempt", "previous"):
         entry.pop(key, None)
 
@@ -419,11 +470,11 @@ def smoke_fix(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, ba
     if not plan:
         return 1
     t0 = time.time()
-    result = start_attempt(plan, 1, gh, base_sha, branch_tag="smoke-", fetch_main=False)
+    result = start_attempt(plan, 1, gh, base_sha, branch_tag="smoke-")
     handoff.mkdir(parents=True, exist_ok=True)
     if result.status == "ready":
         patch_path(handoff, pid).parent.mkdir(parents=True, exist_ok=True)
-        patch_path(handoff, pid).write_text(result.record["patch"])
+        patch_path(handoff, pid).write_bytes(result.record["patch"])
     (handoff / SMOKE_FILE).write_text(json.dumps({
         "plan": plan, "status": result.status, "reason": result.reason, "agent_secs": round(time.time() - t0),
         "record": {k: v for k, v in result.record.items() if k != "patch"},
@@ -436,6 +487,10 @@ def smoke_publish(gh: GitHub, handoff: Path, out_dir: Path) -> int:
     """Smoke test, publish job: push, dispatch, wait for the GPU run, verify, write the PR it
     would open to *out_dir*, delete the branch. Opens no PR, writes no daily issue."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    if not (handoff / SMOKE_FILE).exists():
+        (out_dir / "summary.json").write_text(json.dumps({"status": "the fix job ended before an attempt"}))
+        log.error("No %s from the fix job; see its log", SMOKE_FILE)
+        return 1
     data = json.loads((handoff / SMOKE_FILE).read_text())
     plan, rec = data["plan"], data["record"]
     summary = {"problem": plan["id"], "status": data["status"], "reason": data["reason"],
@@ -445,9 +500,9 @@ def smoke_publish(gh: GitHub, handoff: Path, out_dir: Path) -> int:
         ensure_sglang_repo()
         (out_dir / "attempt-1.diff").write_text(rec["diff"])
         t0 = time.time()
-        rec.update(push_and_dispatch(plan, rec, patch_path(handoff, plan["id"]).read_text(), gh))
         entry = {"plan": plan, "attempt": rec, "run_id": None}
         try:
+            push_and_dispatch(plan, rec, patch_path(handoff, plan["id"]).read_bytes(), gh)
             while True:
                 status, v = poll_dispatched(plan["id"], entry, gh, datetime.now(timezone.utc))
                 if status != "waiting":

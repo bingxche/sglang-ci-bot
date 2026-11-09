@@ -31,8 +31,10 @@ REVIEW_TIMEOUT_SECS = int(os.environ.get("AUTOFIX_REVIEW_TIMEOUT_SECS", "3600"))
 REVIEW_MAX_TURNS = int(os.environ.get("AUTOFIX_REVIEW_MAX_TURNS", "150"))
 # A dispatched run that has not finished its jobs by then is given up.
 DISPATCH_TIMEOUT_HOURS = 24
-# Scheduled runs read back per job when checking that a failure is not flaky.
+# Scheduled runs read back per job when checking that a failure is not flaky, and how
+# many of the workflow's latest scheduled runs are looked through to find them.
 HISTORY_RUNS = 6
+HISTORY_SCAN = 15
 # Open PRs whose files are scanned for the test file, newest first.
 MAX_OPEN_PRS_SCANNED = 300
 # Words the PR's prose may have (links and code blocks not counted): the spec's

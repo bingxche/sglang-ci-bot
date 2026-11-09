@@ -55,6 +55,8 @@ jobs:
           AUTOFIX_MODE: ${{ vars.AUTOFIX_MODE || 'off' }}
           AUTOFIX_MAX_PER_HOUR: ${{ vars.AUTOFIX_MAX_PER_HOUR || '3' }}
           AGENT_ARCHIVE_DIR: ${{ runner.temp }}/agent-sessions
+          # The smoke test builds a clone that ends at an old commit: never in the runner's shared /workspace.
+          AGENT_WORKSPACE: ${{ github.event.inputs.smoke_problem != '' && format('{0}/autofix-smoke', runner.temp) || '/workspace' }}
           SMOKE_PROBLEM: ${{ github.event.inputs.smoke_problem }}
           SMOKE_DATE: ${{ github.event.inputs.smoke_date }}
           SMOKE_BASE: ${{ github.event.inputs.smoke_base }}
@@ -69,7 +71,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: autofix-handoff-${{ github.run_id }}
+          name: autofix-handoff-${{ github.run_id }}-${{ github.run_attempt }}
           path: autofix-handoff
           if-no-files-found: ignore
           retention-days: 3
@@ -78,7 +80,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: autofix-agent-sessions-${{ github.run_id }}
+          name: autofix-agent-sessions-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/agent-sessions
           if-no-files-found: ignore
           retention-days: 14
@@ -106,7 +108,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: autofix-handoff-${{ github.run_id }}
+          name: autofix-handoff-${{ github.run_id }}-${{ github.run_attempt }}
           path: autofix-handoff
 
       - name: Publish
@@ -131,7 +133,7 @@ jobs:
         if: always() && (github.event_name == 'workflow_dispatch' && github.event.inputs.smoke_problem != '')
         uses: actions/upload-artifact@v4
         with:
-          name: autofix-smoke-${{ github.run_id }}
+          name: autofix-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           path: autofix-smoke
           if-no-files-found: ignore
           retention-days: 14
