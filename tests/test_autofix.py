@@ -166,7 +166,7 @@ class InfraTest(unittest.TestCase):
             ("OSError: [Errno 28] No space left on device", "disk full"),
             ("RuntimeError: hipErrorNoDevice", "GPU unavailable or broken"),
             ("401 Client Error: Unauthorized for url: https://huggingface.co/api/models/x", "Hugging Face download"),
-            ("requests.exceptions.ReadTimeout: HTTPSConnectionPool", "network"),
+            ("requests.exceptions.ReadTimeout: HTTPSConnectionPool(host='huggingface.co', port=443)", "network"),
             ("docker: Error response from daemon: manifest unknown", "image pull or build"),
         ):
             self.assertEqual(autofix.classify_infra([err]), kind, err)
@@ -174,13 +174,17 @@ class InfraTest(unittest.TestCase):
     def test_code_errors_are_not_infrastructure(self):
         for err in ("AttributeError: 'types.SimpleNamespace' object has no attribute 'layer_router'",
                     "Memory access fault by GPU node-2 on address 0x7f",
-                    "AssertionError: 0.61 not greater than 0.65"):
+                    "AssertionError: 0.61 not greater than 0.65",
+                    # The test's own server died: a bug, not the network.
+                    "requests.exceptions.ConnectionError: [Errno 111] Connection refused",
+                    "requests.exceptions.ReadTimeout: HTTPConnectionPool(host='127.0.0.1', port=30000)"):
             self.assertIsNone(autofix.classify_infra([err]), err)
 
     def test_performance(self):
         self.assertTrue(autofix.is_perf(["nightly-perf-2-gpu-text (rocm10)"], []))
         self.assertTrue(autofix.is_perf(["x"], ["AssertionError: output throughput 812 tok/s < 900"]))
         self.assertFalse(autofix.is_perf([SMALL], ["AttributeError: x"]))
+        self.assertFalse(autofix.is_perf(["jit-kernel-benchmark-test-amd (rocm10)"], ["ImportError: x"]))
 
 
 class LogParsingTest(unittest.TestCase):
@@ -292,6 +296,33 @@ class HourlyCapTest(unittest.TestCase):
         body = autofix.render_log_comment(state, "live", 3, NOW)
         self.assertEqual(autofix.load_state(body), state)
 
+    def test_comment_stays_under_githubs_limit(self):
+        state = self.state()
+        for i in range(8):
+            state["problems"][f"R{i}"] = {"name": "x", "status": "retry", "attempts": 1, "updated": NOW.isoformat(),
+                                          "previous": "log line\n" * 20_000,
+                                          "attempt": {"diff": "+x\n" * 20_000}}
+        for _ in range(150):
+            autofix.add_event(state, NOW, "R1", "not fixed", "y" * 300)
+        body = autofix.render_log_comment(state, "live", 3, NOW)
+        self.assertLess(len(body), 65_536)
+        self.assertEqual(set(autofix.load_state(body)["problems"]), {f"R{i}" for i in range(8)})
+
+    def test_skipped_problems_are_forgotten_after_two_days(self):
+        old = {"problems": {"R1": {"name": "a", "attempts": 0, "skip": "flaky",
+                                   "updated": (NOW - timedelta(days=3)).isoformat()},
+                            "R2": {"name": "b", "attempts": 1, "status": "gave-up",
+                                   "updated": (NOW - timedelta(days=3)).isoformat()}}}
+        self.assertEqual(set(autofix.new_day_state(old, "2026-11-09", NOW)["problems"]), {"R2"})
+
+    def test_model_unavailable_gives_up_after_three_hours(self):
+        state = self.state()
+        p = {"id": "R1", "name": "x"}
+        for _ in range(3):
+            autofix.record_attempt(state, "R1", p, 1, autofix.AttemptResult("model-unavailable", "404"), NOW)
+        self.assertEqual(state["problems"]["R1"]["status"], "gave-up")
+        self.assertEqual(state["problems"]["R1"]["attempts"], 0)
+
     def test_audit_finds_an_hour_over_the_cap(self):
         import autofix_audit
         entered = [{"id": f"R{i}", "at": (NOW + timedelta(minutes=10 * i)).isoformat()} for i in range(4)]
@@ -330,6 +361,14 @@ class PatchGateTest(unittest.TestCase):
         for path in ("docker/rocm.Dockerfile", "python/pyproject_rocm.toml", ".github/CODEOWNERS"):
             d = self.diff(path, ["a"], ["b"])
             self.assertTrue(any("may not change" in p for p in autofix.gate_patch(d, self.ROOT_CAUSE)), path)
+
+    def test_cache_files_are_rejected(self):
+        d = self.diff("test/registered/a/__pycache__/test_x.cpython-312.pyc", [], ["x"])
+        self.assertTrue(any("cache" in p for p in autofix.gate_patch(d, self.ROOT_CAUSE)))
+
+    def test_removed_comment_mentioning_nightly_is_not_a_moved_test(self):
+        d = self.diff("test/registered/a/test_x.py", ["# flaky on nightly too"], ["# fails on nightly too"])
+        self.assertEqual(autofix.workaround_signals(d), [])
 
     def test_empty_patch(self):
         self.assertEqual(autofix.gate_patch("", self.ROOT_CAUSE), ["the agent changed nothing"])
@@ -556,6 +595,14 @@ class VerifyRunTest(unittest.TestCase):
         v = autofix.verify_run(self.PLAN, {**self.REC, "head_sha": "other"}, self.RUN, self.jobs(), lambda _: PASSED_LOG)
         self.assertFalse(v["ok"])
 
+    def test_a_partition_that_died_early_does_not_hide_the_pass(self):
+        jobs = [{"id": 11, "name": SMALL.replace(", 3)", ", 0)"), "status": "completed",
+                 "labels": ["linux-mi300-1gpu-sglang"], "html_url": "https://j/11"}] + self.jobs()
+        logs = {11: "2026-11-07T01:00:00Z docker: container exited\n", 10: PASSED_LOG}
+        v = autofix.verify_run(self.PLAN, self.REC, self.RUN, jobs, logs.get)
+        self.assertTrue(v["ok"], v["reasons"])
+        self.assertEqual(v["results"][0]["job_url"], "https://j/10")
+
     def test_skip_passes_only_for_a_workaround(self):
         line = "test_first_chunk_reads_fp8_pool (__main__.TestMiniMaxHD128AsmPrefill.test_first_chunk_reads_fp8_pool) ... skipped 'x'"
         log = ci_log("OK (skipped=1)", line)
@@ -657,7 +704,7 @@ class TickTest(unittest.TestCase):
         with mock.patch.object(autofix, "poll_dispatched", return_value=("failed", failed)):
             autofix.check_dispatched("R1", entry, gh, state, NOW, TEMPLATE)
             self.assertEqual(entry["status"], "retry")
-            self.assertIn("did not fix the problem on the GPU", entry["previous"])
+            self.assertIn("the GPU re-run failed", entry["previous"])
             gh.delete_branch.assert_not_called()
             entry.update(status="dispatched", attempts=2)
             autofix.check_dispatched("R1", entry, gh, state, NOW, TEMPLATE)

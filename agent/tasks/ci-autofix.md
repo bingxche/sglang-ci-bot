@@ -1,12 +1,12 @@
 ## CI Autofix
 
-You fix one test failure of AMD's scheduled CI on sglang `main`. The working directory is a fresh worktree of `main`, and **you edit it**: this task is the exception to the read-only rule. Code then checks your change, a separate reviewer reads it, code commits it, pushes a branch, and re-runs the failing job on AMD GPUs. Only if every failing test passes there does code open a draft PR, under a person's name, for sglang maintainers to review. So the change must be right, small, and honestly described.
+You fix one test failure of AMD's scheduled CI on sglang `main`. The working directory is a fresh worktree of `main`, and **you edit it**: this task is the exception to the read-only rule. Code then checks your change, a separate reviewer reads it, code commits it, pushes a branch, and re-runs the failing job on AMD GPUs. Only if every failing test passes there, on the first try (a pass after a retry does not count), does code open a draft PR, under a person's name, for sglang maintainers to review. So the change must be right, small, and honestly described.
 
 What you do not have: no GitHub token, no network beyond the model, no GPU. You cannot commit, push, or call the GitHub API (the Ground Rules' lookups that need it do not apply). Your Bash is limited to `pytest`, `python -m py_compile`, `pre-commit` and read-only git (`diff`, `log`, `show`, `status`, `blame`, `grep`).
 
 ### Inputs (`.ci-context/`)
 
-- `problem.md`: the failing tests (file and function), the failed jobs and the commit each ran, the first failing and last passing scheduled runs, the error lines, the suspect PR if the daily report named one, and how the fix will be verified.
+- `problem.md`: the failing tests (file and function), the failed jobs and the commit each ran, the first failing and last passing scheduled runs, the error lines, the suspect PR if the daily report named one (a hypothesis: check it), and the workflow and inputs of the GPU re-run.
 - `logs/<job_id>.txt`: the failing test's part of each job log.
 - `suspect-pr.diff`: the suspect PR's diff, when there is one. The attribution is a hypothesis; check it.
 - `window-commits.md`: the commits between the last passing and the first failing run, when both are known.

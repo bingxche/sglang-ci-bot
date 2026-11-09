@@ -158,7 +158,8 @@ def pr_sections(body: str) -> dict[str, str]:
     return {parts[i]: parts[i + 1] for i in range(1, len(parts) - 1, 2)}
 
 
-def audit_pr_text(pr: dict, files: list[dict], template: str, label_exists: bool) -> list[str]:
+def audit_pr_text(pr: dict, files: list[dict], template: str, label_exists: bool,
+                  fix_kind: str = "root-cause") -> list[str]:
     """D2, D2b and the path part of D3, from the PR alone."""
     n = pr["number"]
     body = pr.get("body") or ""
@@ -174,7 +175,7 @@ def audit_pr_text(pr: dict, files: list[dict], template: str, label_exists: bool
         labels = {lb["name"] for lb in pr.get("labels") or []}
         if label_exists and "workaround" not in labels:
             v.append(f"D2: #{n} is a workaround without the workaround label")
-    if autofix.check_title(pr["title"], "root-cause"):
+    if autofix.check_title(pr["title"], fix_kind):
         v.append(f"D2b: #{n} title fails the sglang title check")
     missing = [s for s in autofix.template_sections(template) if s not in sections]
     if missing:
@@ -262,8 +263,9 @@ def cmd_prs(args, token: str) -> int:
         if not pr or not autofix._PR_MARKER_RE.search(pr.get("body") or ""):
             continue
         files = gh.pr_files(pr["number"])
-        violations += audit_pr_text(pr, files, template, label_exists)
-        violations += audit_pr_runs(pr, pr_data(pr.get("body") or ""), gh)
+        data = pr_data(pr.get("body") or "")
+        violations += audit_pr_text(pr, files, template, label_exists, data.get("fix_kind") or "root-cause")
+        violations += audit_pr_runs(pr, data, gh)
 
     print(f"# Autofix audit: {len(prs)} bot PR(s), {len(states)} day(s) of state\n")
     print("\n".join(f"- {v}" for v in violations) if violations else "No violations.")

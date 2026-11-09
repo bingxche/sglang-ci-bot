@@ -114,6 +114,12 @@ MAX_OPEN_PRS_SCANNED = 300
 # Words the PR's prose may have (links and code blocks not counted).
 MAX_BODY_WORDS = 250
 
+# GitHub rejects comments over 65,536 characters; the log comment carries the state.
+MAX_COMMENT_CHARS = 60_000
+MAX_STATE_DIFF = 6_000
+MAX_PREVIOUS = 12_000
+# A model-unavailable problem gives up after this many hours, so it stops taking a slot.
+MAX_UNAVAILABLE = 3
 LOG_MARKER = "<!-- ci-autofix-log -->"
 STATE_PREFIX = "<!-- ci-autofix-state:v1 "
 QUEUE_NOTICE_MARKER = "<!-- ci-autofix-queue-notice -->"
@@ -241,9 +247,11 @@ INFRA_PATTERNS = (
     ("Hugging Face download",
      r"401 Client Error|Unauthorized for url: https://huggingface|GatedRepoError|RepositoryNotFoundError"
      r"|LocalEntryNotFoundError|couldn't connect to 'https://huggingface\.co'|HfHubHTTPError"),
+    # Only failures reaching outside hosts: a test's own server that crashed also shows
+    # "Connection refused" or a ReadTimeout, and that is a bug to fix.
     ("network",
-     r"(?:Read|Connect)Timeout(?:Error)?\b|Connection (?:reset by peer|refused|timed out)"
-     r"|Temporary failure in name resolution|Could not resolve host|TLS handshake timeout"),
+     r"Temporary failure in name resolution|Could not resolve host|TLS handshake timeout"
+     r"|(?:Read|Connect)Timeout.*(?:huggingface\.co|github\.com|pypi\.org|docker\.io)"),
     ("image pull or build",
      r"failed to (?:pull|resolve) image|manifest unknown|toomanyrequests|pull access denied"
      r"|Error response from daemon|ERROR: failed to solve"),
@@ -265,7 +273,7 @@ def classify_infra(texts: list[str]) -> str | None:
 
 
 def is_perf(job_names: list[str], errors: list[str]) -> bool:
-    if any(re.search(r"\bperf\b|-perf-|benchmark", n or "") for n in job_names):
+    if any(re.search(r"\bperf\b|-perf-", n or "") for n in job_names):
         return True
     return any(_PERF_RE.search(e or "") for e in errors)
 
@@ -420,6 +428,7 @@ class Outcome:
     status: str           # passed / failed / skipped / not-run / unknown
     retried: bool = False
     note: str = ""
+    ran_file: bool = True  # False: the log has no run_suite segment for the file (read as a whole)
 
 
 def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
@@ -435,25 +444,28 @@ def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
     mine = [s for s in segments if s.file and same_file(s.file, test_file)]
     if segments and not mine:
         return Outcome("not-run", note=f"{test_file} did not run in this job")
-    if not segments:
+    whole_log = not segments
+    if whole_log:
         mine = [Segment(None, lines)]
     retried = len(mine) > 1 or any(
         (m := _RETRY_RE.match(line.strip())) and same_file(m.group(1) or m.group(2), test_file)
         for line in lines
     )
     last = mine[-1]
+    ran = not whole_log
     status = func_status(last.lines, test_func)
     if status:
-        return Outcome(status, retried)
+        return Outcome(status, retried, ran_file=ran)
     _, name, _ = _split_func(test_func)
     passed = _segment_passed(last)
     if passed and name in ("setUpClass", "setUpModule"):
-        return Outcome("passed", retried)
+        return Outcome("passed", retried, ran_file=ran)
     if passed and not any("skipped=" in line for line in last.lines):
-        return Outcome("passed", retried, note="file passed; the function is not named in the log")
+        return Outcome("passed", retried, note="file passed; the function is not named in the log", ran_file=ran)
     if passed:
-        return Outcome("unknown", retried, note="file passed with skipped tests; this one may be among them")
-    return Outcome("unknown", retried, note=f"no result for {test_func} in the log")
+        return Outcome("unknown", retried, note="file passed with skipped tests; this one may be among them",
+                       ran_file=ran)
+    return Outcome("unknown", retried, note=f"no result for {test_func} in the log", ran_file=ran)
 
 
 def unrelated_failures(raw_log: str, tests: list[tuple[str, str]]) -> list[str]:
@@ -524,7 +536,7 @@ _SKIP_RE = re.compile(
     r"|\bskip_tests\b|\bSkipTest\b|\bself\.skipTest\(|@skip\b"
 )
 _HIP_RE = re.compile(r"\bis_hip\(\)|\b_is_hip\b|\bis_rocm\(|torch\.version\.hip")
-_SUITE_RE = re.compile(r"register_\w*_ci\(|\bsuite\s*=|nightly")
+_SUITE_RE = re.compile(r"register_\w*_ci\(|\bsuite\s*=")
 
 
 def diff_files(diff: str) -> dict[str, dict[str, list[str]]]:
@@ -577,6 +589,9 @@ def gate_patch(diff: str, fix: dict) -> list[str]:
         problems.append(f"touches paths autofix may not change: {', '.join(forbidden)}")
     if any(f.startswith(".ci-context/") for f in files):
         problems.append("includes .ci-context files")
+    junk = [f for f in files if re.search(r"(^|/)(__pycache__|\.pytest_cache)/|\.pyc$", f)]
+    if junk:
+        problems.append(f"includes build or cache files: {', '.join(junk[:5])}")
     signals = workaround_signals(diff)
     if signals and fix.get("fix_kind") != "workaround":
         problems.append("looks like a workaround (" + "; ".join(signals) + ") but fix_kind is "
@@ -834,8 +849,10 @@ def new_day_state(state: dict, today: str, now: datetime) -> dict:
         "events": list(state.get("events") or []) if state.get("date") == today else [],
     }
     for pid, p in list(state["problems"].items()):
-        if p.get("status") in ("opened", "gave-up") and \
-                datetime.fromisoformat(p["updated"]) < now - timedelta(days=30):
+        age = now - datetime.fromisoformat(p["updated"])
+        # Finished problems stay a month (attempt counts); skipped ones only while the report has them.
+        if (p.get("status") in ("opened", "gave-up") and age > timedelta(days=30)) or \
+                (not p.get("status") and age > timedelta(days=2)):
             del state["problems"][pid]
     return state
 
@@ -857,6 +874,29 @@ _STATUS_TEXT = {
 
 
 def render_log_comment(state: dict, mode: str, cap: int, now: datetime) -> str:
+    """The log comment with the state; shortened (old events, long texts) to fit GitHub's limit."""
+    for p in state["problems"].values():
+        if p.get("previous"):
+            p["previous"] = p["previous"][-MAX_PREVIOUS:]
+        if p.get("attempt", {}).get("diff"):
+            p["attempt"]["diff"] = p["attempt"]["diff"][-MAX_STATE_DIFF:]
+    body = _render_log_comment(state, mode, cap, now)
+    while len(body) > MAX_COMMENT_CHARS and state["events"]:
+        del state["events"][: max(1, len(state["events"]) // 4)]
+        body = _render_log_comment(state, mode, cap, now)
+    if len(body) > MAX_COMMENT_CHARS:
+        # Second attempts lose their notes and diffs (only shown to the agent), never their state.
+        for p in state["problems"].values():
+            p.pop("previous", None)
+            if p.get("attempt", {}).get("diff"):
+                p["attempt"]["diff"] = p["attempt"]["diff"][-1_000:]
+        body = _render_log_comment(state, mode, cap, now)
+    if len(body) > MAX_COMMENT_CHARS:
+        log.error("The autofix log comment is %d characters, over GitHub's limit", len(body))
+    return body
+
+
+def _render_log_comment(state: dict, mode: str, cap: int, now: datetime) -> str:
     lines = [
         LOG_MARKER,
         "## AMD CI autofix",
@@ -1355,10 +1395,10 @@ def render_problem_context(plan: dict) -> str:
         s = plan["suspect"]
         lines += ["", "## Suspect PR named by the daily report", "",
                   f"- #{s['pr']} (commit {s['sha']}), confidence {s['confidence']}: {s.get('evidence', '')}",
-                  "- Its diff is in `.ci-context/suspect-pr.diff`. Treat the attribution as a hypothesis."]
-    lines += ["", "## How the fix is verified", "",
-              f"Code pushes your change to a branch and runs `{plan['recipe']['workflow']}` with "
-              f"`{json.dumps(plan['recipe']['inputs'])}` on AMD GPUs. Every test above must PASS without a retry."]
+                  "- Its diff: `.ci-context/suspect-pr.diff`."]
+    lines += ["", "## GPU re-run", "",
+              f"- Workflow: `{plan['recipe']['workflow']}`",
+              f"- Inputs: `{json.dumps(plan['recipe']['inputs'])}`"]
     return "\n".join(lines) + "\n"
 
 
@@ -1509,16 +1549,17 @@ def start_attempt(plan: dict, attempt: int, gh: GitHub, base_ref: str = "origin/
             log.info("%s attempt %d, turn %d rejected: %s", plan["id"], attempt, turn, problems)
             if turn == 2:
                 return AttemptResult("failed", "; ".join(problems)[:500])
-            feedback = ("# Your previous change was rejected\n\n"
-                        + "\n".join(f"- {p}" for p in problems)
-                        + "\n\nFix these and write the report again. Your change is still in the worktree "
-                          "(`git diff`).\n")
+            feedback = "# Rejected\n\n" + "\n".join(f"- {p}" for p in problems) + "\n"
 
+        final = staged_diff(wt)  # what is pushed is gated too, after pre-commit and pytest ran
+        late = gate_patch(final, fix)
+        if late:
+            return AttemptResult("failed", "; ".join(late)[:500])
         message = f"{title}\n\n{_first_sentence(fix['pr']['motivation'])}\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n"
         return AttemptResult("ready", record={
             "branch": f"{BRANCH_PREFIX}{branch_tag}{plan['id'].lower()}-{_slug(plan['name'])}",
             "base_sha": base_sha, "fix": fix, "title": title, "message": message,
-            "patch": staged_diff(wt, binary=True), "diff": diff[-20_000:],
+            "patch": staged_diff(wt, binary=True), "diff": final[-MAX_STATE_DIFF:],
             "checks": {**checks, "review": review.get("verdict", "")},
         })
     except ModelUnavailable as exc:
@@ -1574,12 +1615,10 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
             before.setdefault(tuple(t), f"{j['run_url']}/job/{j['job_id']}")
     accuracy, speed = [], []
     for f, fn in plan["tests"]:
-        best = None
-        for j in mine:
-            o = test_outcome(job_log(j["id"]), f, fn)
-            if o.status != "not-run":
-                best = (o, j)
-                break
+        # The job that ran the file; a job that died before running any file says nothing.
+        outcomes = [(test_outcome(job_log(j["id"]), f, fn), j) for j in mine]
+        best = next((x for x in outcomes if x[0].ran_file and x[0].status != "not-run"), None) or \
+            next((x for x in outcomes if x[0].status != "not-run"), None)
         if not best:
             out["reasons"].append(f"`{f}` did not run")
             continue
@@ -1605,8 +1644,8 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
 
 def previous_attempt_text(rec: dict, verification: dict, gh: GitHub, plan: dict) -> str:
     """``.ci-context/previous-attempt.md`` for a second attempt after the GPU run failed."""
-    lines = ["# Your previous attempt did not fix the problem on the GPU", "",
-             f"Run: {verification.get('run_url')}", "", "Why it failed:", ""]
+    lines = ["# Previous attempt: the GPU re-run failed", "",
+             f"Run: {verification.get('run_url')}", "", "## Failed checks", ""]
     lines += [f"- {r}" for r in verification.get("reasons") or []]
     lines += ["", "## The previous change", "", "```diff", rec.get("diff", "")[-15_000:], "```", ""]
     lines += ["## The previous root cause", "", str(rec.get("fix", {}).get("root_cause", "")), ""]
@@ -1742,7 +1781,7 @@ def end_attempt(state: dict, pid: str, entry: dict, now: datetime, what: str, re
         _slim(entry)
     else:
         entry.update(status="retry", reason=f"{what}: {reason}",
-                     previous=previous or f"# Your previous attempt failed\n\n{what}: {reason}\n")
+                     previous=previous or f"# Previous attempt: {what}\n\n{reason}\n")
         add_event(state, now, pid, f"{what} on attempt {entry['attempts']}; trying again", reason)
 
 
@@ -1791,7 +1830,13 @@ def record_attempt(state: dict, pid: str, plan: dict, n: int, result: AttemptRes
     entry.update(name=plan["name"], plan=plan, updated=now.isoformat(timespec="seconds"))
     entry.pop("skip", None)
     if result.status == "model-unavailable":
-        add_event(state, now, pid, "model unavailable; not fixed this hour", result.reason)
+        entry["unavailable"] = entry.get("unavailable", 0) + 1
+        if entry["unavailable"] >= MAX_UNAVAILABLE:
+            entry.update(status="gave-up", reason=f"model unavailable {entry['unavailable']} times: {result.reason}")
+            add_event(state, now, pid, "model unavailable again; gave up", result.reason)
+            _slim(entry)
+        else:
+            add_event(state, now, pid, "model unavailable; not fixed this hour", result.reason)
         return
     entry["attempts"] = n
     entry.pop("previous", None)
@@ -1804,7 +1849,7 @@ def record_attempt(state: dict, pid: str, plan: dict, n: int, result: AttemptRes
         _slim(entry)
     else:
         entry.update(status="retry", reason=result.reason,
-                     previous=f"# Your previous attempt was rejected before the GPU run\n\n{result.reason}\n")
+                     previous=f"# Previous attempt: rejected before the GPU re-run\n\n{result.reason}\n")
         add_event(state, now, pid, f"attempt {n}: rejected before the GPU run", result.reason)
 
 
@@ -1844,10 +1889,10 @@ def fix_phase(token: str, bot_repo: str, mode: str, cap: int, gh: GitHub, handof
         if plan:
             (retries if entry.get("status") == "retry" else eligible).append(plan)
             continue
-        entry = state["problems"].setdefault(p.id, {"attempts": 0, "updated": now.isoformat(timespec="seconds")})
+        entry = state["problems"].setdefault(p.id, {"attempts": 0})
         if entry.get("skip") != why:
             add_event(state, now, p.id, "not fixed", why)
-        entry.update(skip=why, name=p.name)
+        entry.update(skip=why, name=p.name, updated=now.isoformat(timespec="seconds"))
     start, new_waiting = plan_hour(state, eligible, now, cap)
     state["pending_notices"] = new_waiting
     # Saved before the long attempts, so a crash cannot forget who started this hour.
