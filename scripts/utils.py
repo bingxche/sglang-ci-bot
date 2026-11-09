@@ -1503,11 +1503,38 @@ def _find_agent_file(name: str) -> Path | None:
 class AgentTask:
     doc: str          # methodology file under agent/tasks/
     model: str = ""   # "" = the runner's default (ANTHROPIC_MODEL)
+    effort: str = ""  # --effort level; "" = the CLI's default
+    # Model and effort are fixed: AGENT_MODEL_<TASK> cannot change them, and a
+    # model the gateway does not serve fails the task (ModelUnavailable)
+    # instead of falling back to the default model.
+    pinned: bool = False
+    # The only tools the agent may use (--allowedTools); every other tool call
+    # is denied. Empty: every tool, without prompts.
+    tools: tuple[str, ...] = ()
+    # False: no GitHub token of any kind in the agent's environment.
+    github_token: bool = True
 
+
+# The autofix agent edits its own worktree and runs tests, linters and
+# read-only git; the reviewer only reads.
+AUTOFIX_TOOLS = (
+    "Read", "Grep", "Glob", "Edit", "Write",
+    "Bash(python -m pytest:*)", "Bash(python3 -m pytest:*)", "Bash(pytest:*)",
+    "Bash(python -m py_compile:*)", "Bash(pre-commit:*)",
+    "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)",
+    "Bash(git blame:*)", "Bash(git grep:*)",
+)
+AUTOFIX_REVIEW_TOOLS = (
+    "Read", "Grep", "Glob",
+    "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git blame:*)",
+)
+# Fixed by the user (2026-11-09) for both autofix tasks: never overridden, never downgraded.
+AUTOFIX_MODEL = "Claude-Opus-5.5[1m]"
 
 # Every agent task, keyed by the prompt's ``Task:`` line. All use the runner's
 # default model (ANTHROPIC_MODEL); give one its own with ``model=`` here, or
-# AGENT_MODEL_<TASK> (e.g. AGENT_MODEL_FAILURE_TRACKER_DATA=sonnet).
+# AGENT_MODEL_<TASK> (e.g. AGENT_MODEL_FAILURE_TRACKER_DATA=sonnet), unless
+# the task is ``pinned``.
 AGENT_TASKS: dict[str, AgentTask] = {
     "Job Failure Analysis": AgentTask("job-failure-analysis.md"),
     "Cross-Job Summary": AgentTask("cross-job-summary.md"),
@@ -1517,7 +1544,20 @@ AGENT_TASKS: dict[str, AgentTask] = {
     "SGLang AMD CI Staging Candidates": AgentTask("staging-candidates.md"),
     "PR CI Status Check": AgentTask("pr-ci-status-check.md"),
     "PR Code Review": AgentTask("pr-code-review.md"),
+    "CI Autofix": AgentTask(
+        "ci-autofix.md", model=AUTOFIX_MODEL, effort="max", pinned=True,
+        tools=AUTOFIX_TOOLS, github_token=False,
+    ),
+    "CI Autofix Review": AgentTask(
+        "ci-autofix-review.md", model=AUTOFIX_MODEL, effort="max", pinned=True,
+        tools=AUTOFIX_REVIEW_TOOLS, github_token=False,
+    ),
 }
+
+
+class ModelUnavailable(RuntimeError):
+    """A pinned task's model was not served, or the session used another model."""
+
 
 _MODEL_ALIASES = ("opus", "sonnet", "haiku")
 # The gateway's answer for a model name it has no deployment of, e.g.
@@ -1556,6 +1596,8 @@ def task_model(task: str) -> str | None:
     the gateway does not serve, so the task keeps the default instead.
     """
     spec = AGENT_TASKS.get(task)
+    if spec and spec.pinned:
+        return spec.model
     slug = re.sub(r"[^A-Z0-9]+", "_", task.upper()).strip("_")
     model = os.environ.get(f"AGENT_MODEL_{slug}") or (spec.model if spec else "")
     if not model:
@@ -2173,7 +2215,11 @@ def _remove_deployed_claude_md(target_dir: Path | None = None):
 
 
 _SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS", "GH_PAT", "GH_TOKEN",
-               "GITHUB_TOKEN", "AGENT_GH_TOKEN", "LLM_GATEWAY_KEY", "BOT_PAT")
+               "GITHUB_TOKEN", "AGENT_GH_TOKEN", "LLM_GATEWAY_KEY", "BOT_PAT", "AUTOFIX_TOKEN")
+# Every GitHub (and Notion) token a workflow may export; a task with
+# ``github_token=False`` gets none of them.
+_TOKEN_ENV = ("GH_PAT", "GH_TOKEN", "GITHUB_TOKEN", "AGENT_GH_TOKEN", "BOT_PAT", "AUTOFIX_TOKEN",
+              "RUNNER_STATUS_TOKEN", "SGLANG_CI_TOKEN", "NOTION_TOKEN")
 _TOKEN_RE = re.compile(r"\b(ghp_|gho_|ghs_|github_pat_|sk-)[A-Za-z0-9_\-]{16,}")
 
 
@@ -2282,6 +2328,35 @@ def _recover_text_from_session_log(
         return last_text
 
     return None
+
+
+def _session_models(work_dir: Path, started_at: float) -> set[str]:
+    """Models named by the assistant turns of the sessions started in *work_dir* since *started_at*."""
+    cwd = str(work_dir.resolve())
+    projects = Path.home() / ".claude" / "projects"
+    models: set[str] = set()
+    for project in {projects / cwd.replace("/", "-"), projects / re.sub(r"[^A-Za-z0-9]", "-", cwd)}:
+        for session in project.glob("*.jsonl"):
+            if session.stat().st_mtime < started_at - 5:
+                continue
+            for line in session.read_text(errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                msg = entry.get("message") if entry.get("type") == "assistant" else None
+                model = msg.get("model") if isinstance(msg, dict) else None
+                # Claude Code writes "<synthetic>" for messages it makes up itself.
+                if model and model != "<synthetic>":
+                    models.add(model)
+    return models
+
+
+def model_matches(expected: str, used: str) -> bool:
+    """``Claude-Opus-5.5[1m]`` matches ``Claude-Opus-5.5`` and ``claude-opus-5-5-2026…``."""
+    def norm(name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", re.sub(r"\[.*?\]", "", name.lower()))
+    return bool(norm(expected)) and norm(used).startswith(norm(expected))
 
 
 # Files that set the environment AMD PR CI tests actually run with. PR CI pulls
@@ -2457,11 +2532,16 @@ def claude_code_analyze(
     the agent writes the canonical report and then overwrites it with
     a short reply like "already delivered above".
 
+    A ``pinned`` task (``AgentTask``) runs only on its own model: an unserved
+    model, or a session log that shows another model, raises
+    ``ModelUnavailable``, and a timeout returns nothing.
+
     Raises ``RuntimeError`` on failure, including an unknown task.
     """
     task = task_name(prompt)
     instructions = agent_instructions(task)
     model = task_model(task)
+    spec = AGENT_TASKS[task]
 
     context_dir = work_dir / ".ci-context"
     context_dir.mkdir(parents=True, exist_ok=True)
@@ -2469,10 +2549,13 @@ def claude_code_analyze(
     # The agent reads PR content written by anyone; when a read-only token is
     # configured, it replaces the bot's posting token in the agent's env.
     env = dict(os.environ)
-    if env.get("AGENT_GH_TOKEN"):
+    if not spec.github_token:
+        for name in _TOKEN_ENV:
+            env.pop(name, None)
+    elif env.get("AGENT_GH_TOKEN"):
         env["GH_PAT"] = env["GH_TOKEN"] = env["AGENT_GH_TOKEN"]
         env.pop("GITHUB_TOKEN", None)
-    for name in ("BOT_PAT", "LLM_GATEWAY_KEY"):
+    for name in ("BOT_PAT", "LLM_GATEWAY_KEY", "AUTOFIX_TOKEN"):
         env.pop(name, None)
 
     started_at = time.time()
@@ -2491,17 +2574,24 @@ def claude_code_analyze(
             "--setting-sources", "user",
             "--output-format", "text",
             "--max-turns", str(max_turns),
-            "--dangerously-skip-permissions",
             # The sglang checkout ships developer skills (e.g. ones that push
             # fixes or rerun CI); none of the bot's tasks use skills.
             "--disable-slash-commands",
         ]
+        if spec.tools:
+            # dontAsk denies every tool call the allowlist does not cover.
+            cmd += ["--tools", ",".join(dict.fromkeys(t.split("(")[0] for t in spec.tools)),
+                    "--permission-mode", "dontAsk", "--allowedTools", *spec.tools]
+        else:
+            cmd.append("--dangerously-skip-permissions")
         if model:
             cmd += ["--model", model]
+        if spec.effort:
+            cmd += ["--effort", spec.effort]
 
         _agent_log.info(
-            "Running Claude Code (task=%s, model=%s, max_turns=%d, timeout=%ds, cwd=%s)...",
-            task, model or "default", max_turns, timeout_secs, work_dir,
+            "Running Claude Code (task=%s, model=%s, effort=%s, max_turns=%d, timeout=%ds, cwd=%s)...",
+            task, model or "default", spec.effort or "default", max_turns, timeout_secs, work_dir,
         )
 
         def run_cli() -> subprocess.CompletedProcess:
@@ -2518,6 +2608,11 @@ def claude_code_analyze(
         result = run_cli()
         if (model and result.returncode != 0
                 and _MODEL_UNAVAILABLE_RE.search(f"{result.stdout}\n{result.stderr}")):
+            if spec.pinned:
+                raise ModelUnavailable(
+                    f"{task}: model {model!r} is not served by the gateway: "
+                    + " ".join((result.stdout or result.stderr).split())[:200]
+                )
             # A task model the gateway does not serve (e.g. a stale
             # ANTHROPIC_DEFAULT_SONNET_MODEL) must not fail the task.
             _agent_log.warning(
@@ -2532,6 +2627,15 @@ def claude_code_analyze(
             "Claude Code exit=%d, stdout=%d chars, stderr=%d chars",
             result.returncode, len(result.stdout or ""), len(result.stderr or ""),
         )
+        if spec.pinned and result.returncode == 0:
+            base = re.sub(r"\[.*?\]", "", model).lower()
+            expected = (os.environ.get(f"ANTHROPIC_DEFAULT_{base.upper()}_MODEL", model)
+                        if base in _MODEL_ALIASES else model)
+            used = _session_models(work_dir, started_at)
+            if not used or not all(model_matches(expected, m) for m in used):
+                raise ModelUnavailable(
+                    f"{task}: expected {expected}, the session log shows {sorted(used) or 'no model'}"
+                )
         if result.returncode == 0 and result.stdout.strip():
             text = result.stdout.strip()
             if output_must_contain and output_must_contain not in text:
@@ -2565,7 +2669,7 @@ def claude_code_analyze(
         )
 
     except subprocess.TimeoutExpired:
-        recovered = _recover_text_from_session_log(work_dir)
+        recovered = None if spec.pinned else _recover_text_from_session_log(work_dir)
         if recovered:
             _agent_log.info(
                 "Claude Code timed out after %ds; recovered %d chars from session log",

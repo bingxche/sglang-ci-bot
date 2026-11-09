@@ -10,7 +10,7 @@ This README is the map of the repo: what each part does and why. Implementation 
 2. [Feature map](#2-feature-map)
 3. [Design rules](#3-design-rules) · [Hidden markers](#hidden-markers-where-the-state-lives) · [Changing this repo](#changing-this-repo)
 4. [How an agent runs](#4-how-an-agent-runs)
-5. [Features](#5-features): [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) · [Suspect PR comments](#52-suspect-pr-comments) · [Failure Trackers](#53-failure-trackers) · [PR commands](#54-pr-commands-the-comment-watcher) · [PR review](#55-pr-review) · [PR CI status](#56-pr-ci-status-check) · [On-demand analysis](#57-on-demand-analysis) · [Notion staging](#58-notion-staging) · [Coverage audit](#59-coverage-exclusion-audit)
+5. [Features](#5-features): [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) · [Suspect PR comments](#52-suspect-pr-comments) · [Failure Trackers](#53-failure-trackers) · [PR commands](#54-pr-commands-the-comment-watcher) · [PR review](#55-pr-review) · [PR CI status](#56-pr-ci-status-check) · [On-demand analysis](#57-on-demand-analysis) · [Notion staging](#58-notion-staging) · [Coverage audit](#59-coverage-exclusion-audit) · [CI autofix](#510-ci-autofix)
 6. [Operations](#6-operations)
 7. [Reference](#7-reference)
 
@@ -26,13 +26,13 @@ Each feature is one lane. The bold box on the left says what it is for; the rest
 
 **Colors.** 🔵 trigger · ⬜ GitHub Actions workflow · 🟧 LLM agents · 🟩 deterministic code · 🟪 where results go.
 
-**The one pattern to notice.** Wherever a result leaves this repo, a green box stands between the orange LLM and the purple output: the LLM proposes, and code decides what gets out. That is design rules [R2](#r2) and [R4](#r4) in picture form. Lanes ① and ④ write straight from an agent, but only into this repo's own issues. **Lane ② is the known exception:** the PR review posts the agent's text without a code gate (see R2).
+**The one pattern to notice.** Wherever a result leaves this repo, a green box stands between the orange LLM and the purple output: the LLM proposes, and code decides what gets out. That is design rules [R2](#r2) and [R4](#r4) in picture form. Lane ⑦ has two: code picks what the agents work on, and code checks the patch and the GPU re-run before anything is published. Lanes ① and ④ write straight from an agent, but only into this repo's own issues. **Lane ② is the known exception:** the PR review posts the agent's text without a code gate (see R2).
 
 Three more things the picture does not show:
 
 - **Everything runs on the self-hosted runner containers** (`runner/`), because only they can reach the LLM gateway. The work runs as GitHub Actions jobs of this repo, plus two loops on runner-1: the hourly CI-monitor timer, and the comment watcher behind lanes ② and ③.
 - **Every agent goes through one function**, [`claude_code_analyze()`](scripts/utils.py). Agents get their instructions from files under [`agent/`](agent/), never from strings in Python ([§4](#4-how-an-agent-runs)).
-- **The daily issue is also state.** The summary and the `finalize` steps of lane ①, and lane ⑤, read the analyses back from it. Runners keep nothing that matters.
+- **The daily issue is also state.** The summary and the `finalize` steps of lane ①, and lanes ⑤ and ⑦, read the analyses back from it; lane ⑦ also keeps its own state there. Runners keep nothing that matters.
 
 ---
 
@@ -49,6 +49,7 @@ Three more things the picture does not show:
 | [On-demand analysis](#57-on-demand-analysis) | Actions tab, paste a run/job URL | [`analyze-ci.yml`](.github/workflows/analyze-ci.yml) → [`analyze_url.py`](scripts/analyze_url.py) | Job Failure Analysis, Cross-Job Summary | An `[Analyze]` issue in this repo |
 | [Notion staging](#58-notion-staging) | 12:00 UTC daily | [`notion-staging.yml`](.github/workflows/notion-staging.yml) → [`stage_notion.py`](scripts/stage_notion.py) | SGLang AMD CI Staging Candidates | Notion staging database |
 | [Coverage audit](#59-coverage-exclusion-audit) | Mondays 16:07 UTC | [`coverage-audit.yml`](.github/workflows/coverage-audit.yml) (code lives in ROCm/sglang-ci) | its own prompt, in ROCm/sglang-ci | A PR merged into ROCm/sglang-ci |
+| [CI autofix](#510-ci-autofix) | after each CI-monitor tick | [`ci-autofix.yml`](.github/workflows/ci-autofix.yml) → [`autofix.py`](scripts/autofix.py) | CI Autofix, CI Autofix Review | `bingxche/autofix-*` branches and draft PRs on sgl-project/sglang, as bingxche; a log comment on the daily issue |
 
 Supporting code:
 - [`utils.py`](scripts/utils.py): GitHub helpers, the agent harness, worktrees, log parsing.
@@ -56,6 +57,7 @@ Supporting code:
 - [`eval_ci_status.py`](scripts/eval_ci_status.py): scores CI-status replays.
 - [`validate_live.py`](scripts/validate_live.py): runs any use case on a runner without writing to GitHub.
 - [`check_pr_rules.py`](scripts/check_pr_rules.py) with [`pr-checks.yml`](.github/workflows/pr-checks.yml): enforce the [rules for changes](#changing-this-repo) on every PR.
+- [`autofix_audit.py`](scripts/autofix_audit.py): checks CI autofix against its done criteria: dispatch-recipe coverage, every bot PR, and every hour of autofix state.
 
 ---
 
@@ -67,21 +69,24 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 
 <a id="r1"></a>**R1. Agents read; code writes.**
 - Every agent works in its own git worktree, at the exact commit under study, and loads no settings from that checkout (`--setting-sources user`). Developer skills are disabled.
-- Its environment carries no posting token, and only a read-only one when `AGENT_GH_TOKEN` is set.
+- Its environment carries no posting token, and only a read-only one when `AGENT_GH_TOKEN` is set. The two CI autofix agents get no GitHub token at all.
 - Only Python code writes to GitHub or Notion.
+- One agent edits files: the CI Autofix agent changes its own worktree, with an allowlist of tools (read, edit, `pytest`, `pre-commit`, read-only git) and every other tool call denied. Code commits that change, pushes the branch, re-runs the job and opens the PR, in a separate job that runs no agent and is the only one holding `AUTOFIX_TOKEN`: code an agent runs (a test it wrote) can read its parent processes' environment, so stripping a token from the agent's own environment is not enough.
 
-*Why:* agents read text anyone can write (PR diffs, logs, a PR's own `.claude/settings.json`, whose hooks once could run on our runners). *Kept by:* [`tests/test_agent_tasks.py`](tests/test_agent_tasks.py) (CLI flags), [`tests/test_ci_verdicts.py`](tests/test_ci_verdicts.py) (agent environment).
+*Why:* agents read text anyone can write (PR diffs, logs, a PR's own `.claude/settings.json`, whose hooks once could run on our runners). *Kept by:* [`tests/test_agent_tasks.py`](tests/test_agent_tasks.py) (CLI flags), [`tests/test_ci_verdicts.py`](tests/test_ci_verdicts.py) (agent environment), [`tests/test_autofix.py`](tests/test_autofix.py) (autofix tools and environment).
 
 <a id="r2"></a>**R2. Every write outside this repo passes a code gate.**
-- New writers start in dry-run behind a repository variable.
+- New writers start in dry-run behind a repository variable. **CI autofix is the exception**: the repo owner chose to run it live from the start (2026-11-09). In its place: `AUTOFIX_MODE=off` stops it at once; at most `AUTOFIX_MAX_PER_HOUR` problems start per hour; it opens only drafts, and only after the failing job passed on AMD GPUs; hidden markers keep it from repeating itself.
 - Posts are capped per tick and made at most once per PR (hidden markers).
-- The bot @-mentions only the person who ran a command, and on a suspect PR comment the people who made that PR: its author, plus a cc to whoever merged it, its co-authors and its reviewers (bots dropped, at most [`MAX_CC`](scripts/suspect_pr_comments.py)), so a break reaches someone even when the author is away.
+- The bot @-mentions only the person who ran a command, and on a suspect PR comment the people who made that PR: its author, plus a cc to whoever merged it, its co-authors and its reviewers (bots dropped, at most [`MAX_CC`](scripts/suspect_pr_comments.py)), so a break reaches someone even when the author is away. One more: CI autofix's queue notice on the daily issue mentions the owner of its switch ([`NOTIFY_USER`](scripts/autofix.py)).
 
-*Why:* a wrong comment on someone else's PR costs trust that is hard to win back. *Kept by:* [`tests/test_suspect_pr_comments.py`](tests/test_suspect_pr_comments.py).
+*Why:* a wrong comment on someone else's PR costs trust that is hard to win back. *Kept by:* [`tests/test_suspect_pr_comments.py`](tests/test_suspect_pr_comments.py), [`tests/test_autofix.py`](tests/test_autofix.py).
 
 **Known gap:** `@amd-bot review` posts the review agent's text as it is, with no code check in between. Closing it (code checks plus verifier agents on every finding) is an open proposal.
 
-<a id="r3"></a>**R3. People decide.** The bot reports, attributes and suggests triage steps. It never approves, merges, prioritizes or reruns sglang work. The one automated merge is the coverage audit's, into ROCm/sglang-ci, of exclusion entries that code validated and tested.
+<a id="r3"></a>**R3. People decide.** The bot reports, attributes and suggests triage steps. It never approves, merges, prioritizes or reruns sglang work. Two automated writes go further:
+- the coverage audit merges, into ROCm/sglang-ci, exclusion entries that code validated and tested;
+- CI autofix opens **draft** PRs on sglang. It never marks them ready, merges them or asks anyone to review them, and the jobs it re-runs are on its own branches.
 
 *Why:* priority and merging need context the bot does not have. *Kept by:* review only.
 
@@ -119,8 +124,8 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 
 <a id="r9"></a>**R9. Cost is bounded.**
 - Every agent run has a turn limit and a timeout.
-- Every fan-out has a cap: agents per matrix job, reviewers, findings verified, suspects verified per tick.
-- Every task's model is chosen for its stakes (all use the default model today; `AGENT_TASKS` can give one a cheaper model).
+- Every fan-out has a cap: agents per matrix job, reviewers, findings verified, suspects verified per tick, autofix problems started per hour (each at most two attempts and two GPU runs).
+- Every task's model is chosen for its stakes (most use the default model; `AGENT_TASKS` can give one a cheaper model). Both CI autofix tasks are pinned to Opus 5.5 1M at effort max: `AGENT_MODEL_<TASK>` cannot change them, and they never fall back to another model ([R6](#r6)).
 
 *Why:* one loop without a bound spends the team's gateway quota. *Kept by:* review only. The limits are in the [environment variables](#environment-variables) table.
 
@@ -148,6 +153,9 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 | `<!-- amd-bot-suspect-pr:<cluster> -->`, `<!-- amd-bot-suspect-fix:<pr> -->` | sglang PRs | a suspect comment / a fix-review request was posted |
 | `<!-- ci-failure-tracker-state: … -->` | Failure Tracker issue body | every failure's `first_seen` / `last_seen` |
 | 🚀 reaction by amd-bot | the `@amd-bot` comment | the command was claimed; no other watcher dispatches it |
+| `<!-- ci-autofix-log -->` with `<!-- ci-autofix-state:v1 … -->` | daily issue | CI autofix's log and state: per problem its attempts, branch, dispatched run and PR; the problems started each hour; who was notified. Carried over from the latest earlier day |
+| `<!-- ci-autofix-queue-notice -->` | daily issue | a notice that @-mentions the owner when problems first wait for their hour |
+| `<!-- amd-bot-autofix: R386 -->`, `<!-- amd-bot-autofix-data:v1 … -->` | the bot's draft PRs on sglang | the problem the PR fixes; the workflow, jobs, tests and GPU run that [`autofix_audit.py`](scripts/autofix_audit.py) re-checks |
 
 ### Changing this repo
 
@@ -176,8 +184,8 @@ Every agent run goes through [`claude_code_analyze()`](scripts/utils.py):
 2. The instructions, [`agent/ground-rules.md`](agent/ground-rules.md) followed by `agent/tasks/<task>.md` ([`agent_instructions()`](scripts/utils.py)), are passed with `--append-system-prompt`. Nothing is read from the checkout's own `CLAUDE.md` or `.claude/`.
 3. Context files the script prepared (logs, evidence packs, other agents' output) are written to `.ci-context/` in the working directory and removed afterwards.
 4. It runs `claude -p` in the worktree:
-   - flags: `--setting-sources user --disable-slash-commands --dangerously-skip-permissions`, with a turn limit and a timeout;
-   - environment: no `BOT_PAT` or `LLM_GATEWAY_KEY`, and `AGENT_GH_TOKEN` in place of `GH_PAT` when set.
+   - flags: `--setting-sources user --disable-slash-commands --dangerously-skip-permissions`, with a turn limit and a timeout. A task with a tool allowlist (`tools` in its `AgentTask`) runs with `--permission-mode dontAsk --allowedTools …` instead, so any other tool call is denied; a task with an `effort` adds `--effort`;
+   - environment: no `BOT_PAT`, `AUTOFIX_TOKEN` or `LLM_GATEWAY_KEY`, and `AGENT_GH_TOKEN` in place of `GH_PAT` when set. A task with `github_token=False` gets no GitHub token at all.
 5. The text output is returned. When the final message misses the expected report (empty, or overwritten by a follow-up), the report is recovered from the session log. When `AGENT_ARCHIVE_DIR` is set, the prompt and session are archived with secrets redacted.
 
 Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sglang_repo()`](scripts/utils.py), [`create_agent_worktree()`](scripts/utils.py)), checked out at the exact commit the CI run or PR used. The clone is re-made if it is broken (an interrupted clone once left runner-7 with no `HEAD`).
@@ -192,11 +200,14 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 | SGLang AMD CI Staging Candidates | [`staging-candidates.md`](agent/tasks/staging-candidates.md) | default | [`analyze()`](scripts/stage_notion.py) |
 | PR CI Status Check | [`pr-ci-status-check.md`](agent/tasks/pr-ci-status-check.md) | default | [`check_ci_for_pr()`](scripts/check_ci_for_pr.py) |
 | PR Code Review | [`pr-code-review.md`](agent/tasks/pr-code-review.md) | default | [`review_pr_with_agent()`](scripts/review_pr.py) |
+| CI Autofix | [`ci-autofix.md`](agent/tasks/ci-autofix.md) | `Claude-Opus-5.5[1m]`, effort max, pinned | [`run_fix_agent()`](scripts/autofix.py) |
+| CI Autofix Review | [`ci-autofix-review.md`](agent/tasks/ci-autofix-review.md) | `Claude-Opus-5.5[1m]`, effort max, pinned | [`run_review_agent()`](scripts/autofix.py) |
 
 **Models.** Every task uses the runner's `ANTHROPIC_MODEL` (`opus[1m]`) unless `AGENT_TASKS` gives it its own.
 - `AGENT_MODEL_<TASK>` overrides the model for one task, e.g. `AGENT_MODEL_FAILURE_TRACKER_DATA=sonnet`.
 - An alias such as `sonnet` is used only when `claude.env` maps it (`ANTHROPIC_DEFAULT_SONNET_MODEL`); otherwise the task keeps the default model.
 - If the gateway has no deployment of the requested model, the task is retried once with the default ([`task_model()`](scripts/utils.py)).
+- An `AgentTask` can also set `effort` (passed as `--effort`) and `pinned`. A pinned task (the two CI autofix tasks) ignores `AGENT_MODEL_<TASK>`, is never retried with the default model, and is checked after the run: if the gateway does not serve its model, or the session log shows any other model, it fails with `ModelUnavailable` ([`claude_code_analyze()`](scripts/utils.py)). A pinned task that times out returns nothing.
 
 **Output contracts.** Reports start with a fixed first line (`### Commit Info`, `**Counts**:`, `# Daily Cross-Workflow Summary`), and the harness strips anything before it. Machine-readable results come in hidden or fenced blocks that code parses and validates: `ci-status-verdicts`, `job-clusters`, `suspect-prs`, and tracker data.
 
@@ -365,6 +376,34 @@ It is the most isolated job in this repo:
 
 It acts as the owner of `SGLANG_CI_TOKEN` (or `GH_PAT`), who must be an admin on ROCm/sglang-ci with ROCm SSO authorized. For a manual dry run, use Actions → Coverage Exclusion Audit → `dry_run`.
 
+### 5.10 CI autofix
+
+**Purpose.** When a scheduled AMD run on sglang `main` fails for sure and nobody has a fix, write the fix, prove on AMD GPUs that it works, and open a **draft** PR for people to review. The fix is the smallest change that fixes the root cause; a skip or a looser threshold is used only when the cause is outside sglang (AITER, the image, the driver, an upstream model) and is then labelled a workaround. It replaces what was done by hand: an agent fixes it, the failing job is re-run on a branch, and a PR is opened with the run linked.
+
+**Flow** ([`ci-autofix.yml`](.github/workflows/ci-autofix.yml), after every CI-monitor run). Each run is two jobs. **fix** ([`fix_phase()`](scripts/autofix.py), steps 1–4) runs the agents with a read-only token (`AGENT_GH_TOKEN`, else `GH_PAT`) and writes nothing to GitHub; it hands its state and patches to **publish** ([`publish_phase()`](scripts/autofix.py), steps 5–7) as an artifact. Publish runs no agent and holds `AUTOFIX_TOKEN`; it also writes the daily issue.
+
+1. **Pick** (code, [`build_plan()`](scripts/autofix.py)). A problem of today's daily report is tried only if:
+   - it failed in a scheduled run on `main` of `pr-test-amd.yml`, `nightly-test-amd.yml` or `nightly-amd-mi355x-disagg.yml` ([`AUTOFIX_WORKFLOWS`](scripts/autofix.py)). Miles, AITER Scout and Docker builds are left out ([`NOT_FIXED`](scripts/autofix.py));
+   - the analyses name its failing test functions, and every one failed in the last two completed scheduled runs of its job, retries included ([`fails_for_sure()`](scripts/autofix.py));
+   - no error matches an infrastructure pattern ([`INFRA_PATTERNS`](scripts/autofix.py): runner lost, disk full, GPU, Hugging Face, network, image) and it is not a performance regression;
+   - one dispatch can re-run all its tests ([`recipe_for()`](scripts/autofix.py) maps a job to its workflow and inputs: `target_stage`, `job_filter` or `configs`, with the same ROCm version and runner pool);
+   - nobody has a fix: no fix PR in the report, and no open or merged sglang PR since the first failure names the test file in its title, body or diff ([`find_fix_pr()`](scripts/autofix.py));
+   - the bot has tried it fewer than 2 times.
+2. **Rate limit.** At most `AUTOFIX_MAX_PER_HOUR` (3) problems start in any hour, most failed jobs first, then the longest failing ([`take_for_this_hour()`](scripts/autofix.py)). The rest wait for a later hour. The first time a problem waits, amd-bot posts a notice on the daily issue that @-mentions bingxche, which GitHub emails; a problem that gets a fix PR meanwhile drops out of the queue.
+3. **Fix** ([`start_attempt()`](scripts/autofix.py), the started problems in parallel). The CI Autofix agent works in a worktree of `main` with the logs, the suspect PR's diff and the commits of the failure window in `.ci-context/`. It must name the root cause first, then pick the change ([`ci-autofix.md`](agent/tasks/ci-autofix.md)). It has no token and only an allowlist of tools.
+4. **Gate** (code, then a reviewer). [`gate_patch()`](scripts/autofix.py) rejects `docker/`, the pins in `python/pyproject*.toml` and `CODEOWNERS`, and a patch that skips, xfails, loosens a number in a test or moves a test out of its suite without being labelled a workaround. [`check_pr_text()`](scripts/autofix.py) checks the PR text; `pre-commit` and `pytest --collect-only` run on the changed files. Then the read-only CI Autofix Review agent checks root cause, minimality, unrelated changes, other platforms and the PR text ([`ci-autofix-review.md`](agent/tasks/ci-autofix-review.md)). A rejection goes back to the fix agent once.
+5. **Re-run on GPUs** ([`push_and_dispatch()`](scripts/autofix.py)). Code commits the patch as bingxche on the commit the agent worked on, pushes `bingxche/autofix-<id>-<slug>` to sgl-project/sglang, and dispatches the failed job on that branch, so workflow changes are tested too. Pushing a non-`main` branch starts no other workflow.
+6. **Verify** (a later tick, [`verify_run()`](scripts/autofix.py), from the job logs, not an agent): same workflow, job, ROCm version and runner labels as the failure, and every test of the problem PASSED with no retry. A skip counts only for a workaround. A failure gives the agent a second attempt with the run's log; after the second, the branch is deleted.
+7. **Open the draft PR** ([`render_pr_body()`](scripts/autofix.py)), unless someone else's fix PR appeared meanwhile. Title: `[Fix|Test|CI] [AMD] <scope>: <title>`, checked against sglang's `pr-title.yml` regex ([`TITLE_RE`](scripts/autofix.py)); a workaround's title starts with "Skip … when …" or "Work around …", and it gets a `### Workaround` section and the `workaround` label if sglang has one. The body is sglang's PR template with every section kept, plus `## Test plan` with the GPU run and each test's result. Dates, counts and job links are written by code.
+
+**Things to know**
+- **Switch:** the repository variable `AUTOFIX_MODE`, `off` (default: no reads, no writes) or `live`. There is no dry-run (R2).
+- **Fix-review requests:** once the bot's PR is open, the report's In-flight Fix Check finds it. The suspect-PR comment asks the suspect PR's author to review it only when it fixes the root cause ([`is_autofix_workaround()`](scripts/suspect_pr_comments.py)).
+- **Not done:** marking ready, merging, @-mentioning reviewers, following up on review comments, rebasing, closing a PR whose problem went away.
+- **Smoke test** (E3 of the spec): Actions → CI Autofix with `smoke_problem`, `smoke_date` and `smoke_base` runs the chain for a past problem on a commit before its human fix: the first attempt, the GPU run (the publish job waits for it), the check, and the PR it would open, written to the `autofix-smoke-<run>` artifact. Then it deletes the branch. It opens no PR and does not touch the daily issue, whatever `AUTOFIX_MODE` is.
+- **If the fix job dies** without handing over its state, the hour's starts are lost with it, and the next tick may start more than the cap allows; the publish job still checks the runs already dispatched.
+- **Audit:** [`autofix_audit.py`](scripts/autofix_audit.py) `recipes` reports how many failed scheduled jobs of the last 14 days have a dispatch recipe; `prs` checks every bot PR and every hour of state against the done criteria (cap, GPU proof, root cause named, format, forbidden paths, still green after merge).
+
 ---
 
 ## 6. Operations
@@ -375,6 +414,7 @@ It acts as the owner of `SGLANG_CI_TOKEN` (or `GH_PAT`), who must be an admin on
 |---|---|
 | **bingxche** | Owns this repo; registers the self-hosted runners (needs admin) |
 | **amd-bot** | Posts every public comment, review and reaction on sglang |
+| **bingxche** (via `AUTOFIX_TOKEN`) | Authors CI autofix's branches, GPU re-runs and draft PRs on sglang |
 
 | Token | Used for |
 |---|---|
@@ -384,6 +424,7 @@ It acts as the owner of `SGLANG_CI_TOKEN` (or `GH_PAT`), who must be an admin on
 | `secrets.AGENT_GH_TOKEN` (optional, read-only) | Handed to agents in place of `GH_PAT` |
 | `secrets.SGLANG_CI_TOKEN` (optional) | Coverage audit, in place of `GH_PAT` |
 | `secrets.RUNNER_STATUS_TOKEN` (optional) | Runner health: listing sglang's runners, which amd-bot's read access cannot |
+| `secrets.AUTOFIX_TOKEN` (bingxche's PAT; fine-grained if the org allows: contents, actions, pull requests on sgl-project/sglang) | CI autofix: pushing `bingxche/autofix-*`, dispatching on it, opening draft PRs. Code refuses any other branch, and no agent ever gets it |
 
 ### Repository secrets and variables
 
@@ -397,11 +438,14 @@ Settings → Secrets and variables → Actions.
 | `NOTION_TOKEN` | Notion connection with Read + Insert, no Update, shared only with the two databases |
 | `SGLANG_CI_TOKEN` | Optional: another ROCm/sglang-ci admin's PAT for the coverage audit |
 | `RUNNER_STATUS_TOKEN` | Optional: a token that can list sgl-project/sglang's self-hosted runners (`GET /repos/sgl-project/sglang/actions/runners`), for the runner health check. Read only; never given to an agent |
+| `AUTOFIX_TOKEN` | bingxche's PAT for CI autofix (see above) |
 
 | Variable | Value |
 |---|---|
 | `USE_AGENT` | `true`: agent mode for review and CI status (API mode otherwise) |
 | `SUSPECT_PR_COMMENTS` | `dry-run` (default), `post`, `off` |
+| `AUTOFIX_MODE` | `off` (default), `live` |
+| `AUTOFIX_MAX_PER_HOUR` | Problems CI autofix may start per hour (default 3) |
 | `COVERAGE_AUDIT_MODEL` | Optional `--model` for the coverage audit (default `opus`) |
 | `NOTION_KNOWN_DATA_SOURCE_ID` / `NOTION_STAGING_DATA_SOURCE_ID` | The official (read-only) and staging (write) Notion data sources; they must differ |
 
@@ -503,6 +547,8 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 python scripts/analyze_url.py --url <run or job URL> [--bot-repo bingxche/sglang-ci-bot]
 python scripts/stage_notion.py analyze --bot-repo bingxche/sglang-ci-bot --output out.json
 python scripts/stage_notion.py sync --input out.json --dry-run
+python scripts/autofix.py fix|publish --bot-repo bingxche/sglang-ci-bot [--handoff dir] [--mode live] [--smoke-problem R386 --smoke-date 2026-11-08 --smoke-base <sha>]
+python scripts/autofix_audit.py --bot-repo bingxche/sglang-ci-bot [--days 14] recipes|prs
 ```
 
 Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) selects API mode.
@@ -530,6 +576,10 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 | `MILES_CAUSE_FIX_URL` | Miles analyses | The sglang-ci dashboard's Miles cause/fix payload (default `https://rocm.github.io/sglang-ci/api/miles/cause-fix.json`) |
 | `TRACKER_AGENT_TIMEOUT_SECS` / `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Tracker extraction budget (900 s, 80 turns) |
 | `SUSPECT_PR_COMMENTS` | `suspect_pr_comments.py` | Mode: `dry-run`, `post` or `off` |
+| `AUTOFIX_MODE` / `AUTOFIX_MAX_PER_HOUR` | `autofix.py` | `off` (default) or `live`; problems started per hour (3) |
+| `AUTOFIX_TOKEN` | `autofix.py` | bingxche's PAT for branches, dispatches and draft PRs on sglang |
+| `AUTOFIX_AGENT_TIMEOUT_SECS` / `AUTOFIX_AGENT_MAX_TURNS` | `autofix.py` | Fix agent budget (7200 s, 400 turns; effort max is slow) |
+| `AUTOFIX_REVIEW_TIMEOUT_SECS` / `AUTOFIX_REVIEW_MAX_TURNS` | `autofix.py` | Review agent budget (3600 s, 150 turns) |
 | `CI_STATUS_AGENT_TIMEOUT` / `CI_STATUS_OUT_DIR` | `check_ci_for_pr.py` | Agent timeout (2400 s); where to save the evidence pack and verdicts |
 | `STAGING_AGENT_TIMEOUT_SECS` / `STAGING_AGENT_MAX_TURNS` | `stage_notion.py analyze` | Staging agent budget (1200 s, 120 turns) |
 | `NOTION_TOKEN` / `NOTION_KNOWN_DATA_SOURCE_ID` / `NOTION_STAGING_DATA_SOURCE_ID` | `stage_notion.py sync` | Notion access; never present in the agent step |
