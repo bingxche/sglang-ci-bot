@@ -153,16 +153,18 @@ class AttemptResult:
 
 
 def start_attempt(plan: dict, attempt: int, gh: GitHub, base_ref: str = "origin/main",
-                  previous: str = "", branch_tag: str = "") -> AttemptResult:
+                  previous: str = "", branch_tag: str = "", fetch_main: bool = True) -> AttemptResult:
     """Run the fix and review agents and gate the result; ``ready`` carries the patch.
 
     Runs in the ``fix`` job, which holds no token that can write anywhere; the
     ``publish`` job pushes the patch (``push_and_dispatch()``). The caller has
-    run ``ensure_sglang_repo()``; attempts run in parallel threads.
+    run ``ensure_sglang_repo()``; attempts run in parallel threads. The smoke
+    test passes ``fetch_main=False``: its clone ends at a past commit, and
+    fetching main would show the agents the human fix.
     """
     with REPO_LOCK:  # `git worktree add` on the shared clone is not safe to run concurrently
         since = (plan.get("last_pass") or plan.get("first_fail") or {}).get("date")
-        if since:  # the shallow clone must reach back to the failure window for `git show`
+        if since and fetch_main:  # the shallow clone must reach back to the failure window for `git show`
             git(SGLANG_REPO_PATH, "fetch", "-q", "origin", "main", f"--shallow-since={since}",
                 timeout=600, check=False)
         base_sha = git(SGLANG_REPO_PATH, "rev-parse", base_ref).strip()

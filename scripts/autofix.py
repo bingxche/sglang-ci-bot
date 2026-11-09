@@ -41,6 +41,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -90,6 +91,7 @@ from autofix_state import (  # noqa: E402
 )
 from failure_tracker import deterministic_rows  # noqa: E402
 from utils import (  # noqa: E402
+    REPO,
     SGLANG_REPO_PATH,
     create_agent_worktree,
     ensure_sglang_repo,
@@ -393,16 +395,31 @@ def smoke_plan(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, b
     }
 
 
+def clone_up_to(base_sha: str) -> None:
+    """Make the agents' sglang clone hold history only up to *base_sha*.
+
+    The smoke test fixes a problem that people have since fixed; a clone of
+    today's main would show the agents that fix (``git log origin/main``).
+    """
+    if SGLANG_REPO_PATH.exists():
+        shutil.rmtree(SGLANG_REPO_PATH)
+    SGLANG_REPO_PATH.mkdir(parents=True)
+    git(SGLANG_REPO_PATH, "init", "-q")
+    git(SGLANG_REPO_PATH, "remote", "add", "origin", f"https://github.com/{REPO}.git")
+    git(SGLANG_REPO_PATH, "fetch", "-q", "--depth", "500", "origin", base_sha, timeout=1800)
+    git(SGLANG_REPO_PATH, "update-ref", "refs/remotes/origin/main", base_sha)
+    git(SGLANG_REPO_PATH, "checkout", "-q", "--detach", base_sha)
+
+
 def smoke_fix(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, base_sha: str,
               handoff: Path, job_filter: str = "") -> int:
     """Smoke test, fix job: the agents' first attempt on *base_sha*, handed to the publish job."""
-    ensure_sglang_repo()
-    git(SGLANG_REPO_PATH, "fetch", "-q", "origin", base_sha, "--depth", "100", check=False)
+    clone_up_to(base_sha)
     plan = smoke_plan(token, bot_repo, gh, date_str, pid, base_sha, job_filter)
     if not plan:
         return 1
     t0 = time.time()
-    result = start_attempt(plan, 1, gh, base_sha, branch_tag="smoke-")
+    result = start_attempt(plan, 1, gh, base_sha, branch_tag="smoke-", fetch_main=False)
     handoff.mkdir(parents=True, exist_ok=True)
     if result.status == "ready":
         patch_path(handoff, pid).parent.mkdir(parents=True, exist_ok=True)
