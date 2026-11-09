@@ -2,7 +2,7 @@
 """Check ci-autofix against its done criteria.
 
 ``recipes`` (E2): of the AMD scheduled jobs that failed in the daily reports
-of the last N days, how many have a dispatch recipe (``autofix.recipe_for()``),
+of the last N days, how many have a dispatch recipe (``autofix_ci.recipe_for()``),
 and which do not.
 
 ``prs`` (D0–D4): every draft PR the bot opened on sgl-project/sglang, and
@@ -34,7 +34,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import autofix  # noqa: E402
+import autofix_github as af_github  # noqa: E402
+import autofix_config as af_config  # noqa: E402
+import autofix_ci as af_ci  # noqa: E402
+import autofix_pr as af_pr  # noqa: E402
+import autofix_state as af_state  # noqa: E402
 from daily_cross_workflow_summary import collect_workflow_analyses  # noqa: E402
 from monitor_ci import MONITORED_WORKFLOWS, get_issue_comments  # noqa: E402
 from utils import SGLANG_REPO_PATH, gh_get, gh_headers  # noqa: E402
@@ -63,12 +67,12 @@ def recipe_coverage(jobs: list[tuple[str, str]], workflow_yaml) -> dict:
     """*jobs*: (workflow, job name) of every failed scheduled job. Counted once per job family."""
     families: dict[tuple[str, str], str] = {}
     for wf, name in jobs:
-        families.setdefault((wf, autofix.job_family(name)), name)
+        families.setdefault((wf, af_ci.job_family(name)), name)
     covered, missing = [], []
     for (wf, _), name in sorted(families.items()):
-        recipe, why = autofix.recipe_for(wf, name, workflow_yaml)
+        recipe, why = af_ci.recipe_for(wf, name, workflow_yaml)
         (covered if recipe else missing).append((wf, name, why))
-    in_scope = [x for x in covered + missing if x[0] in autofix.AUTOFIX_WORKFLOWS]
+    in_scope = [x for x in covered + missing if x[0] in af_config.AUTOFIX_WORKFLOWS]
     return {
         "families": len(families),
         "covered": covered,
@@ -85,7 +89,7 @@ def render_coverage(cov: dict, days: int, instances: Counter) -> str:
         "",
         f"- All monitored AMD scheduled workflows: {n}/{total} failed jobs have a recipe "
         f"({100 * n / max(total, 1):.0f}%).",
-        f"- Workflows autofix fixes ({', '.join(autofix.AUTOFIX_WORKFLOWS)}): "
+        f"- Workflows autofix fixes ({', '.join(af_config.AUTOFIX_WORKFLOWS)}): "
         f"{cov['in_scope_covered']}/{cov['in_scope']} "
         f"({100 * cov['in_scope_covered'] / max(cov['in_scope'], 1):.0f}%).",
         "",
@@ -97,7 +101,7 @@ def render_coverage(cov: dict, days: int, instances: Counter) -> str:
         "|---|---|---|---|",
     ]
     for wf, name, why in cov["missing"]:
-        lines.append(f"| {wf} | `{name}` | {instances[(wf, autofix.job_family(name))]} | {why} |")
+        lines.append(f"| {wf} | `{name}` | {instances[(wf, af_ci.job_family(name))]} | {why} |")
     lines += ["", "## With a recipe", ""]
     by_wf = Counter(wf for wf, _, _ in cov["covered"])
     lines += [f"- {wf}: {k} jobs" for wf, k in sorted(by_wf.items())]
@@ -119,7 +123,7 @@ def cmd_recipes(args, token: str) -> int:
         log.info("Reading %s (#%d)", date, num)
         for wf, jas in collect_workflow_analyses(token, args.bot_repo, num).items():
             jobs += [(wf, ja["job_name"]) for ja in jas if wf in MONITORED_WORKFLOWS]
-    instances = Counter((wf, autofix.job_family(name)) for wf, name in jobs)
+    instances = Counter((wf, af_ci.job_family(name)) for wf, name in jobs)
     cov = recipe_coverage(jobs, workflow_yaml)
     print(render_coverage(cov, args.days, instances))
     return 0
@@ -166,44 +170,44 @@ def audit_pr_text(pr: dict, files: list[dict], template: str, label_exists: bool
     v = []
     sections = pr_sections(body)
     motivation = sections.get("Motivation", "")
-    if not re.search(r"\[(?:" + "|".join(autofix.CONFIDENCE_LABELS) + r")\]", motivation):
+    if not re.search(r"\[(?:" + "|".join(af_pr.CONFIDENCE_LABELS) + r")\]", motivation):
         v.append(f"D2: #{n} Motivation names no confidence label")
     diff = "\n".join(f"diff --git a/{f['filename']} b/{f['filename']}\n{f.get('patch') or ''}" for f in files)
-    if autofix.workaround_signals(diff):
+    if af_pr.workaround_signals(diff):
         if "### Workaround" not in body:
             v.append(f"D2: #{n} skips or loosens a test but has no ### Workaround section")
         labels = {lb["name"] for lb in pr.get("labels") or []}
         if label_exists and "workaround" not in labels:
             v.append(f"D2: #{n} is a workaround without the workaround label")
-    if autofix.check_title(pr["title"], fix_kind):
+    if af_pr.check_title(pr["title"], fix_kind):
         v.append(f"D2b: #{n} title fails the sglang title check")
-    missing = [s for s in autofix.template_sections(template) if s not in sections]
+    missing = [s for s in af_pr.template_sections(template) if s not in sections]
     if missing:
         v.append(f"D2b: #{n} lacks template sections {missing}")
     prose = "\n".join(sections.get(s, "") for s in ("Motivation", "Modifications", "Accuracy Tests",
                                                     "Speed Tests and Profiling"))
     prose = re.sub(r"^Failing on `main`.*$", "", prose, flags=re.MULTILINE)  # code-written job list
-    words = autofix.count_words(prose)
-    if words > autofix.MAX_BODY_WORDS:
-        v.append(f"D2b: #{n} prose has {words} words (at most {autofix.MAX_BODY_WORDS})")
-    forbidden = [f["filename"] for f in files if any(p.search(f["filename"]) for p in autofix.FORBIDDEN_PATHS)]
+    words = af_pr.count_words(prose)
+    if words > af_config.MAX_BODY_WORDS:
+        v.append(f"D2b: #{n} prose has {words} words (at most {af_config.MAX_BODY_WORDS})")
+    forbidden = [f["filename"] for f in files if any(p.search(f["filename"]) for p in af_pr.FORBIDDEN_PATHS)]
     if forbidden:
         v.append(f"D3: #{n} touches {forbidden}")
     return v
 
 
 def pr_data(body: str) -> dict:
-    start = (body or "").rfind(autofix.PR_DATA_PREFIX)
+    start = (body or "").rfind(af_pr.PR_DATA_PREFIX)
     if start < 0:
         return {}
     end = body.find(" -->", start)
     try:
-        return json.loads(body[start + len(autofix.PR_DATA_PREFIX):end])
+        return json.loads(body[start + len(af_pr.PR_DATA_PREFIX):end])
     except ValueError:
         return {}
 
 
-def audit_pr_runs(pr: dict, data: dict, gh: autofix.GitHub) -> list[str]:
+def audit_pr_runs(pr: dict, data: dict, gh: af_github.GitHub) -> list[str]:
     """D1 and D4 for one PR, from its hidden data block."""
     n = pr["number"]
     v = []
@@ -219,7 +223,7 @@ def audit_pr_runs(pr: dict, data: dict, gh: autofix.GitHub) -> list[str]:
         plan = {"recipe": {"workflow": data["workflow"], "families": data["families"]},
                 "tests": data["tests"], "jobs": []}
         rec = {"head_sha": run["head_sha"], "fix": {"fix_kind": data.get("fix_kind")}}
-        result = autofix.verify_run(plan, rec, run, gh.jobs(run["id"]), gh.job_log)
+        result = af_ci.verify_run(plan, rec, run, gh.jobs(run["id"]), gh.job_log)
         if not result["ok"]:
             v.append(f"D1: #{n} run {run['html_url']}: " + "; ".join(result["reasons"])[:300])
     if pr.get("merged_at"):
@@ -229,12 +233,12 @@ def audit_pr_runs(pr: dict, data: dict, gh: autofix.GitHub) -> list[str]:
         for r in reversed(gh.scheduled_runs(data["workflow"])):
             if r["created_at"] <= merged or checked >= 2:
                 continue
-            jobs = [j for j in gh.jobs(r["id"]) if autofix.job_family(j["name"]) in families]
+            jobs = [j for j in gh.jobs(r["id"]) if af_ci.job_family(j["name"]) in families]
             if not jobs:
                 continue
             checked += 1
             for f, fn in data.get("tests") or []:
-                outcome = next((o for o in (autofix.test_outcome(gh.job_log(j["id"]), f, fn) for j in jobs)
+                outcome = next((o for o in (af_ci.test_outcome(gh.job_log(j["id"]), f, fn) for j in jobs)
                                 if o.status != "not-run"), None)
                 if not outcome or outcome.status != "passed":
                     v.append(f"D4: #{n} `{f}::{fn}` {outcome.status if outcome else 'did not run'} "
@@ -244,14 +248,14 @@ def audit_pr_runs(pr: dict, data: dict, gh: autofix.GitHub) -> list[str]:
 
 def cmd_prs(args, token: str) -> int:
     now = datetime.now(timezone.utc)
-    gh = autofix.GitHub(token)
+    gh = af_github.GitHub(token)
     violations: list[str] = []
 
     states = []
     for _, num in daily_issues(token, args.bot_repo, args.days, now):
         for c in get_issue_comments(token, args.bot_repo, num):
-            if autofix.LOG_MARKER in (c.get("body") or ""):
-                states.append(autofix.load_state(c["body"]))
+            if af_state.LOG_MARKER in (c.get("body") or ""):
+                states.append(af_state.load_state(c["body"]))
     violations += audit_states(states, args.max_per_hour)
 
     template_path = Path(args.sglang) / ".github" / "pull_request_template.md"
@@ -260,7 +264,7 @@ def cmd_prs(args, token: str) -> int:
     prs = gh.search_prs(f'in:body "amd-bot-autofix:" author:{args.author}')
     for item in prs:
         pr = gh.pull(item["number"])
-        if not pr or not autofix._PR_MARKER_RE.search(pr.get("body") or ""):
+        if not pr or not af_pr.PR_MARKER_RE.search(pr.get("body") or ""):
             continue
         files = gh.pr_files(pr["number"])
         data = pr_data(pr.get("body") or "")
@@ -281,9 +285,9 @@ def main() -> int:
     rec = sub.add_parser("recipes", help="E2: dispatch recipe coverage")
     rec.add_argument("--ref", default="origin/main", help="Read the workflows at this ref of --sglang")
     prs = sub.add_parser("prs", help="D0–D4: every bot PR")
-    prs.add_argument("--author", default=autofix.NOTIFY_USER)
+    prs.add_argument("--author", default=af_config.NOTIFY_USER)
     prs.add_argument("--max-per-hour", type=int,
-                     default=int(os.environ.get("AUTOFIX_MAX_PER_HOUR") or autofix.DEFAULT_MAX_PER_HOUR))
+                     default=int(os.environ.get("AUTOFIX_MAX_PER_HOUR") or af_config.DEFAULT_MAX_PER_HOUR))
     args = parser.parse_args()
     logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO, stream=sys.stderr)
     token = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN") or ""

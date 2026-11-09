@@ -111,12 +111,16 @@ jobs:
 
       - name: Publish
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          BOT_GH_PAT: ${{ secrets.GH_PAT }}
+          # Optional. Unset, autofix writes with the PAT the runner containers already carry as
+          # GH_PAT (bingxche's, from runner/setup.sh --pat); autofix_github.push_branch() refuses
+          # any other account.
           AUTOFIX_TOKEN: ${{ secrets.AUTOFIX_TOKEN }}
           AUTOFIX_MODE: ${{ vars.AUTOFIX_MODE || 'off' }}
           AUTOFIX_MAX_PER_HOUR: ${{ vars.AUTOFIX_MAX_PER_HOUR || '3' }}
           SMOKE_PROBLEM: ${{ github.event.inputs.smoke_problem }}
         run: |
+          export AUTOFIX_TOKEN="${AUTOFIX_TOKEN:-$GH_PAT}" GH_PAT="$BOT_GH_PAT"
           ARGS=(publish --bot-repo "${{ github.repository }}" --handoff autofix-handoff)
           if [ -n "$SMOKE_PROBLEM" ]; then
             ARGS+=(--smoke-problem "$SMOKE_PROBLEM" --smoke-out autofix-smoke)

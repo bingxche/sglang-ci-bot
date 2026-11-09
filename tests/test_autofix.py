@@ -15,6 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import autofix  # noqa: E402
+import autofix_config as af_config  # noqa: E402
+import autofix_github as af_github  # noqa: E402
+import autofix_ci as af_ci  # noqa: E402
+import autofix_select as af_select  # noqa: E402
+import autofix_pr as af_pr  # noqa: E402
+import autofix_state as af_state  # noqa: E402
 import utils  # noqa: E402
 
 NOW = datetime(2026, 11, 9, 14, 30, tzinfo=timezone.utc)
@@ -109,19 +115,19 @@ class JobNameAndRecipeTest(unittest.TestCase):
     yaml = staticmethod(YAMLS.get)
 
     def test_job_names(self):
-        j = autofix.parse_job_name("call-pr-test-amd-extra (rocm720) / extra-a-test-1-gpu-large-amd "
+        j = af_ci.parse_job_name("call-pr-test-amd-extra (rocm720) / extra-a-test-1-gpu-large-amd "
                                    "(rocm720, linux-mi300-1gpu-sglang, 0)")
         self.assertEqual((j.caller, j.base, j.rocm, j.runner),
                          ("call-pr-test-amd-extra", "extra-a-test-1-gpu-large-amd", "rocm720", "linux-mi300-1gpu-sglang"))
-        j = autofix.parse_job_name("nightly-test-1-gpu-unit (rocm720, linux-mi300-1gpu-sglang) part 1")
+        j = af_ci.parse_job_name("nightly-test-1-gpu-unit (rocm720, linux-mi300-1gpu-sglang) part 1")
         self.assertEqual((j.base, j.rocm), ("nightly-test-1-gpu-unit", "rocm720"))
         # Partitions are one family; ROCm versions are not.
-        self.assertEqual(autofix.job_family(SMALL), autofix.job_family(SMALL.replace(", 3)", ", 5)")))
-        self.assertNotEqual(autofix.job_family(SMALL), autofix.job_family(SMALL.replace("rocm10", "rocm720")))
+        self.assertEqual(af_ci.job_family(SMALL), af_ci.job_family(SMALL.replace(", 3)", ", 5)")))
+        self.assertNotEqual(af_ci.job_family(SMALL), af_ci.job_family(SMALL.replace("rocm10", "rocm720")))
 
     def test_pr_test_stage(self):
         r, _ = autofix.recipe_for("pr-test-amd.yml", SMALL, self.yaml)
-        self.assertEqual(autofix.dispatch_inputs([r]), {
+        self.assertEqual(af_ci.dispatch_inputs([r]), {
             "rocm_version": "rocm10", "runner_arch": "mi300", "continue_on_error": "true",
             "target_stage": "stage-b-test-1-gpu-small-amd"})
 
@@ -132,22 +138,22 @@ class JobNameAndRecipeTest(unittest.TestCase):
         self.assertNotEqual(a.group, c.group)
         # mi35x runners take no runner_arch, so it is a separate dispatch from the mi300 one.
         self.assertNotEqual(a.group, b.group)
-        self.assertEqual(autofix.dispatch_inputs([a, a])["target_stage"], "stage-b-test-1-gpu-small-amd")
+        self.assertEqual(af_ci.dispatch_inputs([a, a])["target_stage"], "stage-b-test-1-gpu-small-amd")
 
     def test_extra_suite_goes_to_its_own_workflow(self):
         r, _ = autofix.recipe_for("pr-test-amd.yml", "call-pr-test-amd-extra (rocm10) / extra-a-test-1-gpu-large-amd "
                                   "(rocm10, linux-mi300-1gpu-sglang, 0)", self.yaml)
         self.assertEqual(r.workflow, "pr-test-amd-extra.yml")
-        self.assertEqual(autofix.dispatch_inputs([r])["rocm_version"], "rocm10")
+        self.assertEqual(af_ci.dispatch_inputs([r])["rocm_version"], "rocm10")
 
     def test_nightly_and_disagg(self):
         r, _ = autofix.recipe_for("nightly-test-amd.yml", "nightly-accuracy-2-gpu-vlm (rocm724, linux-mi300-2gpu-sglang)",
                                   self.yaml)
-        self.assertEqual(autofix.dispatch_inputs([r]), {"rocm_version": "rocm724", "continue_on_error": "true",
+        self.assertEqual(af_ci.dispatch_inputs([r]), {"rocm_version": "rocm724", "continue_on_error": "true",
                                                          "job_filter": "nightly-accuracy-2-gpu-vlm"})
         r, _ = autofix.recipe_for("nightly-amd-mi355x-disagg.yml",
                                   "nightly-mi355x-2n (glm52-fp4-1k1k-1p1d, glm52-fp4-mi355x-sglang, amd/GLM)", self.yaml)
-        self.assertEqual(autofix.dispatch_inputs([r]), {"configs": "glm52-fp4-1k1k-1p1d"})
+        self.assertEqual(af_ci.dispatch_inputs([r]), {"configs": "glm52-fp4-1k1k-1p1d"})
 
     def test_no_recipe(self):
         for wf, name in (("nightly-test-amd-miles-rocm10.yml", "test-miles-mi35x (x)"),
@@ -169,7 +175,7 @@ class InfraTest(unittest.TestCase):
             ("requests.exceptions.ReadTimeout: HTTPSConnectionPool(host='huggingface.co', port=443)", "network"),
             ("docker: Error response from daemon: manifest unknown", "image pull or build"),
         ):
-            self.assertEqual(autofix.classify_infra([err]), kind, err)
+            self.assertEqual(af_ci.classify_infra([err]), kind, err)
 
     def test_code_errors_are_not_infrastructure(self):
         for err in ("AttributeError: 'types.SimpleNamespace' object has no attribute 'layer_router'",
@@ -178,43 +184,43 @@ class InfraTest(unittest.TestCase):
                     # The test's own server died: a bug, not the network.
                     "requests.exceptions.ConnectionError: [Errno 111] Connection refused",
                     "requests.exceptions.ReadTimeout: HTTPConnectionPool(host='127.0.0.1', port=30000)"):
-            self.assertIsNone(autofix.classify_infra([err]), err)
+            self.assertIsNone(af_ci.classify_infra([err]), err)
 
     def test_performance(self):
-        self.assertTrue(autofix.is_perf(["nightly-perf-2-gpu-text (rocm10)"], []))
-        self.assertTrue(autofix.is_perf(["x"], ["AssertionError: output throughput 812 tok/s < 900"]))
-        self.assertFalse(autofix.is_perf([SMALL], ["AttributeError: x"]))
-        self.assertFalse(autofix.is_perf(["jit-kernel-benchmark-test-amd (rocm10)"], ["ImportError: x"]))
+        self.assertTrue(af_ci.is_perf(["nightly-perf-2-gpu-text (rocm10)"], []))
+        self.assertTrue(af_ci.is_perf(["x"], ["AssertionError: output throughput 812 tok/s < 900"]))
+        self.assertFalse(af_ci.is_perf([SMALL], ["AttributeError: x"]))
+        self.assertFalse(af_ci.is_perf(["jit-kernel-benchmark-test-amd (rocm10)"], ["ImportError: x"]))
 
 
 class LogParsingTest(unittest.TestCase):
     def test_failed_function(self):
-        o = autofix.test_outcome(FAILED_LOG, TEST_FILE, TEST_FUNC)
+        o = af_ci.test_outcome(FAILED_LOG, TEST_FILE, TEST_FUNC)
         self.assertEqual((o.status, o.retried), ("failed", False))
 
     def test_passed_file_with_no_named_function(self):
-        o = autofix.test_outcome(PASSED_LOG, TEST_FILE, TEST_FUNC)
+        o = af_ci.test_outcome(PASSED_LOG, TEST_FILE, TEST_FUNC)
         self.assertEqual((o.status, o.retried), ("passed", False))
 
     def test_retry_is_seen(self):
         log = ci_log("OK", "", retried=True)
-        o = autofix.test_outcome(log, TEST_FILE, TEST_FUNC)
+        o = af_ci.test_outcome(log, TEST_FILE, TEST_FUNC)
         self.assertEqual((o.status, o.retried), ("passed", True))
 
     def test_skips_make_a_silent_pass_unknown(self):
-        o = autofix.test_outcome(ci_log("OK (skipped=1)", ""), TEST_FILE, TEST_FUNC)
+        o = af_ci.test_outcome(ci_log("OK (skipped=1)", ""), TEST_FILE, TEST_FUNC)
         self.assertEqual(o.status, "unknown")
 
     def test_verbose_unittest_and_skips(self):
         line = "test_first_chunk_reads_fp8_pool (__main__.TestMiniMaxHD128AsmPrefill.test_first_chunk_reads_fp8_pool) ... skipped 'no kernel'"
-        self.assertEqual(autofix.test_outcome(ci_log("OK (skipped=1)", line), TEST_FILE, TEST_FUNC).status, "skipped")
+        self.assertEqual(af_ci.test_outcome(ci_log("OK (skipped=1)", line), TEST_FILE, TEST_FUNC).status, "skipped")
         line = "test_first_chunk_reads_fp8_pool (__main__.TestMiniMaxHD128AsmPrefill.test_first_chunk_reads_fp8_pool) ... ok"
-        self.assertEqual(autofix.test_outcome(ci_log("OK", line), TEST_FILE, TEST_FUNC).status, "passed")
+        self.assertEqual(af_ci.test_outcome(ci_log("OK", line), TEST_FILE, TEST_FUNC).status, "passed")
 
     def test_set_up_class(self):
         log = ci_log("FAILED (errors=1)", "ERROR: setUpClass (__main__.TestTorchCompile)")
-        self.assertEqual(autofix.test_outcome(log, TEST_FILE, "TestTorchCompile.setUpClass").status, "failed")
-        self.assertEqual(autofix.test_outcome(PASSED_LOG, TEST_FILE, "setUpClass").status, "passed")
+        self.assertEqual(af_ci.test_outcome(log, TEST_FILE, "TestTorchCompile.setUpClass").status, "failed")
+        self.assertEqual(af_ci.test_outcome(PASSED_LOG, TEST_FILE, "setUpClass").status, "passed")
 
     def test_pytest_status_on_a_later_line(self):
         log = "\n".join([
@@ -225,28 +231,28 @@ class LogParsingTest(unittest.TestCase):
             "PASSED",
         ])
         f = "python/sglang/multimodal_gen/test/server/test_server_2_gpu.py"
-        self.assertEqual(autofix.test_outcome(log, f, "test_diffusion_generation[wan2_1_lora]").status, "failed")
-        self.assertEqual(autofix.test_outcome(log, f, "TestDiffusionServerTwoGpu::test_diffusion_generation[qwen]").status,
+        self.assertEqual(af_ci.test_outcome(log, f, "test_diffusion_generation[wan2_1_lora]").status, "failed")
+        self.assertEqual(af_ci.test_outcome(log, f, "TestDiffusionServerTwoGpu::test_diffusion_generation[qwen]").status,
                          "passed")
 
     def test_file_that_did_not_run(self):
-        self.assertEqual(autofix.test_outcome(FAILED_LOG, "test/registered/x/test_absent.py", "test_a").status, "not-run")
+        self.assertEqual(af_ci.test_outcome(FAILED_LOG, "test/registered/x/test_absent.py", "test_a").status, "not-run")
 
     def test_unrelated_failures(self):
         log = FAILED_LOG + "\n2026-11-07T01:00:00Z ✗ FAILED: /sglang-checkout/test/registered/b/test_b.py returned exit code 1"
-        self.assertEqual(autofix.unrelated_failures(log, [(TEST_FILE, TEST_FUNC)]), ["test/registered/b/test_b.py"])
+        self.assertEqual(af_ci.unrelated_failures(log, [(TEST_FILE, TEST_FUNC)]), ["test/registered/b/test_b.py"])
 
 
 class HistoryTest(unittest.TestCase):
     def test_fails_for_sure_needs_two_failed_runs_in_a_row(self):
-        self.assertTrue(autofix.fails_for_sure(["failed", "failed", "passed"]))
-        self.assertFalse(autofix.fails_for_sure(["failed", "passed", "failed"]))
-        self.assertFalse(autofix.fails_for_sure(["failed"]))
-        self.assertFalse(autofix.fails_for_sure(["passed", "failed", "failed"]))
+        self.assertTrue(af_ci.fails_for_sure(["failed", "failed", "passed"]))
+        self.assertFalse(af_ci.fails_for_sure(["failed", "passed", "failed"]))
+        self.assertFalse(af_ci.fails_for_sure(["failed"]))
+        self.assertFalse(af_ci.fails_for_sure(["passed", "failed", "failed"]))
 
     def test_failure_window(self):
         runs = [("failed", {"date": "11-09"}), ("failed", {"date": "11-08"}), ("passed", {"date": "11-07"})]
-        ff, lp, n = autofix.failure_window(runs)
+        ff, lp, n = af_ci.failure_window(runs)
         self.assertEqual((ff["date"], lp["date"], n), ("11-08", "11-07", 2))
 
 
@@ -294,7 +300,7 @@ class HourlyCapTest(unittest.TestCase):
         state["problems"]["R1"] = {"name": "a --> b <!-- c", "status": "dispatched", "attempts": 1,
                                    "updated": NOW.isoformat()}
         body = autofix.render_log_comment(state, "live", 3, NOW)
-        self.assertEqual(autofix.load_state(body), state)
+        self.assertEqual(af_state.load_state(body), state)
 
     def test_comment_stays_under_githubs_limit(self):
         state = self.state()
@@ -306,7 +312,7 @@ class HourlyCapTest(unittest.TestCase):
             autofix.add_event(state, NOW, "R1", "not fixed", "y" * 300)
         body = autofix.render_log_comment(state, "live", 3, NOW)
         self.assertLess(len(body), 65_536)
-        self.assertEqual(set(autofix.load_state(body)["problems"]), {f"R{i}" for i in range(8)})
+        self.assertEqual(set(af_state.load_state(body)["problems"]), {f"R{i}" for i in range(8)})
 
     def test_skipped_problems_are_forgotten_after_two_days(self):
         old = {"problems": {"R1": {"name": "a", "attempts": 0, "skip": "flaky",
@@ -339,8 +345,8 @@ class PatchGateTest(unittest.TestCase):
 
     def test_root_cause_fix_passes(self):
         d = self.diff("sgl-kernel/csrc/topk.cuh", ["  mask = 0xffffffff;"], ["  mask = warp::kFullMask;"])
-        self.assertEqual(autofix.gate_patch(d, self.ROOT_CAUSE), [])
-        self.assertEqual(autofix.workaround_signals(d), [])
+        self.assertEqual(af_pr.gate_patch(d, self.ROOT_CAUSE), [])
+        self.assertEqual(af_pr.workaround_signals(d), [])
 
     def test_workarounds_are_recognized(self):
         cases = [
@@ -353,25 +359,25 @@ class PatchGateTest(unittest.TestCase):
             self.diff("python/sglang/test/x.py", [], ["pytest.mark.xfail(reason='x')"]),
         ]
         for d in cases:
-            self.assertTrue(autofix.workaround_signals(d), d)
-            self.assertTrue(autofix.gate_patch(d, self.ROOT_CAUSE), d)
-            self.assertEqual(autofix.gate_patch(d, {"fix_kind": "workaround"}), [], d)
+            self.assertTrue(af_pr.workaround_signals(d), d)
+            self.assertTrue(af_pr.gate_patch(d, self.ROOT_CAUSE), d)
+            self.assertEqual(af_pr.gate_patch(d, {"fix_kind": "workaround"}), [], d)
 
     def test_forbidden_paths(self):
         for path in ("docker/rocm.Dockerfile", "python/pyproject_rocm.toml", ".github/CODEOWNERS"):
             d = self.diff(path, ["a"], ["b"])
-            self.assertTrue(any("may not change" in p for p in autofix.gate_patch(d, self.ROOT_CAUSE)), path)
+            self.assertTrue(any("may not change" in p for p in af_pr.gate_patch(d, self.ROOT_CAUSE)), path)
 
     def test_cache_files_are_rejected(self):
         d = self.diff("test/registered/a/__pycache__/test_x.cpython-312.pyc", [], ["x"])
-        self.assertTrue(any("cache" in p for p in autofix.gate_patch(d, self.ROOT_CAUSE)))
+        self.assertTrue(any("cache" in p for p in af_pr.gate_patch(d, self.ROOT_CAUSE)))
 
     def test_removed_comment_mentioning_nightly_is_not_a_moved_test(self):
         d = self.diff("test/registered/a/test_x.py", ["# flaky on nightly too"], ["# fails on nightly too"])
-        self.assertEqual(autofix.workaround_signals(d), [])
+        self.assertEqual(af_pr.workaround_signals(d), [])
 
     def test_empty_patch(self):
-        self.assertEqual(autofix.gate_patch("", self.ROOT_CAUSE), ["the agent changed nothing"])
+        self.assertEqual(af_pr.gate_patch("", self.ROOT_CAUSE), ["the agent changed nothing"])
 
 
 def fix_report(kind: str = "root-cause", **pr) -> dict:
@@ -393,35 +399,35 @@ def fix_report(kind: str = "root-cause", **pr) -> dict:
 class PrTextTest(unittest.TestCase):
     def test_titles_pass_the_sglang_title_check(self):
         fix = fix_report()
-        self.assertEqual(autofix.build_title(fix, ["sgl-kernel/csrc/topk.cuh"]),
+        self.assertEqual(af_pr.build_title(fix, ["sgl-kernel/csrc/topk.cuh"]),
                          "[Fix] [AMD] attention: Use the platform warp mask in topk")
-        self.assertEqual(autofix.build_title(fix, ["test/registered/a/test_x.py"])[:13], "[Test] [AMD] ")
-        self.assertEqual(autofix.build_title(fix, [".github/workflows/pr-test-amd.yml"])[:11], "[CI] [AMD] ")
+        self.assertEqual(af_pr.build_title(fix, ["test/registered/a/test_x.py"])[:13], "[Test] [AMD] ")
+        self.assertEqual(af_pr.build_title(fix, [".github/workflows/pr-test-amd.yml"])[:11], "[CI] [AMD] ")
         for title in ("[Fix] [AMD] attention: Use the platform warp mask in topk",
                       "[Test] [AMD] aiter-backend: Skip the fp8 prefill test when AITER lacks the kernel",
                       "[CI] [AMD] pr-test-amd: Work around the missing MI35x runner label"):
             kind = "root-cause" if title.startswith("[Fix]") else "workaround"
-            self.assertEqual(autofix.check_title(title, kind), [], title)
+            self.assertEqual(af_pr.check_title(title, kind), [], title)
 
     def test_bad_titles(self):
-        self.assertTrue(autofix.check_title("[Fix] [AMD] [Workaround] attention: x", "workaround"))
-        self.assertTrue(autofix.check_title("[Fix] [amd] attention: x", "root-cause"))
-        self.assertTrue(autofix.check_title("[Test] [AMD] attention: Change the test", "workaround"))
-        self.assertTrue(autofix.check_title("Fix attention", "root-cause"))
+        self.assertTrue(af_pr.check_title("[Fix] [AMD] [Workaround] attention: x", "workaround"))
+        self.assertTrue(af_pr.check_title("[Fix] [amd] attention: x", "root-cause"))
+        self.assertTrue(af_pr.check_title("[Test] [AMD] attention: Change the test", "workaround"))
+        self.assertTrue(af_pr.check_title("Fix attention", "root-cause"))
 
     def test_report_parsing(self):
         text = "Found it.\n\n```json autofix\n" + json.dumps(fix_report()) + "\n```\n"
-        self.assertEqual(autofix.parse_fix_report(text)["fix_kind"], "root-cause")
+        self.assertEqual(af_pr.parse_fix_report(text)["fix_kind"], "root-cause")
         with self.assertRaises(ValueError):
-            autofix.parse_fix_report("```json autofix\n" + json.dumps(fix_report("workaround")) + "\n```\n")
-        self.assertEqual(autofix.parse_fix_report('```json autofix\n{"status": "no-fix", "reason": "x"}\n```\n')["status"],
+            af_pr.parse_fix_report("```json autofix\n" + json.dumps(fix_report("workaround")) + "\n```\n")
+        self.assertEqual(af_pr.parse_fix_report('```json autofix\n{"status": "no-fix", "reason": "x"}\n```\n')["status"],
                          "no-fix")
 
     def test_pr_text_checks(self):
-        self.assertEqual(autofix.check_pr_text(fix_report()), [])
-        self.assertTrue(autofix.check_pr_text(fix_report(motivation="It broke. [HIGH] #1 did it.")))
-        self.assertTrue(autofix.check_pr_text(fix_report(modifications="word " * 300)))
-        self.assertTrue(autofix.check_pr_text(fix_report(modifications="Fixes R386, cc @someone.")))
+        self.assertEqual(af_pr.check_pr_text(fix_report()), [])
+        self.assertTrue(af_pr.check_pr_text(fix_report(motivation="It broke. [HIGH] #1 did it.")))
+        self.assertTrue(af_pr.check_pr_text(fix_report(modifications="word " * 300)))
+        self.assertTrue(af_pr.check_pr_text(fix_report(modifications="Fixes R386, cc @someone.")))
 
     def body(self, kind: str = "root-cause") -> str:
         fix = fix_report(kind, title="Skip the fp8 prefill test when AITER lacks the kernel",
@@ -431,7 +437,7 @@ class PrTextTest(unittest.TestCase):
              "first_fail": {"date": "2026-11-06", "run_url": "https://github.com/sgl-project/sglang/actions/runs/1"},
              "jobs": [{"job_id": 7, "job_name": SMALL, "run_url": "https://github.com/sgl-project/sglang/actions/runs/1",
                        "tests": [[TEST_FILE, TEST_FUNC]]}],
-             "recipe": {"workflow": "pr-test-amd.yml", "families": [autofix.job_family(SMALL)]}}
+             "recipe": {"workflow": "pr-test-amd.yml", "families": [af_ci.job_family(SMALL)]}}
         v = {"run_id": 9, "run_url": "https://github.com/sgl-project/sglang/actions/runs/9",
              "results": [{"file": TEST_FILE, "func": TEST_FUNC, "status": "passed",
                           "job_url": "https://github.com/sgl-project/sglang/actions/runs/9/job/10",
@@ -441,8 +447,8 @@ class PrTextTest(unittest.TestCase):
 
     def test_body_keeps_every_template_section_in_order(self):
         body = self.body()
-        sections = autofix.template_sections(body)
-        self.assertEqual([s for s in sections if s != "Test plan"], autofix.template_sections(TEMPLATE))
+        sections = af_pr.template_sections(body)
+        self.assertEqual([s for s in sections if s != "Test plan"], af_pr.template_sections(TEMPLATE))
         self.assertEqual(sections.index("Test plan"), sections.index("Accuracy Tests") - 1)
         self.assertIn("- [x] Format your code", body)
         self.assertIn("- [ ] Add unit tests", body)
@@ -495,13 +501,13 @@ class FakeGitHub:
         return []
 
 
-def problem(**kw) -> autofix.Problem:
+def problem(**kw) -> af_select.Problem:
     analysis = ("### Failed Tests\n| Test File | Test Function | Error |\n|---|---|---|\n"
                 f"| `{TEST_FILE}` | `{TEST_FUNC}` | AttributeError: no attribute 'layer_router' |\n")
     job = {"job_id": 7, "job_name": SMALL, "run_url": "https://github.com/sgl-project/sglang/actions/runs/42",
            "workflow": "pr-test-amd.yml", "analysis": analysis}
     job.update(kw.pop("job", {}))
-    return autofix.Problem("R386", "MiniMax fp8 prefill test crashes", [job], **kw)
+    return af_select.Problem("R386", "MiniMax fp8 prefill test crashes", [job], **kw)
 
 
 class SelectionTest(unittest.TestCase):
@@ -552,7 +558,7 @@ class ReportParsingTest(unittest.TestCase):
     ])
 
     def test_names_and_fixes(self):
-        sections = autofix.problem_sections(self.SUMMARY)
+        sections = af_select.problem_sections(self.SUMMARY)
         self.assertEqual(sections["R386"]["name"], "MiniMax fp8 prefill test crashes")
         self.assertEqual((sections["R386"]["fix"], sections["R386"]["fix_pr"]), (False, None))
         self.assertEqual((sections["R414"]["fix"], sections["R414"]["fix_pr"]), (True, 49028))
@@ -566,7 +572,7 @@ class VerifyRunTest(unittest.TestCase):
     PLAN = {"tests": [[TEST_FILE, TEST_FUNC]],
             "jobs": [{"job_id": 7, "job_name": SMALL, "run_url": "u", "labels": ["linux-mi300-1gpu-sglang"],
                       "tests": [[TEST_FILE, TEST_FUNC]]}],
-            "recipe": {"workflow": "pr-test-amd.yml", "families": [autofix.job_family(SMALL)]}}
+            "recipe": {"workflow": "pr-test-amd.yml", "families": [af_ci.job_family(SMALL)]}}
     REC = {"head_sha": "abc", "fix": {"fix_kind": "root-cause"}}
     RUN = {"id": 9, "path": ".github/workflows/pr-test-amd.yml", "head_sha": "abc", "status": "completed",
            "html_url": "https://github.com/x/runs/9"}
@@ -624,8 +630,17 @@ class ModeOffTest(unittest.TestCase):
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_mode_defaults_to_off(self):
-        self.assertEqual(autofix.DEFAULT_MODE, "off")
+        self.assertEqual(af_config.DEFAULT_MODE, "off")
         self.assertEqual(autofix.MODES, ("off", "live"))
+
+    def test_the_switch(self):
+        for value, mode in ((None, "off"), ("", "off"), ("LIVE", "live"), (" live ", "live"), ("on", "off"),
+                            ("dry-run", "off")):
+            env = {} if value is None else {"AUTOFIX_MODE": value}
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(af_config.mode_from_env(), mode, value)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(af_config.max_per_hour_from_env(), 3)
 
     def test_the_fix_job_refuses_the_write_token(self):
         env = {"GH_PAT": "ro", "AUTOFIX_TOKEN": "push", "AUTOFIX_MODE": "live"}
@@ -674,7 +689,7 @@ class TickTest(unittest.TestCase):
             with mock.patch.multiple(autofix, push_and_dispatch=pushed, **common):
                 autofix.publish_phase("t", "o/r", "live", 3, gh, handoff, NOW)
             self.assertEqual(pushed.call_args.args[2], record["patch"])
-            state = autofix.load_state(posted[-1])
+            state = af_state.load_state(posted[-1])
             self.assertEqual(state["problems"]["R386"]["status"], "dispatched")
             self.assertEqual([e["id"] for e in state["entered"]], ["R386"])
 
@@ -687,7 +702,7 @@ class TickTest(unittest.TestCase):
                                     poll_dispatched=mock.Mock(return_value=("verified", verified)),
                                     find_fix_pr=mock.Mock(return_value=None), **common):
             autofix.publish_phase("t", "o/r", "live", 3, gh, Path(tmp), NOW + timedelta(hours=1))
-        state = autofix.load_state(updated[-1])
+        state = af_state.load_state(updated[-1])
         self.assertEqual(state["problems"]["R386"]["status"], "opened")
         title, body, branch = gh.create_draft_pr.call_args.args
         self.assertEqual(branch, "bingxche/autofix-r386-x")
@@ -711,6 +726,15 @@ class TickTest(unittest.TestCase):
         self.assertEqual(entry["status"], "gave-up")
         gh.delete_branch.assert_called_once_with("bingxche/autofix-r1-x")
         self.assertNotIn("plan", entry)
+
+
+class PushGuardTest(unittest.TestCase):
+    def test_push_refuses_a_token_of_another_account(self):
+        gh = mock.Mock(write_token="t")
+        gh.identity.return_value = ("amd-bot", "1+amd-bot@users.noreply.github.com")
+        with mock.patch.object(af_github, "git", side_effect=AssertionError("must not commit or push")):
+            with self.assertRaises(RuntimeError):
+                af_github.push_branch(Path("."), "bingxche/autofix-r1-x", "m", gh)
 
 
 class BranchGuardTest(unittest.TestCase):
