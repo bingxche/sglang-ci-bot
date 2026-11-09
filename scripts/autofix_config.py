@@ -35,8 +35,9 @@ DISPATCH_TIMEOUT_HOURS = 24
 HISTORY_RUNS = 6
 # Open PRs whose files are scanned for the test file, newest first.
 MAX_OPEN_PRS_SCANNED = 300
-# Words the PR's prose may have (links and code blocks not counted).
-MAX_BODY_WORDS = 250
+# Words the PR's prose may have (links and code blocks not counted): the spec's
+# "about 250", with 10% slack so a precise, hedged text is not rejected at 262.
+MAX_BODY_WORDS = 275
 # GitHub rejects comments over 65,536 characters; the log comment carries the state.
 MAX_COMMENT_CHARS = 60_000
 MAX_STATE_DIFF = 6_000

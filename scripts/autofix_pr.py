@@ -190,7 +190,7 @@ def check_pr_text(fix: dict) -> list[str]:
                       ("motivation", "modifications", "workaround", "accuracy", "speed"))
     words = count_words(prose)
     if words > MAX_BODY_WORDS:
-        problems.append(f"the PR text has {words} words (at most {MAX_BODY_WORDS})")
+        problems.append(f"the PR text has {words} words (aim for about 250; at most {MAX_BODY_WORDS})")
     if re.search(r"(?<![\w-])R\d+(?![\w-])|\bcluster\b|\blane\b|\bleg\b", prose):
         problems.append("the PR text uses the bot's internal words (R123, cluster, leg, lane)")
     if re.search(r"(?<![\w`])@[A-Za-z0-9]", prose):
