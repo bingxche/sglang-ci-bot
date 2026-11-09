@@ -704,6 +704,15 @@ class ModeOffTest(unittest.TestCase):
         self.assertEqual(af_config.DEFAULT_MODE, "off")
         self.assertEqual(autofix.MODES, ("off", "live"))
 
+    def test_the_script_runs_from_the_command_line(self):
+        # The workflow runs the file; a lost `__main__` guard once made it exit 0 doing nothing.
+        for phase in ("fix", "publish"):
+            r = subprocess.run([sys.executable, str(ROOT / "scripts" / "autofix.py"), phase, "--bot-repo", "o/r"],
+                               capture_output=True, text=True, timeout=60,
+                               env={**os.environ, "GH_PAT": "x", "AUTOFIX_MODE": "off", "AUTOFIX_TOKEN": ""})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("AUTOFIX_MODE=off; nothing to do", r.stdout + r.stderr, phase)
+
     def test_the_switch(self):
         for value, mode in ((None, "off"), ("", "off"), ("LIVE", "live"), (" live ", "live"), ("on", "off"),
                             ("dry-run", "off")):

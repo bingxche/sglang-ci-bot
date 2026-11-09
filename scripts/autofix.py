@@ -497,3 +497,7 @@ def main() -> int:
         log.error("AUTOFIX_MODE=live needs AUTOFIX_TOKEN in the publish job")
         return 1
     return publish_phase(token, args.bot_repo, args.mode, args.max_per_hour, gh, handoff)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
