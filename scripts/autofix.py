@@ -358,7 +358,8 @@ def _slim(entry: dict) -> None:
         entry.pop(key, None)
 
 
-def smoke_plan(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, base_sha: str) -> dict | None:
+def smoke_plan(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, base_sha: str,
+               job_filter: str = "") -> dict | None:
     """The plan for problem *pid* of *date_str*'s report, without the selection checks
     (the problem has long been fixed)."""
     issue_num = find_issue(token, bot_repo, date_str)
@@ -368,7 +369,7 @@ def smoke_plan(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, b
         return None
     yaml = workflow_yaml_at(base_sha)
     jobs = [{**ja, "run": gh.run(run_id_of(ja["run_url"]))} for ja in problem.jobs
-            if ja["workflow"] in AUTOFIX_WORKFLOWS]
+            if ja["workflow"] in AUTOFIX_WORKFLOWS and job_filter in ja["job_name"]]
     groups: dict[tuple, list[tuple[Recipe, dict]]] = {}
     for j in jobs:
         recipe, _ = recipe_for(j["workflow"], j["job_name"], yaml)
@@ -379,9 +380,10 @@ def smoke_plan(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, b
         return None
     group = max(groups.values(), key=len)
     group_jobs = [j for _, j in group]
+    own = set(problem.tests)
     return {
-        "id": pid, "name": problem.name, "tests": [list(t) for t in problem_tests(group_jobs)],
-        "jobs": plan_jobs(gh, group_jobs), "other_jobs": [],
+        "id": pid, "name": problem.name, "tests": [list(t) for t in problem_tests(group_jobs) if t in own],
+        "jobs": plan_jobs(gh, group_jobs, own), "other_jobs": [],
         "errors": [r["error"] for r in deterministic_rows("", group_jobs)][:10],
         "recipe": plan_recipe(group),
         "first_fail": {"date": min(j["run"]["created_at"][:10] for j in group_jobs),
@@ -392,11 +394,11 @@ def smoke_plan(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, b
 
 
 def smoke_fix(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, base_sha: str,
-              handoff: Path) -> int:
+              handoff: Path, job_filter: str = "") -> int:
     """Smoke test, fix job: the agents' first attempt on *base_sha*, handed to the publish job."""
     ensure_sglang_repo()
     git(SGLANG_REPO_PATH, "fetch", "-q", "origin", base_sha, "--depth", "100", check=False)
-    plan = smoke_plan(token, bot_repo, gh, date_str, pid, base_sha)
+    plan = smoke_plan(token, bot_repo, gh, date_str, pid, base_sha, job_filter)
     if not plan:
         return 1
     t0 = time.time()
@@ -459,6 +461,9 @@ def main() -> int:
     parser.add_argument("--smoke-problem", help="E3: problem ID (R…) to fix end to end without opening a PR")
     parser.add_argument("--smoke-date", help="E3: date (YYYY-MM-DD) of the daily report holding the problem")
     parser.add_argument("--smoke-base", help="E3: sglang commit to build the fix on (before the human fix)")
+    parser.add_argument("--smoke-job", default="",
+                        help="E3: only the problem's jobs whose name contains this (e.g. a 1-GPU job of a problem "
+                             "that also failed on 8 GPUs)")
     parser.add_argument("--smoke-out", default="autofix-smoke", help="E3: output directory")
     args = parser.parse_args()
     logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO, stream=sys.stdout)
@@ -480,7 +485,8 @@ def main() -> int:
             if not (args.smoke_date and args.smoke_base):
                 log.error("--smoke-problem needs --smoke-date and --smoke-base")
                 return 1
-            return smoke_fix(token, args.bot_repo, gh, args.smoke_date, args.smoke_problem, args.smoke_base, handoff)
+            return smoke_fix(token, args.bot_repo, gh, args.smoke_date, args.smoke_problem, args.smoke_base,
+                             handoff, args.smoke_job)
         if not write_token:
             log.error("The smoke test's publish job needs AUTOFIX_TOKEN")
             return 1

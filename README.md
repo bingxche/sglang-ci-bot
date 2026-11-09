@@ -561,7 +561,7 @@ python scripts/check_ci_for_pr.py 1234 --no-post
 python scripts/analyze_url.py --url <run or job URL> [--bot-repo bingxche/sglang-ci-bot]
 python scripts/stage_notion.py analyze --bot-repo bingxche/sglang-ci-bot --output out.json
 python scripts/stage_notion.py sync --input out.json --dry-run
-python scripts/autofix.py fix|publish --bot-repo bingxche/sglang-ci-bot [--handoff dir] [--mode live] [--smoke-problem R386 --smoke-date 2026-11-08 --smoke-base <sha>]
+python scripts/autofix.py fix|publish --bot-repo bingxche/sglang-ci-bot [--handoff dir] [--mode live] [--smoke-problem R386 --smoke-date 2026-11-08 --smoke-base <sha> [--smoke-job <name part>]]
 python scripts/autofix_audit.py --bot-repo bingxche/sglang-ci-bot [--days 14] recipes|prs
 ```
 

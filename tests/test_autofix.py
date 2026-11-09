@@ -507,6 +507,7 @@ def problem(**kw) -> af_select.Problem:
     job = {"job_id": 7, "job_name": SMALL, "run_url": "https://github.com/sgl-project/sglang/actions/runs/42",
            "workflow": "pr-test-amd.yml", "analysis": analysis}
     job.update(kw.pop("job", {}))
+    kw.setdefault("tests", af_select.own_tests([job], "", exclusive=True))
     return af_select.Problem("R386", "MiniMax fp8 prefill test crashes", [job], **kw)
 
 
@@ -566,6 +567,76 @@ class ReportParsingTest(unittest.TestCase):
         self.assertEqual(sections["R332"]["name"], "Qwen3.8-Flash-Next FP8 crashes on MI300")
         self.assertEqual(sections["R269"]["name"], "VLM accuracy below the floor")
         self.assertFalse(sections["R332"]["fix"])
+
+
+class OwnTestsTest(unittest.TestCase):
+    """One job can be in several problems; its analysis lists every failure (R392-R394, Nov 6)."""
+
+    ANALYSIS = "\n".join([
+        "### Failed Tests",
+        "| Test File | Test Function | Error |",
+        "|---|---|---|",
+        "| `test/registered/kernels/ops/attention/test_dsv4_q_rope_store.py` | `TestQRopeStore.test_exact_output_and_padding` | build failed |",
+        "| `test/registered/kernels/ops/attention/test_dsv4_q_rope_store.py` | `test_exact_output_and_padding` | same |",
+        "| `test/registered/kernels/ops/gemm/test_hc_mix_flydsl.py` | `test_gated_residual_dispatch`, "
+        "`test_gated_residual_dispatch_many_rows[32/96/128]` (4 failed, 1 passed) | ModuleNotFoundError: aiter.ops.flydsl.hc_mix |",
+        "| `test/registered/amd/test_minimax_hd128_asm_prefill.py` | `TestMiniMaxHD128AsmPrefill.test_first_chunk_reads_fp8_pool` "
+        "| AttributeError: layer_router |",
+    ])
+    JOB = {"job_id": 127910655397, "job_name": "stage-b-test-1-gpu-small-amd-mi35x (rocm10, linux-mi35x-gpu-1)",
+           "run_url": "https://github.com/sgl-project/sglang/actions/runs/42223350044", "workflow": "pr-test-amd.yml",
+           "analysis": ANALYSIS}
+
+    def test_functions_are_split_out_of_prose(self):
+        self.assertEqual(af_select.split_functions(
+            "`test_gated_residual_dispatch`, `test_gated_residual_dispatch_many_rows[32/96/128]` (4 failed, 1 passed)"),
+            ["test_gated_residual_dispatch", "test_gated_residual_dispatch_many_rows"])
+        self.assertEqual(af_select.split_functions(
+            "test_blend_matches_per_slice_loop[100--2-dtype1]` (blend_extent=100 → clamped to 70)"),
+            ["test_blend_matches_per_slice_loop[100--2-dtype1]"])
+        self.assertEqual(af_select.split_functions("`TestX.setUpClass`"), ["TestX.setUpClass"])
+        self.assertEqual(af_select.split_functions("— (server crashed before any test)"), [])
+
+    def test_a_qualified_name_absorbs_the_bare_one(self):
+        tests = af_select.problem_tests([self.JOB])
+        self.assertIn(("test/registered/kernels/ops/attention/test_dsv4_q_rope_store.py",
+                       "TestQRopeStore.test_exact_output_and_padding"), tests)
+        self.assertNotIn(("test/registered/kernels/ops/attention/test_dsv4_q_rope_store.py",
+                          "test_exact_output_and_padding"), tests)
+
+    def test_each_problem_keeps_only_the_files_its_text_names(self):
+        r392 = "| pr-test-amd | `stage-b-test-1-gpu-small-amd-mi35x` | `test/registered/kernels/ops/attention/test_dsv4_q_rope_store.py` |"
+        r394 = "| <!-- R394 --> aiter `hc_mix` missing | same | same | `test/registered/kernels/ops/gemm/test_hc_mix_flydsl.py` |"
+        self.assertEqual({f for f, _ in af_select.own_tests([self.JOB], r392, exclusive=False)},
+                         {"test/registered/kernels/ops/attention/test_dsv4_q_rope_store.py"})
+        self.assertEqual([fn for _, fn in af_select.own_tests([self.JOB], r394, exclusive=False)],
+                         ["test_gated_residual_dispatch", "test_gated_residual_dispatch_many_rows"])
+        # Nothing names its files and another problem shares the job: no tests, so no attempt.
+        self.assertEqual(af_select.own_tests([self.JOB], "", exclusive=False), [])
+        self.assertEqual(len(af_select.own_tests([self.JOB], "", exclusive=True)), 4)
+
+    def test_report_shorthand_for_file_names(self):
+        text = "`test/registered/amd/test_deepseek_v4_pro_fp4_mtp.py` · `_fp4_tbo_mtp.py`"
+        self.assertTrue(af_select.file_named("test/registered/amd/test_deepseek_v4_pro_fp4_tbo_mtp.py", text))
+        self.assertFalse(af_select.file_named("test/registered/amd/test_kimi.py", text))
+
+    def test_section_text_follows_the_problem(self):
+        summary = "\n".join([
+            "### <!-- R392 --> RoPE kernels do not compile — pr-test-amd · ✅ fix open",
+            "| pr-test-amd | job | `test_dsv4_q_rope_store.py` | `test_x` |",
+            "### <!-- R393 · R394 --> Two tests fail — pr-test-amd",
+            "| <!-- R393 --> Stale KV-pool mock | pr | job | `test_minimax_hd128_asm_prefill.py` | `t` |",
+            "| <!-- R394 --> aiter `hc_mix` missing | same | same | `test_hc_mix_flydsl.py` | `t` |",
+            "## Workflow drill-down",
+            "| job | `test_other.py` | `t` | <!-- R392 --> RoPE | x |",
+        ])
+        sections = af_select.problem_sections(summary)
+        text = {pid: "\n".join(sections[pid]["text"]) for pid in ("R392", "R393", "R394")}
+        self.assertIn("test_dsv4_q_rope_store.py", text["R392"])
+        self.assertIn("test_other.py", text["R392"])
+        self.assertNotIn("test_hc_mix_flydsl.py", text["R393"])
+        self.assertIn("test_hc_mix_flydsl.py", text["R394"])
+        self.assertNotIn("test_minimax", text["R394"])
 
 
 class VerifyRunTest(unittest.TestCase):

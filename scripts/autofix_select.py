@@ -6,7 +6,8 @@ needs; ``plan_hour()`` starts at most ``AUTOFIX_MAX_PER_HOUR`` problems per
 hour and queues the rest."""
 
 import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from autofix_ci import (
 from autofix_config import AUTOFIX_WORKFLOWS, HISTORY_RUNS, NOT_FIXED
 from autofix_github import GitHub
 from daily_cross_workflow_summary import (
+    _cluster_ids,
     collect_workflow_analyses,
     extract_summary_from_body,
     parse_job_cluster_comment,
@@ -60,11 +62,12 @@ def problem_sections(summary: str) -> dict[str, dict]:
     current: list[str] = []
     for line in summary.splitlines():
         s = line.strip()
-        if s.startswith("### ") or (s.startswith("|") and _HEADING_ID_RE.search(s)):
-            m = _HEADING_ID_RE.search(s)
-            ids = re.findall(r"R\d+", m.group(1)) if m else []
+        # Hidden `<!-- R386 -->` IDs; reports before 2026-11-06 wrote them as visible text.
+        ids = _cluster_ids(s) if s.startswith(("### ", "|")) else []
+        if s.startswith("### ") or ids:
             text = _HEADING_ID_RE.sub("", s.lstrip("#").strip()).strip()
-            name = re.split(r" — | \| ", text.strip("| "))[0]
+            cells = [c.strip() for c in re.split(r" — | \| ", text.strip("| "))]
+            name = next((c for c in cells if c and not re.fullmatch(r"(?:R\d+[\s·,]*)+", c)), "")
             name = re.sub(r"^(?:🆕|↩️)\s*", "", re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", name)).strip()
             fix = re.search(r"✅ fix (?:open|merged)", s) is not None
             if s.startswith("### "):
@@ -72,16 +75,20 @@ def problem_sections(summary: str) -> dict[str, dict]:
             # A heading naming several problems names the group; their rows name each one.
             own_name = len(ids) == 1
             for pid in ids:
-                entry = out.setdefault(pid, {"name": pid, "fix": False, "fix_pr": None, "named": False})
-                if own_name and not entry["named"]:
+                entry = out.setdefault(pid, {"name": pid, "fix": False, "fix_pr": None, "named": False, "text": []})
+                if own_name and name and not entry["named"]:
                     entry.update(name=name, named=True)
                 entry["fix"] = entry["fix"] or (fix and own_name)
+                if own_name or not s.startswith("### "):
+                    entry["text"].append(s)
             continue
         if s.startswith("## "):
             current = []
+        elif len(current) == 1:
+            out[current[0]]["text"].append(s)
         m = _FIX_LINK_RE.search(s)
         if m and len(current) == 1:
-            out.setdefault(current[0], {"name": current[0], "fix": False, "fix_pr": None, "named": False})
+            out.setdefault(current[0], {"name": current[0], "fix": False, "fix_pr": None, "named": False, "text": []})
             out[current[0]]["fix_pr"] = int(m.group(1))
     return out
 
@@ -94,6 +101,8 @@ class Problem:
     suspect: dict | None = None
     fix_pr: int | None = None
     report_fix: bool = False
+    # The failing tests that are this problem's (``own_tests()``); a job's other failures are not.
+    tests: list[tuple[str, str]] = field(default_factory=list)
 
 
 def load_problems(token: str, bot_repo: str, issue_num: int) -> list[Problem]:
@@ -106,6 +115,7 @@ def load_problems(token: str, bot_repo: str, issue_num: int) -> list[Problem]:
         for ja in jas:
             job_info[ja["job_id"]] = {**ja, "workflow": wf}
     problems = []
+    membership = Counter(j for job_ids in clusters.values() for j in job_ids)
     for pid, job_ids in clusters.items():
         jobs = [job_info[j] for j in job_ids if j in job_info]
         if not jobs:
@@ -116,8 +126,47 @@ def load_problems(token: str, bot_repo: str, issue_num: int) -> list[Problem]:
             pid, section.get("name") or pid, jobs, suspect,
             fix_pr=(suspect or {}).get("fix_pr") or section.get("fix_pr"),
             report_fix=section.get("fix", False),
+            tests=own_tests(jobs, "\n".join(section.get("text") or []),
+                            exclusive=all(membership[j["job_id"]] == 1 for j in jobs)),
         ))
     return problems
+
+
+def split_functions(cell: str) -> list[str]:
+    """Test function names in an analysis's Failed Tests cell, which can hold several and prose:
+    ``test_a`, `test_b_many_rows[32/96/128]` (4 failed, 1 passed)`` → test_a, test_b_many_rows."""
+    # The table parser strips a cell's outer backticks ("a`, `b"); put them back before pairing.
+    tokens = re.findall(r"`([^`]+)`", f"`{cell.strip()}`")
+    names = []
+    for tok in tokens:
+        m = re.match(r"^\s*([A-Za-z_]\w*(?:(?:\.|::)[A-Za-z_]\w*)*)(\[[^\]]*\])?", tok)
+        if not m:
+            continue
+        name, param = m.group(1), m.group(2) or ""
+        last = re.split(r"\.|::", name)[-1]
+        if not (last.startswith("test") or last in ("setUpClass", "setUpModule", "tearDownClass")):
+            continue
+        if "/" in param or " " in param:  # "[32/96/128]" stands for several cases: match them all
+            param = ""
+        names.append(name + param)
+    return names
+
+
+def file_named(path: str, text: str) -> bool:
+    """Whether *text* names the test file, in full or in the report's shorthand (`` `_fp8_tbo.py` ``)."""
+    base = Path(path).name
+    if base in text:
+        return True
+    return any(base.endswith(f"_{suffix}") for suffix in re.findall(r"`[_…]+([\w.]{4,}\.py)`", text))
+
+
+def own_tests(jobs: list[dict], text: str, exclusive: bool) -> list[tuple[str, str]]:
+    """The failing tests that are this problem's. A job can be in several problems, and its
+    analysis lists all its failures, so only files the problem's own report text names count.
+    Without such text, all of them count only when no other problem shares the jobs."""
+    candidates = problem_tests(jobs)
+    named = [t for t in candidates if file_named(t[0], text)] if text else []
+    return named or (candidates if exclusive else [])
 
 
 def run_id_of(run_url: str) -> int:
@@ -125,12 +174,16 @@ def run_id_of(run_url: str) -> int:
 
 
 def problem_tests(jobs: list[dict]) -> list[tuple[str, str]]:
+    """Every failing (test file, function) in the jobs' analyses."""
     tests = []
     for row in deterministic_rows("", jobs):
-        f, fn = row["test_file"].strip("` "), row["test_function"].strip("` ")
-        if f.endswith(".py") and fn and fn not in ("-", "—", "N/A", "n/a", "unknown"):
-            tests.append((f, fn))
-    return list(dict.fromkeys(tests))
+        f = row["test_file"].strip("` ")
+        if f.endswith(".py"):
+            tests += [(f, fn) for fn in split_functions(row["test_function"])]
+    tests = list(dict.fromkeys(tests))
+    # `test_x` and `TestX.test_x` of one file are one test.
+    qualified = {(f, re.split(r"\.|::", fn)[-1]) for f, fn in tests if re.search(r"\.|::", fn)}
+    return [(f, fn) for f, fn in tests if re.search(r"\.|::", fn) or (f, fn) not in qualified]
 
 
 def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[dict | None, str]:
@@ -148,10 +201,12 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
         why = "; ".join(NOT_FIXED[w] for w in wf if w in NOT_FIXED)
         return None, "not a scheduled failure on main of an autofix workflow" + (f" ({why})" if why else "")
 
-    tests = problem_tests(jobs)
+    own = set(p.tests)
+    tests = [t for t in problem_tests(jobs) if t in own]
     if not tests:
-        return None, "no failing test function named in the analyses"
-    errors = [r["error"] for r in deterministic_rows("", jobs)]
+        return None, "no failing test function of this problem named in the analyses"
+    files = {f for f, _ in tests}
+    errors = [r["error"] for r in deterministic_rows("", jobs) if r["test_file"].strip("` ") in files]
     infra = classify_infra(errors)
     if infra:
         return None, f"infrastructure ({infra})"
@@ -171,7 +226,7 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
     # One dispatch per attempt: the group with the most failed jobs, and it must cover every test.
     group = max(groups.values(), key=len)
     group_jobs = [j for _, j in group]
-    covered = set(problem_tests(group_jobs))
+    covered = {t for t in problem_tests(group_jobs) if t in own}
     if set(tests) - covered:
         return None, "its tests failed in jobs no single dispatch can re-run"
 
@@ -185,7 +240,9 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
     for j in sorted(group_jobs, key=lambda j: j["run"]["created_at"], reverse=True):
         by_family.setdefault(job_family(j["job_name"]), j)
     for fam, j in list(by_family.items())[:4]:
-        job_tests = problem_tests([j])
+        job_tests = [t for t in problem_tests([j]) if t in own]
+        if not job_tests:
+            continue
         statuses: list[tuple[str, dict]] = []
         for run in gh.scheduled_runs(j["workflow"]):
             if len(statuses) >= HISTORY_RUNS:
@@ -218,7 +275,7 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
     return {
         "id": p.id,
         "name": p.name,
-        "jobs": plan_jobs(gh, group_jobs),
+        "jobs": plan_jobs(gh, group_jobs, own),
         "other_jobs": [{k: ja[k] for k in ("job_id", "job_name", "run_url", "workflow")}
                        for ja in p.jobs if ja["job_id"] not in in_group],
         "tests": [list(t) for t in tests],
@@ -233,14 +290,14 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
     }, ""
 
 
-def plan_jobs(gh: GitHub, jobs: list[dict]) -> list[dict]:
-    """The failed jobs as a plan keeps them: links, runner labels, commit, and their tests."""
+def plan_jobs(gh: GitHub, jobs: list[dict], own: set) -> list[dict]:
+    """The failed jobs as a plan keeps them: links, runner labels, commit, and the problem's tests in each."""
     out = []
     for j in jobs:
         api_job = next((x for x in gh.jobs(run_id_of(j["run_url"])) if x["id"] == j["job_id"]), {})
         out.append({k: j[k] for k in ("job_id", "job_name", "run_url", "workflow")} | {
             "labels": api_job.get("labels") or [], "sha": j["run"]["head_sha"],
-            "tests": [list(t) for t in problem_tests([j])],
+            "tests": [list(t) for t in problem_tests([j]) if t in own],
         })
     return out
 
