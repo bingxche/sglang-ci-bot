@@ -89,13 +89,16 @@ def run_fix_agent(wt: Path, plan: dict, attempt: int, base_sha: str, context: di
     return parse_fix_report(text)
 
 
-def run_review_agent(wt: Path, plan: dict, fix: dict, diff: str, title: str, context: dict[str, str]) -> dict:
+def run_review_agent(wt: Path, plan: dict, fix: dict, diff: str, title: str, context: dict[str, str],
+                     previous_review: dict | None = None) -> dict:
     files = {
         "problem.md": context["problem.md"],
         "fix.json": json.dumps(fix, indent=2),
         "patch.diff": diff,
         "pr-draft.md": f"# {title}\n\n" + "\n\n".join(f"## {k}\n\n{v}" for k, v in fix["pr"].items()),
     }
+    if previous_review:  # the fixer revised after this verdict
+        files["previous-review.json"] = json.dumps(previous_review, indent=2)
     prompt = "\n".join([
         "Task: CI Autofix Review",
         f"Problem: {plan['name']}",
@@ -188,6 +191,7 @@ def start_attempt(plan: dict, attempt: int, gh: GitHub, base_ref: str = "origin/
             context["previous-attempt.md"] = previous
 
         feedback = ""
+        last_review: dict | None = None
         for turn in (1, 2):
             fix, review, checks, diff, title = None, {}, {}, "", ""
             try:
@@ -208,7 +212,8 @@ def start_attempt(plan: dict, attempt: int, gh: GitHub, base_ref: str = "origin/
                     diff = staged_diff(wt)  # pre-commit may have reformatted
                 if not problems:
                     try:
-                        review = run_review_agent(wt, plan, fix, diff, title, context)
+                        review = run_review_agent(wt, plan, fix, diff, title, context, last_review)
+                        last_review = review
                     except ValueError as exc:
                         review = {"verdict": "FAIL", "reasons": [f"the review agent's report: {exc}"]}
                     if review["verdict"] != "PASS":

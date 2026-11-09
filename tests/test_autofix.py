@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import autofix  # noqa: E402
+import autofix_agents as af_agents  # noqa: E402
 import autofix_config as af_config  # noqa: E402
 import autofix_github as af_github  # noqa: E402
 import autofix_ci as af_ci  # noqa: E402
@@ -806,6 +807,40 @@ class TickTest(unittest.TestCase):
         self.assertEqual(entry["status"], "gave-up")
         gh.delete_branch.assert_called_once_with("bingxche/autofix-r1-x")
         self.assertNotIn("plan", entry)
+
+
+class AttemptTest(unittest.TestCase):
+    """start_attempt() with git, the worktree and both agents faked."""
+
+    DIFF = ("diff --git a/sgl-kernel/csrc/topk.cuh b/sgl-kernel/csrc/topk.cuh\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n"
+            "-  mask = 0xffffffff;\n+  mask = warp::kFullMask;\n")
+    PLAN = {"id": "R386", "name": "topk mask", "tests": [[TEST_FILE, TEST_FUNC]], "jobs": [],
+            "recipe": {"workflow": "pr-test-amd.yml", "inputs": {}, "families": []}}
+
+    def attempt(self, reviews):
+        review = mock.Mock(side_effect=reviews)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.multiple(
+                af_agents, git=mock.Mock(return_value="base\n"), create_agent_worktree=mock.Mock(return_value=Path(tmp)),
+                remove_agent_worktree=mock.Mock(), collect_ci_runtime_env=mock.Mock(return_value=""),
+                run_fix_agent=mock.Mock(return_value=fix_report()), staged_diff=mock.Mock(return_value=self.DIFF),
+                run_checks=mock.Mock(return_value=([], {"pre_commit": True})), run_review_agent=review):
+            result = af_agents.start_attempt(self.PLAN, 1, mock.Mock(), "base")
+        return result, review
+
+    def test_the_second_review_sees_the_first(self):
+        first = {"verdict": "FAIL", "checks": {"root_cause": "OK"}, "reasons": ["the PR text overstates the cause"]}
+        result, review = self.attempt([first, {"verdict": "PASS", "reasons": []}])
+        self.assertEqual(result.status, "ready")
+        self.assertIsNone(review.call_args_list[0].args[6])
+        self.assertEqual(review.call_args_list[1].args[6], first)
+        self.assertEqual(result.record["checks"]["review"], "PASS")
+        self.assertTrue(result.record["branch"].startswith("bingxche/autofix-r386-"))
+
+    def test_two_failed_reviews_end_the_attempt_before_any_push(self):
+        fail = {"verdict": "FAIL", "reasons": ["root cause not shown"]}
+        result, review = self.attempt([fail, fail])
+        self.assertEqual((result.status, review.call_count), ("failed", 2))
+        self.assertIn("root cause not shown", result.reason)
 
 
 class PushGuardTest(unittest.TestCase):

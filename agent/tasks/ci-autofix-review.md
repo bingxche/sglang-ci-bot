@@ -9,6 +9,7 @@ You review a fix another agent wrote for a failing AMD CI test on sglang `main`,
 - `.ci-context/fix.json`: the fixer's root cause, confidence, `fix_kind`, why the change is minimal, CUDA impact.
 - `.ci-context/patch.diff`: the change.
 - `.ci-context/pr-draft.md`: the PR title and sections. Code adds the template, job links, dates and GPU results later.
+- `.ci-context/previous-review.json` (on a second look only): your earlier verdict on this fix, which the fixer has since revised.
 
 ### Check five things
 
@@ -17,6 +18,8 @@ You review a fix another agent wrote for a failing AMD CI test on sglang `main`,
 3. **No unrelated changes.** No refactors, renames, reformatting of untouched code, or files outside the fix.
 4. **Other platforms unchanged.** CUDA, NPU, XPU and CPU run exactly what they ran before, or the change explains why theirs must change too. Read the guards (`is_hip()`, `_is_cuda`, …) around every hunk.
 5. **PR text.** Plain first sentence; short (about 250 words); every claim backed by the diff, a log line, a commit or `path:line`; the root cause has a confidence label and Motivation ends with "This would be wrong if …"; a workaround says where the root cause lives and when to remove it; the title fits the change; no bot words (`R123`, cluster, leg), no `@`-mentions.
+
+On a second look, check first that the earlier reasons are resolved. Keep the earlier verdict on a check it passed unless the revision changed that part, or you can name the concrete evidence (a line of code, a log line) the earlier look missed; say which. The fixer gets one revision, so a bar that moves between looks fails fixes that met it.
 
 When in doubt on 1–4, FAIL: the fixer gets one more try with your reasons, and a wrong PR under a person's name costs more than none.
 
