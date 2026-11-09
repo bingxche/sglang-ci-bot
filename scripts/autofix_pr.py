@@ -211,7 +211,8 @@ def render_pr_body(template: str, plan: dict, fix: dict, verification: dict, che
                           for j in jobs[:6])
     if len(jobs) > 6:
         job_links += f" and {len(jobs) - 6} more"
-    since = (f"since [{ff['date']}]({ff['run_url']}), {plan['failing_runs']} scheduled run(s) in a row"
+    runs = plan.get("failing_runs") or 1
+    since = (f"since [{ff['date']}]({ff['run_url']}), {runs} scheduled run{'s' if runs != 1 else ''} in a row"
              if ff.get("date") else "in the latest scheduled runs")
     motivation = f"{pr['motivation'].strip()}\n\nFailing on `main` {since}: {job_links}."
     modifications = pr["modifications"].strip()
