@@ -107,8 +107,9 @@ def _render_log_comment(state: dict, mode: str, cap: int, now: datetime) -> str:
         f"Last updated {now.strftime('%Y-%m-%d %H:%M UTC')}.",
         "",
     ]
-    active = {pid: p for pid, p in state["problems"].items()
-              if p.get("status") in ("ready", "dispatched", "retry") or p.get("updated", "").startswith(state["date"])}
+    # Problems autofix worked on; the ones it skipped are in the decisions below.
+    active = {pid: p for pid, p in state["problems"].items() if p.get("status") and (
+              p["status"] in ("ready", "dispatched", "retry") or p.get("updated", "").startswith(state["date"]))}
     if active:
         lines += ["| Problem | Status | Attempts | Detail |", "|---|---|---|---|"]
         for pid, p in sorted(active.items(), key=lambda kv: kv[1].get("updated", ""), reverse=True):

@@ -129,12 +129,9 @@ def run_checks(wt: Path, files: list[str]) -> tuple[list[str], dict]:
     if existing:
         out = ""
         for _ in range(2):
-            try:
-                pc = subprocess.run(["pre-commit", "run", "--files", *existing], cwd=wt, capture_output=True,
-                                    text=True, timeout=1800, env=env)
-            except FileNotFoundError:
-                out = "pre-commit is not installed on the runner"
-                break
+            # As a module: pip --user puts the `pre-commit` script in ~/.local/bin, often not on PATH.
+            pc = subprocess.run([sys.executable, "-m", "pre_commit", "run", "--files", *existing], cwd=wt,
+                                capture_output=True, text=True, timeout=1800, env=env)
             out = pc.stdout + pc.stderr
             if pc.returncode == 0:
                 checks["pre_commit"] = True
