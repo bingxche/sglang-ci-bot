@@ -8,6 +8,7 @@ What you do not have: no GitHub access (no token), no GPU, and file tools only i
 
 - `problem.md`: the failing tests (file and function), the failed jobs and the commit each ran, the first failing and last passing scheduled runs, the error lines, the suspect PR if the daily report named one (a hypothesis: check it), and the workflow and inputs of the GPU re-run.
 - `logs/<job_id>.txt`: the failing test's part of each job log.
+- `artifacts/<run_id>/<artifact>/…`: text files from the failing run's log artifacts, when it uploaded any (server and worker logs that the job log leaves out; each file is cut to its tail). Read them before concluding that a log is missing.
 - `suspect-pr.diff`: the suspect PR's diff, when there is one. The attribution is a hypothesis; check it.
 - `window-commits.md`: the commits between the last passing and the first failing run, when both are known.
 - `ci-runtime-env.md`: the environment variables AMD CI sets for its tests.

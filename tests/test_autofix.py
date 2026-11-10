@@ -1118,6 +1118,58 @@ class CrusoeTest(unittest.TestCase):
         self.assertEqual(rec["head_sha"], "sha")
 
 
+class ArtifactTest(unittest.TestCase):
+    """The failing run's log artifacts reach the fix agent (R313: the worker log lived only there)."""
+
+    ARTIFACTS = [
+        {"id": 1, "name": "diffusion-failures-amd-2gpu-rocm720-0-1", "size_in_bytes": 8000, "expired": False},
+        {"id": 2, "name": "diffusion-failures-amd-2gpu-rocm10-0-1", "size_in_bytes": 8000, "expired": False},
+        {"id": 3, "name": "zimage-turbo-outputs-rocm720", "size_in_bytes": 80000, "expired": False},
+        {"id": 4, "name": "server-logs", "size_in_bytes": 10**9, "expired": False},
+        {"id": 5, "name": "old-logs", "size_in_bytes": 10, "expired": True},
+    ]
+
+    def fake_extract(self, zip_path, dest):
+        dest.mkdir(parents=True)
+        (dest / "zimage_turbo_bcg_tp2.log").write_bytes(b"x" * 300_000 + b"\nhipErrorCapturedEvent in watchdog\n")
+        (dest / "frame.png").write_bytes(b"\x89PNG\0\0binary")
+        return [dest / "zimage_turbo_bcg_tp2.log", dest / "frame.png"]
+
+    def test_only_log_artifacts_of_the_failed_rocm_version(self):
+        gh = af_github.GitHub("t")
+        downloaded = []
+        with mock.patch.multiple(af_github, _list_run_artifacts=mock.Mock(return_value=self.ARTIFACTS),
+                                 _download_artifact_archive=lambda tok, a, path: downloaded.append(a["id"]),
+                                 _extract_zip_safely=self.fake_extract):
+            files = gh.log_artifacts(42679924010, "rocm720")
+        self.assertEqual(downloaded, [1])
+        self.assertEqual(list(files), ["diffusion-failures-amd-2gpu-rocm720-0-1/zimage_turbo_bcg_tp2.log"])
+        text = next(iter(files.values()))
+        self.assertTrue(text.endswith("hipErrorCapturedEvent in watchdog\n"))  # the tail is kept
+        self.assertLessEqual(len(text), af_config.MAX_ARTIFACT_FILE_CHARS)
+
+    def test_the_agent_gets_them_in_its_context(self):
+        plan = {**AttemptTest.PLAN, "jobs": [{"job_id": 7, "job_name": SMALL.replace("rocm10", "rocm720"),
+                                              "run_url": "https://github.com/sgl-project/sglang/actions/runs/42",
+                                              "workflow": "pr-test-amd.yml", "sha": "s", "labels": [], "tests": []}]}
+        gh = mock.Mock()
+        gh.job_log.return_value = FAILED_LOG
+        gh.log_artifacts.return_value = {"diffusion-failures/worker.log": "hipErrorCapturedEvent"}
+        seen = {}
+
+        def fix_agent(wt, plan, attempt, base, context, feedback=""):
+            seen.update(context)
+            return {"status": "no-fix", "reason": "x"}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.multiple(
+                af_agents, git=mock.Mock(return_value="base\n"), create_agent_worktree=mock.Mock(return_value=Path(tmp)),
+                remove_agent_worktree=mock.Mock(), collect_ci_runtime_env=mock.Mock(return_value=""),
+                run_fix_agent=fix_agent):
+            af_agents.start_attempt(plan, 1, gh, "base")
+        gh.log_artifacts.assert_called_once_with(42, "rocm720")
+        self.assertEqual(seen["artifacts/42/diffusion-failures/worker.log"], "hipErrorCapturedEvent")
+
+
 class PushGuardTest(unittest.TestCase):
     def test_push_refuses_a_token_of_another_account(self):
         gh = mock.Mock(write_token="t")

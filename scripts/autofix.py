@@ -502,6 +502,8 @@ def smoke_fix(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, ba
                                                           "reason": why, "agent_secs": 0, "record": {}}))
             log.info("Smoke test of %s: not planned: %s", pid, why)
             return 0
+        # The base is today's main, so main's history hides no later fix: deepen as the hourly job does.
+        deepen_clone([plan])
     else:
         plan = smoke_plan(token, bot_repo, gh, date_str, pid, base_sha, job_filter)
     if not plan:

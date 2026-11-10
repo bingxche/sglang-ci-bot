@@ -44,6 +44,12 @@ MAX_BODY_WORDS = 275
 MAX_COMMENT_CHARS = 60_000
 MAX_STATE_DIFF = 6_000
 MAX_PREVIOUS = 12_000
+# Failing jobs' log artifacts handed to the fix agent: an artifact name must look like logs,
+# and these caps keep `.ci-context/artifacts/` small.
+ARTIFACT_NAME_RE = r"fail|log|error|crash|debug|dump"
+MAX_ARTIFACT_BYTES = 50_000_000   # an artifact zip larger than this is not downloaded
+MAX_ARTIFACT_FILE_CHARS = 200_000  # each text file: its last this many characters
+MAX_ARTIFACT_TOTAL_CHARS = 1_000_000
 # A model-unavailable problem gives up after this many hours, so it stops taking a slot.
 MAX_UNAVAILABLE = 3
 

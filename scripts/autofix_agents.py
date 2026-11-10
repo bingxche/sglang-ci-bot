@@ -10,7 +10,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from autofix_ci import clean_log, job_label, segment_text
+from autofix_ci import clean_log, job_label, parse_job_name, segment_text
 from autofix_config import (
     AGENT_MAX_TURNS,
     AGENT_TIMEOUT_SECS,
@@ -190,6 +190,15 @@ def start_attempt(plan: dict, attempt: int, gh: GitHub, base_ref: str = "origin/
             text = "\n\n".join(segment_text(gh.job_log(j["job_id"]), f) for f, _ in plan["tests"]) or \
                 "\n".join(clean_log(gh.job_log(j["job_id"]))[-400:])
             context[f"logs/{j['job_id']}.txt"] = text[-60_000:]
+        for j in plan["jobs"][:3]:  # server-side logs that only the run's artifacts hold
+            run_id = int(j["run_url"].rstrip("/").rsplit("/", 1)[-1])
+            try:
+                arts = gh.log_artifacts(run_id, parse_job_name(j["job_name"]).rocm)
+            except Exception as exc:  # the job logs are still there; say what is missing
+                log.warning("%s: artifacts of run %s unreadable (%s)", plan["id"], run_id, exc)
+                continue
+            for path, text in arts.items():
+                context.setdefault(f"artifacts/{run_id}/{path}", text)
         if plan.get("suspect"):
             context["suspect-pr.diff"] = gh.pr_diff(plan["suspect"]["pr"])[:200_000]
         lp, ff = plan.get("last_pass") or {}, plan.get("first_fail") or {}

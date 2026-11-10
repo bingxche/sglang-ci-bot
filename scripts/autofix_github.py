@@ -4,15 +4,37 @@ dispatch, draft PR, branch deletion) only with ``AUTOFIX_TOKEN`` and only on
 
 import base64
 import os
+import re
 import subprocess
+import tempfile
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
 
-from autofix_config import API, AUTOFIX_LOGIN, BRANCH_PREFIX, MAX_OPEN_PRS_SCANNED
-from utils import REPO, download_job_logs, get_pr_changed_files, get_pr_diff, get_run_jobs, gh_get, gh_headers
+from autofix_config import (
+    API,
+    ARTIFACT_NAME_RE,
+    AUTOFIX_LOGIN,
+    BRANCH_PREFIX,
+    MAX_ARTIFACT_BYTES,
+    MAX_ARTIFACT_FILE_CHARS,
+    MAX_ARTIFACT_TOTAL_CHARS,
+    MAX_OPEN_PRS_SCANNED,
+)
+from utils import (
+    REPO,
+    _download_artifact_archive,
+    _extract_zip_safely,
+    _list_run_artifacts,
+    download_job_logs,
+    get_pr_changed_files,
+    get_pr_diff,
+    get_run_jobs,
+    gh_get,
+    gh_headers,
+)
 
 # Reads that hang would hold the hourly job (and every tick queued behind it).
 TIMEOUT = 60
@@ -105,6 +127,36 @@ class GitHub:
         data = self._get(f"actions/workflows/{workflow}/runs", branch=branch,
                          event="workflow_dispatch", per_page=20) or {}
         return data.get("workflow_runs") or []
+
+    def log_artifacts(self, run_id: int, rocm: str = "") -> dict[str, str]:
+        """The text files of a run's log-like artifacts (``ARTIFACT_NAME_RE``), as ``{path: text}``.
+
+        Tests that start servers often keep the server's log only in an
+        artifact; the job log then shows just the client side. Artifacts
+        named for another ROCm version than *rocm* are left out; each file
+        keeps its tail, and the total is capped.
+        """
+        out: dict[str, str] = {}
+        total = 0
+        for artifact in _list_run_artifacts(self.token, run_id):
+            name = artifact.get("name", "")
+            other_rocm = rocm and re.search(r"rocm\d+", name) and rocm not in name
+            if (artifact.get("expired") or not re.search(ARTIFACT_NAME_RE, name, re.I) or other_rocm
+                    or artifact.get("size_in_bytes", 0) > MAX_ARTIFACT_BYTES):
+                continue
+            with tempfile.TemporaryDirectory() as tmp:
+                zip_path = Path(tmp) / "a.zip"
+                _download_artifact_archive(self.token, artifact, zip_path)
+                for path in sorted(_extract_zip_safely(zip_path, Path(tmp) / "x")):
+                    raw = path.read_bytes()
+                    if b"\0" in raw[:4096]:  # binary
+                        continue
+                    text = raw.decode(errors="replace")[-MAX_ARTIFACT_FILE_CHARS:]
+                    if total + len(text) > MAX_ARTIFACT_TOTAL_CHARS:
+                        return out
+                    out[f"{name}/{path.relative_to(Path(tmp) / 'x').as_posix()}"] = text
+                    total += len(text)
+        return out
 
     def dispatch_busy(self, workflow: str) -> bool:
         """Whether a hand-dispatched run of *workflow* is queued or running: dispatching
