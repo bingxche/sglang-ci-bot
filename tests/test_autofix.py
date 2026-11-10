@@ -310,6 +310,15 @@ class HourlyCapTest(unittest.TestCase):
         body = autofix.render_log_comment(state, "live", 3, NOW)
         self.assertEqual(af_state.load_state(body), state)
 
+    def test_the_table_lists_only_problems_autofix_worked_on(self):
+        state = self.state()
+        state["problems"]["R1"] = {"name": "skipped one", "attempts": 0, "skip": "flaky", "updated": NOW.isoformat()}
+        state["problems"]["R2"] = {"name": "tried one", "attempts": 1, "status": "gave-up", "reason": "no fix",
+                                   "updated": NOW.isoformat()}
+        table = autofix.render_log_comment(state, "live", 3, NOW).split("<!-- ci-autofix-state")[0]
+        self.assertIn("tried one", table)
+        self.assertNotIn("skipped one", table)
+
     def test_comment_stays_under_githubs_limit(self):
         state = self.state()
         for i in range(8):
@@ -949,10 +958,11 @@ class ReviewFixesTest(unittest.TestCase):
             self.assertEqual(gh.pr_for_branch("bingxche/autofix-r1-x", "old"), old)
 
     def test_checks_run_agent_code_without_tokens(self):
-        envs = []
+        envs, cmds = [], []
 
         def fake_run(cmd, **kw):
             envs.append(kw.get("env"))
+            cmds.append(cmd)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as tmp, \
@@ -962,6 +972,8 @@ class ReviewFixesTest(unittest.TestCase):
             (Path(tmp) / "test" / "test_x.py").write_text("x = 1\n")
             af_agents.run_checks(Path(tmp), ["test/test_x.py"])
         self.assertEqual(len(envs), 2)  # pre-commit and pytest --collect-only
+        # pre-commit as a module: its script is in ~/.local/bin, not on the runner's PATH (11-10: every fix rejected).
+        self.assertEqual(cmds[0][1:4], ["-m", "pre_commit", "run"])
         for env in envs:
             self.assertNotIn("GH_PAT", env)
             self.assertNotIn("AUTOFIX_TOKEN", env)
