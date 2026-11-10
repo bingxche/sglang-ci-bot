@@ -84,7 +84,7 @@ from autofix_select import (  # noqa: E402
     load_problems,
     plan_hour,
     plan_jobs,
-    plan_recipe,
+    plan_recipes,
     problem_tests,
     run_id_of,
 )
@@ -457,7 +457,7 @@ def smoke_plan(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, b
         "id": pid, "name": problem.name, "tests": [list(t) for t in problem_tests(group_jobs) if t in own],
         "jobs": plan_jobs(gh, group_jobs, own), "other_jobs": [],
         "errors": [r["error"] for r in deterministic_rows("", group_jobs)][:10],
-        "recipe": plan_recipe(group),
+        **plan_recipes(group, yaml),
         "first_fail": {"date": min(j["run"]["created_at"][:10] for j in group_jobs),
                        "run_url": group_jobs[0]["run_url"], "sha": group_jobs[0]["run"]["head_sha"]},
         "last_pass": None, "failing_runs": len({j["run_url"] for j in group_jobs}),
