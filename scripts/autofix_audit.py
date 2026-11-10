@@ -223,7 +223,7 @@ def audit_pr_runs(pr: dict, data: dict, gh: af_github.GitHub) -> list[str]:
         v.append(f"D1: #{n} has no dispatched run on one of its commits")
     else:
         plan = {"recipe": {"workflow": data["workflow"], "families": data["families"],
-                           "ref_input": data.get("ref_input", ""), "labels": data.get("labels") or []},
+                           "ref_input": data.get("ref_input", ""), "gpu": data.get("gpu", "")},
                 "tests": data["tests"], "jobs": []}
         rec = {"head_sha": head, "fix": {"fix_kind": data.get("fix_kind")}}
         result = af_ci.verify_run(plan, rec, run, gh.jobs(run["id"]), gh.job_log)

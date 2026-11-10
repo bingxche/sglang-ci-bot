@@ -12,8 +12,7 @@ from autofix_config import (
     NOT_FIXED,
     PR_TEST_EXTRA_WORKFLOW,
     PR_TEST_WORKFLOW,
-    SPUR_LABELS,
-    SPUR_SUITES,
+    SPUR_GPU,
     SPUR_WORKFLOW,
 )
 from utils import SGLANG_REPO_PATH
@@ -48,11 +47,13 @@ def parse_job_name(name: str) -> JobName:
 
 
 def job_family(name: str) -> str:
-    """The job without its partition: two runs of it are comparable."""
+    """The job without its partition or runner: two runs of it are comparable.
+    Where it ran is checked separately (``verify_run()``), so a job that moved
+    to another pool of the same GPU still matches."""
     j = parse_job_name(name)
     if j.base.startswith("nightly-mi355x-"):  # disagg: the config is the job
         return f"{j.base}|{j.params[0] if j.params else ''}"
-    return f"{j.base}|{j.rocm}|{j.runner}"
+    return f"{j.base}|{j.rocm}"
 
 
 @dataclass(frozen=True)
@@ -107,22 +108,27 @@ def recipe_for(workflow: str, job_name: str, workflow_yaml) -> tuple[Recipe | No
 
 
 def crusoe_recipe_for(workflow: str, job_name: str, workflow_yaml) -> Recipe | None:
-    """The same suite on Crusoe (``SPUR_WORKFLOW``), when that runs it on the failed job's GPU.
+    """The same suite on Crusoe (``SPUR_WORKFLOW``), when that runs it on the failed job's GPU:
+    an MI35x job whose suite the Spur workflow offers (its ``suite`` options).
 
     The Spur workflow is dispatched on main and checks out the branch named in
     its ``ref`` input (its runners' job-start hook only accepts runs from main).
     """
     j = parse_job_name(job_name)
-    if workflow != PR_TEST_WORKFLOW or j.caller or j.base not in SPUR_SUITES or not j.rocm:
+    if workflow != PR_TEST_WORKFLOW or j.caller or not j.rocm or SPUR_GPU not in f"{j.base} {j.runner}":
         return None
     text = workflow_yaml(SPUR_WORKFLOW) or ""
-    if "workflow_dispatch:" not in text or not re.search(r"^\s+ref:\s*$", text, re.M) or j.base not in text:
+    options = re.search(r"^\s+suite:.*?^\s+options:\s*\[([^\]]*)\]", text, re.M | re.S)
+    if ("workflow_dispatch:" not in text or not re.search(r"^\s+ref:\s*$", text, re.M) or not options
+            or j.base not in [o.strip() for o in options.group(1).split(",")]):
         return None
     inputs = (("suite", j.base), ("rocm_version", j.rocm))
     if re.search(r"^\s+continue_on_error:\s*$", text, re.M):
         inputs += (("continue_on_error", "true"),)
     return Recipe(SPUR_WORKFLOW, (SPUR_WORKFLOW, inputs), "", "", inputs, dispatch_ref="main", ref_input="ref",
-                  verify_family=job_family(f"{j.base}-spur"), labels=SPUR_LABELS)
+                  # The Spur job is named after its id (`…-spur`), with no ROCm version in it;
+                  # the version is the dispatch's own input.
+                  verify_family=job_family(f"{j.base}-spur"))
 
 
 def dispatch_inputs(recipes: list[Recipe]) -> dict:
@@ -453,12 +459,16 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
         if not mine or any(f"HEAD is now at {sha7}" not in job_log(j["id"]) for j in mine):
             out.update(inconclusive=True, reasons=["the run did not test the pushed commit"])
             return out
-    want_labels = ({fam: sorted(recipe["labels"]) for fam in families} if recipe.get("labels") else
-                   {job_family(j["job_name"]): sorted(j.get("labels") or []) for j in plan["jobs"]})
+    # Where it ran: the failed job's runner labels, or (Crusoe and its ARC fallback) the same GPU.
+    gpu = recipe.get("gpu") or ""
+    want_labels = {job_family(j["job_name"]): sorted(j.get("labels") or []) for j in plan["jobs"]}
     for fam in families:
         got = [j for j in mine if job_family(j["name"]) == fam]
         if not got:
             out["reasons"].append(f"the run has no `{fam.split('|')[0]}` job")
+        elif gpu:
+            if any(not any(gpu in label for label in j.get("labels") or []) for j in got):
+                out["reasons"].append(f"`{fam.split('|')[0]}` ran on {got[0].get('labels')}, not a {gpu} runner")
         elif want_labels.get(fam) and any(sorted(j.get("labels") or []) != want_labels[fam] for j in got):
             out["reasons"].append(f"`{fam.split('|')[0]}` ran on {got[0].get('labels')}, not {want_labels[fam]}")
     fix_kind = rec["fix"]["fix_kind"]

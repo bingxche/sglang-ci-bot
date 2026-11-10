@@ -997,10 +997,37 @@ class CrusoeTest(unittest.TestCase):
                          "pr-test-amd.yml": PR_TEST_YAML + "\n  stage-b-test-1-gpu-small-amd-mi35x:\n    if: "
                          "contains(format(',{0},', inputs.target_stage), ',stage-b-test-1-gpu-small-amd-mi35x,')\n"}.get)
 
+    def test_after_49389_a_spur_failure_falls_back_to_arc_on_the_same_gpu(self):
+        # sglang#49389 runs the scheduled MI35x stage-b job on Spur itself: the failure names that runner.
+        on_spur = "stage-b-test-1-gpu-small-amd-mi35x (rocm10, linux-sglang-mi35x-spur)"
+        self.assertEqual(af_ci.job_family(on_spur), af_ci.job_family(MI35X))
+        self.assertIsNotNone(af_ci.crusoe_recipe_for("pr-test-amd.yml", on_spur, self.yaml))
+        plan = {"tests": [[TEST_FILE, TEST_FUNC]],
+                "jobs": [{"job_id": 1, "job_name": on_spur, "run_url": "u", "labels": ["linux-sglang-mi35x-spur"]}],
+                "recipe": {"workflow": "pr-test-amd.yml", "families": [af_ci.job_family(on_spur)], "gpu": "mi35x"}}
+        run = {"id": 9, "path": ".github/workflows/pr-test-amd.yml", "head_sha": "abc", "status": "completed",
+               "html_url": "u"}
+        arc_job = [{"id": 2, "name": MI35X, "status": "completed", "labels": ["linux-mi35x-gpu-1"], "html_url": "j"}]
+        rec = {"head_sha": "abc", "fix": {"fix_kind": "root-cause"}}
+        self.assertTrue(af_ci.verify_run(plan, rec, run, arc_job, lambda _: PASSED_LOG)["ok"])
+        mi300 = [{**arc_job[0], "labels": ["linux-mi300-1gpu-sglang"]}]
+        self.assertFalse(af_ci.verify_run(plan, rec, run, mi300, lambda _: PASSED_LOG)["ok"])
+
+    def test_suites_come_from_the_spur_workflow(self):
+        # sglang#49387 adds the 8-GPU stage-c suite to the Spur workflow's options.
+        stage_c = "stage-c-test-large-8-gpu-amd-mi35x (rocm10, linux-mi35x-gpu-8, 0)"
+        self.assertIsNone(af_ci.crusoe_recipe_for("pr-test-amd.yml", stage_c, self.yaml))
+        with_c = SPUR_YAML.replace("stage-b-test-1-gpu-small-amd-mi35x, all]",
+                                   "stage-b-test-1-gpu-small-amd-mi35x, stage-c-test-large-8-gpu-amd-mi35x, all]")
+        self.assertIsNotNone(af_ci.crusoe_recipe_for("pr-test-amd.yml", stage_c,
+                                                     {**YAMLS, "test-amd-mi35x-spur.yml": with_c}.get))
+        # stage-a is offered too, but the scheduled stage-a runs on MI300: not the same GPU.
+        stage_a = "stage-a-test-1-gpu-small-amd (rocm10, linux-mi300-1gpu-sglang)"
+        self.assertIsNone(af_ci.crusoe_recipe_for("pr-test-amd.yml", stage_a, self.yaml))
+
     def test_only_the_mi35x_suite_goes_to_crusoe(self):
         r = af_ci.crusoe_recipe_for("pr-test-amd.yml", MI35X, self.yaml)
-        self.assertEqual((r.workflow, r.dispatch_ref, r.ref_input, r.labels),
-                         ("test-amd-mi35x-spur.yml", "main", "ref", ("linux-sglang-mi35x-spur",)))
+        self.assertEqual((r.workflow, r.dispatch_ref, r.ref_input), ("test-amd-mi35x-spur.yml", "main", "ref"))
         self.assertEqual(dict(r.inputs), {"suite": "stage-b-test-1-gpu-small-amd-mi35x", "rocm_version": "rocm10"})
         # The MI300 suite would change GPUs; nightly and extra jobs have no Spur suite.
         self.assertIsNone(af_ci.crusoe_recipe_for("pr-test-amd.yml", SMALL, self.yaml))
@@ -1014,6 +1041,7 @@ class CrusoeTest(unittest.TestCase):
         self.assertEqual(recipes["recipe"]["workflow"], "test-amd-mi35x-spur.yml")
         self.assertEqual(recipes["recipe"]["families"], [af_ci.job_family("stage-b-test-1-gpu-small-amd-mi35x-spur")])
         self.assertEqual(recipes["fallback_recipe"]["inputs"]["target_stage"], "stage-b-test-1-gpu-small-amd-mi35x")
+        self.assertEqual((recipes["recipe"]["gpu"], recipes["fallback_recipe"]["gpu"]), ("mi35x", "mi35x"))
         r, _ = af_ci.recipe_for("pr-test-amd.yml", SMALL, self.yaml)
         self.assertNotIn("fallback_recipe", af_select.plan_recipes([(r, {"workflow": "pr-test-amd.yml", "job_name": SMALL})],
                                                                  self.yaml))
@@ -1043,8 +1071,7 @@ class CrusoeTest(unittest.TestCase):
 
     def plan(self):
         return {"tests": [[TEST_FILE, TEST_FUNC]], "jobs": [],
-                "recipe": {"workflow": "test-amd-mi35x-spur.yml", "ref_input": "ref",
-                           "labels": ["linux-sglang-mi35x-spur"],
+                "recipe": {"workflow": "test-amd-mi35x-spur.yml", "ref_input": "ref", "gpu": "mi35x",
                            "families": [af_ci.job_family("stage-b-test-1-gpu-small-amd-mi35x-spur")]}}
 
     def test_a_crusoe_run_is_checked_against_the_commit_in_its_log(self):

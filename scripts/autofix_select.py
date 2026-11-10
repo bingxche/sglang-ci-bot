@@ -24,7 +24,7 @@ from autofix_ci import (
     recipe_for,
     test_outcome,
 )
-from autofix_config import AUTOFIX_WORKFLOWS, HISTORY_RUNS, HISTORY_SCAN, NOT_FIXED
+from autofix_config import AUTOFIX_WORKFLOWS, HISTORY_RUNS, HISTORY_SCAN, NOT_FIXED, SPUR_GPU
 from autofix_github import GitHub
 from daily_cross_workflow_summary import (
     _cluster_ids,
@@ -316,7 +316,7 @@ def plan_recipe(group: list[tuple[Recipe, dict]]) -> dict:
     r = group[0][0]
     return {"workflow": r.workflow, "inputs": dispatch_inputs([r for r, _ in group]),
             "families": list(dict.fromkeys(r.verify_family or job_family(j["job_name"]) for r, j in group)),
-            "dispatch_ref": r.dispatch_ref, "ref_input": r.ref_input, "labels": list(r.labels)}
+            "dispatch_ref": r.dispatch_ref, "ref_input": r.ref_input, "gpu": ""}
 
 
 def plan_recipes(group: list[tuple[Recipe, dict]], workflow_yaml) -> dict:
@@ -329,7 +329,8 @@ def plan_recipes(group: list[tuple[Recipe, dict]], workflow_yaml) -> dict:
     arc = plan_recipe(group)
     crusoe = [(crusoe_recipe_for(j["workflow"], j["job_name"], workflow_yaml), j) for _, j in group]
     if all(r for r, _ in crusoe) and len({r.group for r, _ in crusoe}) == 1:
-        return {"recipe": plan_recipe(crusoe), "fallback_recipe": arc}
+        # Crusoe and ARC are two pools of one GPU: the check is the GPU, not the runner labels.
+        return {"recipe": {**plan_recipe(crusoe), "gpu": SPUR_GPU}, "fallback_recipe": {**arc, "gpu": SPUR_GPU}}
     return {"recipe": arc}
 
 
