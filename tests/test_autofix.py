@@ -1,12 +1,15 @@
 """ci-autofix: what it picks, how it re-runs and checks a fix, and what it writes."""
 
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -113,6 +116,8 @@ FAILED_LOG = ci_log("FAILED (errors=1)",
                     "ERROR: test_first_chunk_reads_fp8_pool (__main__.TestMiniMaxHD128AsmPrefill.test_first_chunk_reads_fp8_pool)")
 PASSED_LOG = ci_log("OK", "")
 
+
+SHA = "abcdef1234567890abcdef1234567890abcdef12"
 
 class JobNameAndRecipeTest(unittest.TestCase):
     yaml = staticmethod(YAMLS.get)
@@ -1046,28 +1051,43 @@ class CrusoeTest(unittest.TestCase):
         self.assertNotIn("fallback_recipe", af_select.plan_recipes([(r, {"workflow": "pr-test-amd.yml", "job_name": SMALL})],
                                                                  self.yaml))
 
-    def test_main_is_dispatched_only_with_the_autofix_branch_as_input(self):
+    def test_main_is_dispatched_only_with_the_autofix_commit_as_input(self):
         gh = af_github.GitHub("t", "w")
         spur = {"workflow": "test-amd-mi35x-spur.yml", "inputs": {"suite": "s"}, "dispatch_ref": "main", "ref_input": "ref"}
         with mock.patch.object(gh, "_write") as write:
-            gh.dispatch("bingxche/autofix-r1-x", spur)
-        self.assertEqual(write.call_args.kwargs["json"],
-                         {"ref": "main", "inputs": {"suite": "s", "ref": "bingxche/autofix-r1-x"}})
-        with mock.patch.object(gh, "_write") as write, self.assertRaises(RuntimeError):
-            gh.dispatch("bingxche/autofix-r1-x", {**spur, "ref_input": ""})
-        write.assert_not_called()
+            gh.dispatch("bingxche/autofix-r1-x", SHA, spur)
+        # The commit, not the branch name: its checkout logs `HEAD is now at <sha7>`.
+        self.assertEqual(write.call_args.kwargs["json"], {"ref": "main", "inputs": {"suite": "s", "ref": SHA}})
+        for bad in ({**spur, "ref_input": ""}, spur):
+            with mock.patch.object(gh, "_write") as write, self.assertRaises(RuntimeError):
+                gh.dispatch("bingxche/autofix-r1-x", "main" if bad is spur else SHA, bad)
+            write.assert_not_called()
 
-    def test_our_run_on_main_is_the_first_one_we_dispatched_after_the_push(self):
+    def test_a_second_crusoe_dispatch_in_one_tick_counts_as_busy(self):
+        gh = af_github.GitHub("t", "w")
+        spur = {"workflow": "test-amd-mi35x-spur.yml", "inputs": {}, "dispatch_ref": "main", "ref_input": "ref"}
+        with mock.patch.object(gh, "_get", return_value={"workflow_runs": []}):
+            self.assertFalse(gh.dispatch_busy("test-amd-mi35x-spur.yml"))
+            with mock.patch.object(gh, "_write"):
+                gh.dispatch("bingxche/autofix-r1-x", SHA, spur)
+            # GitHub may not list our run yet; ours would cancel it.
+            self.assertTrue(gh.dispatch_busy("test-amd-mi35x-spur.yml"))
+
+    def test_our_run_on_main_is_the_one_created_while_we_dispatched(self):
         gh = mock.Mock()
         gh.branch_runs.return_value = [
-            {"id": 3, "created_at": "2026-11-09T15:10:00Z", "actor": {"login": "bingxche"}},
-            {"id": 2, "created_at": "2026-11-09T15:05:00Z", "actor": {"login": "michaelzhang-ai"}},
-            {"id": 1, "created_at": "2026-11-09T14:00:00Z", "actor": {"login": "bingxche"}},
+            {"id": 4, "created_at": "2026-11-09T15:20:00Z", "actor": {"login": "bingxche"}},  # by hand, later
+            {"id": 3, "created_at": "2026-11-09T15:04:01Z", "actor": {"login": "bingxche"}},
+            {"id": 2, "created_at": "2026-11-09T15:04:00Z", "actor": {"login": "michaelzhang-ai"}},
+            {"id": 1, "created_at": "2026-11-09T15:03:00Z", "actor": {"login": "bingxche"}},  # by hand, earlier
         ]
         recipe = {"workflow": "test-amd-mi35x-spur.yml", "dispatch_ref": "main"}
-        run = af_github.find_dispatched_run(gh, recipe, "bingxche/autofix-r1-x", "abc",
-                                            datetime(2026, 11, 9, 15, 4, tzinfo=timezone.utc))
+        started, after = (datetime(2026, 11, 9, 15, 4, 0, tzinfo=timezone.utc),
+                          datetime(2026, 11, 9, 15, 4, 2, tzinfo=timezone.utc))
+        run = af_github.find_dispatched_run(gh, recipe, "bingxche/autofix-r1-x", SHA, after, started)
         self.assertEqual(run["id"], 3)
+        gh.branch_runs.return_value = gh.branch_runs.return_value[:1] + gh.branch_runs.return_value[2:]
+        self.assertIsNone(af_github.find_dispatched_run(gh, recipe, "bingxche/autofix-r1-x", SHA, after, started))
 
     def plan(self):
         return {"tests": [[TEST_FILE, TEST_FUNC]], "jobs": [],
@@ -1096,13 +1116,23 @@ class CrusoeTest(unittest.TestCase):
         arc = {"workflow": "pr-test-amd.yml", "inputs": {"target_stage": "x"}}
         for inconclusive, falls_back in ((True, True), (False, False)):
             plan = {"recipe": {"workflow": "test-amd-mi35x-spur.yml"}, "fallback_recipe": dict(arc)}
-            rec, entry, gh = {"branch": "bingxche/autofix-r1-x"}, {"run_id": 9}, mock.Mock()
+            rec, entry, gh = {"branch": "bingxche/autofix-r1-x", "head_sha": SHA}, {"run_id": 9}, mock.Mock()
             self.assertEqual(autofix.try_fallback(plan, rec, entry, {"inconclusive": inconclusive}, gh), falls_back)
             if falls_back:
                 self.assertEqual((plan["recipe"], entry["run_id"]), (arc, None))
-                gh.dispatch.assert_called_once_with("bingxche/autofix-r1-x", arc)
+                gh.dispatch.assert_called_once_with("bingxche/autofix-r1-x", SHA, arc)
             else:
                 gh.dispatch.assert_not_called()
+
+    def test_a_failed_arc_dispatch_leaves_the_crusoe_plan_as_it_was(self):
+        crusoe, arc = {"workflow": "test-amd-mi35x-spur.yml"}, {"workflow": "pr-test-amd.yml", "inputs": {}}
+        plan = {"recipe": crusoe, "fallback_recipe": arc}
+        rec, entry, gh = {"branch": "bingxche/autofix-r1-x", "head_sha": SHA}, {"run_id": 9}, mock.Mock()
+        gh.dispatch.side_effect = RuntimeError("502")
+        with self.assertRaises(RuntimeError):
+            autofix.try_fallback(plan, rec, entry, {"inconclusive": True}, gh)
+        # The next tick reads the Crusoe run again and can still fall back.
+        self.assertEqual((plan["recipe"], plan["fallback_recipe"], entry["run_id"]), (crusoe, arc, 9))
 
     def test_a_busy_crusoe_queue_sends_the_run_to_arc(self):
         arc = {"workflow": "pr-test-amd.yml", "inputs": {}}
@@ -1114,8 +1144,38 @@ class CrusoeTest(unittest.TestCase):
         with mock.patch.multiple(autofix, clean_checkout=mock.Mock(), git=mock.Mock(),
                                  push_branch=mock.Mock(return_value="sha")):
             autofix.push_and_dispatch(plan, rec, b"patch", gh)
-        gh.dispatch.assert_called_once_with("bingxche/autofix-r1-x", arc)
+        gh.dispatch.assert_called_once_with("bingxche/autofix-r1-x", "sha", arc)
         self.assertEqual(rec["head_sha"], "sha")
+        self.assertEqual(plan["arc_because"], "Crusoe is busy")
+
+    def test_a_failed_crusoe_dispatch_goes_to_arc(self):
+        arc = {"workflow": "pr-test-amd.yml", "inputs": {}}
+        crusoe = {"workflow": "test-amd-mi35x-spur.yml", "inputs": {}, "dispatch_ref": "main", "ref_input": "ref"}
+        plan = {"recipe": crusoe, "fallback_recipe": arc}
+        rec = {"branch": "bingxche/autofix-r1-x", "base_sha": "b", "message": "m"}
+        gh = mock.Mock()
+        gh.dispatch_busy.return_value = False
+        gh.dispatch.side_effect = [RuntimeError("422 unexpected input"), None]
+        with mock.patch.multiple(autofix, clean_checkout=mock.Mock(), git=mock.Mock(),
+                                 push_branch=mock.Mock(return_value="sha")):
+            autofix.push_and_dispatch(plan, rec, b"patch", gh)
+        self.assertEqual(gh.dispatch.call_args.args, ("bingxche/autofix-r1-x", "sha", arc))
+        self.assertEqual(plan["recipe"], arc)
+        self.assertLessEqual(rec["dispatch_started"], rec["dispatched_at"])
+
+    def test_a_log_github_cannot_serve_yet_is_read_again(self):
+        rec = {"head_sha": SHA, "fix": {"fix_kind": "root-cause"}}
+        run = {"id": 9, "path": ".github/workflows/test-amd-mi35x-spur.yml", "status": "completed", "html_url": "u"}
+        jobs = [{"id": 1, "name": "stage-b-test-1-gpu-small-amd-mi35x-spur", "status": "completed",
+                 "labels": ["linux-sglang-mi35x-spur"], "html_url": "j"}]
+        v = af_ci.verify_run(self.plan(), rec, run, jobs, lambda _: "[Failed to fetch logs: HTTP 404]")
+        self.assertFalse(v["done"])
+        gh = af_github.GitHub("t")
+        with mock.patch.object(af_github, "download_job_logs",
+                               side_effect=["[Failed to fetch logs: HTTP 404]", "log", "other"]) as dl:
+            self.assertEqual([gh.job_log(1), gh.job_log(1), gh.job_log(1)],
+                             ["[Failed to fetch logs: HTTP 404]", "log", "log"])
+        self.assertEqual(dl.call_count, 2)
 
 
 class ArtifactTest(unittest.TestCase):
@@ -1129,24 +1189,44 @@ class ArtifactTest(unittest.TestCase):
         {"id": 5, "name": "old-logs", "size_in_bytes": 10, "expired": True},
     ]
 
-    def fake_extract(self, zip_path, dest):
-        dest.mkdir(parents=True)
-        (dest / "zimage_turbo_bcg_tp2.log").write_bytes(b"x" * 300_000 + b"\nhipErrorCapturedEvent in watchdog\n")
-        (dest / "frame.png").write_bytes(b"\x89PNG\0\0binary")
-        return [dest / "zimage_turbo_bcg_tp2.log", dest / "frame.png"]
+    @staticmethod
+    def write_zip(artifact, path):
+        """An artifact like the diffusion one: a long log, a binary, and a disagg-style log tarball."""
+        tar = io.BytesIO()
+        with tarfile.open(fileobj=tar, mode="w:gz") as tf:
+            data = b"prefill server: HIP out of memory\n"
+            info = tarfile.TarInfo("./prefill/server.log")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("zimage_turbo_bcg_tp2.log", b"x" * 3_000_000 + b"\nhipErrorCapturedEvent in watchdog\n")
+            zf.writestr("frame.png", b"\x89PNG\0\0binary")
+            zf.writestr("disagg_logs.tar.gz", tar.getvalue())
 
     def test_only_log_artifacts_of_the_failed_rocm_version(self):
         gh = af_github.GitHub("t")
         downloaded = []
-        with mock.patch.multiple(af_github, _list_run_artifacts=mock.Mock(return_value=self.ARTIFACTS),
-                                 _download_artifact_archive=lambda tok, a, path: downloaded.append(a["id"]),
-                                 _extract_zip_safely=self.fake_extract):
+
+        def download(tok, artifact, path):
+            downloaded.append(artifact["id"])
+            self.write_zip(artifact, path)
+
+        with mock.patch.object(gh, "_get", return_value={"artifacts": self.ARTIFACTS}) as get, \
+                mock.patch.object(af_github, "_download_artifact_archive", download):
             files = gh.log_artifacts(42679924010, "rocm720")
-        self.assertEqual(downloaded, [1])
-        self.assertEqual(list(files), ["diffusion-failures-amd-2gpu-rocm720-0-1/zimage_turbo_bcg_tp2.log"])
-        text = next(iter(files.values()))
+            self.assertIs(gh.log_artifacts(42679924010, "rocm720"), files)  # once per run
+        self.assertEqual((downloaded, get.call_count), ([1], 1))
+        name = "diffusion-failures-amd-2gpu-rocm720-0-1"
+        self.assertEqual(list(files), [f"{name}/disagg_logs.tar.gz/prefill/server.log",
+                                       f"{name}/zimage_turbo_bcg_tp2.log"])
+        self.assertEqual(files[f"{name}/disagg_logs.tar.gz/prefill/server.log"], "prefill server: HIP out of memory\n")
+        text = files[f"{name}/zimage_turbo_bcg_tp2.log"]
         self.assertTrue(text.endswith("hipErrorCapturedEvent in watchdog\n"))  # the tail is kept
-        self.assertLessEqual(len(text), af_config.MAX_ARTIFACT_FILE_CHARS)
+        self.assertEqual(len(text), af_config.MAX_ARTIFACT_FILE_CHARS)
+
+    def test_the_prompt_names_the_artifacts_as_one_folder(self):
+        files = {"problem.md": "", **{f"artifacts/1/a/{i}.log": "" for i in range(500)}}
+        self.assertEqual(af_agents.context_list(files), ".ci-context/problem.md, .ci-context/artifacts/ (500 files)")
 
     def test_the_agent_gets_them_in_its_context(self):
         plan = {**AttemptTest.PLAN, "jobs": [{"job_id": 7, "job_name": SMALL.replace("rocm10", "rocm720"),
@@ -1166,7 +1246,7 @@ class ArtifactTest(unittest.TestCase):
                 remove_agent_worktree=mock.Mock(), collect_ci_runtime_env=mock.Mock(return_value=""),
                 run_fix_agent=fix_agent):
             af_agents.start_attempt(plan, 1, gh, "base")
-        gh.log_artifacts.assert_called_once_with(42, "rocm720")
+        gh.log_artifacts.assert_called_once_with(42, "rocm720", prefer="stage-b-test-1-gpu-small-amd")
         self.assertEqual(seen["artifacts/42/diffusion-failures/worker.log"], "hipErrorCapturedEvent")
 
 
@@ -1182,7 +1262,7 @@ class PushGuardTest(unittest.TestCase):
 class BranchGuardTest(unittest.TestCase):
     def test_only_autofix_branches(self):
         gh = autofix.GitHub("t", "w")
-        for call in (lambda: gh.delete_branch("main"), lambda: gh.dispatch("feature/x", {"workflow": "x.yml", "inputs": {}}),
+        for call in (lambda: gh.delete_branch("main"), lambda: gh.dispatch("feature/x", SHA, {"workflow": "x.yml", "inputs": {}}),
                      lambda: gh.create_draft_pr("t", "b", "michael/fix")):
             with self.assertRaises(RuntimeError):
                 call()

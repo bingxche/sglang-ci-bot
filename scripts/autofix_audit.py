@@ -218,7 +218,7 @@ def audit_pr_runs(pr: dict, data: dict, gh: af_github.GitHub) -> list[str]:
     commits = [c["sha"] for c in gh._get(f"pulls/{n}/commits", per_page=100) or []]
     run = gh.run(data["run_id"]) if data.get("run_id") else {}
     # A Crusoe run is dispatched on main; verify_run reads the tested commit from its log.
-    head = commits[-1] if data.get("ref_input") and commits else run.get("head_sha")
+    head = data.get("head_sha") if data.get("ref_input") else run.get("head_sha")
     if not run or head not in commits:
         v.append(f"D1: #{n} has no dispatched run on one of its commits")
     else:
@@ -231,9 +231,10 @@ def audit_pr_runs(pr: dict, data: dict, gh: af_github.GitHub) -> list[str]:
             v.append(f"D1: #{n} run {run['html_url']}: " + "; ".join(result["reasons"])[:300])
     if pr.get("merged_at"):
         merged = pr["merged_at"]
-        families = set(data.get("families") or [])
+        failed = data.get("failed") or {"workflow": data["workflow"], "families": data.get("families")}
+        families = set(failed["families"] or [])
         checked = 0
-        for r in reversed(gh.scheduled_runs(data["workflow"])):
+        for r in reversed(gh.scheduled_runs(failed["workflow"])):
             if r["created_at"] <= merged or checked >= 2:
                 continue
             jobs = [j for j in gh.jobs(r["id"]) if af_ci.job_family(j["name"]) in families]

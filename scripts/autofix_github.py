@@ -3,11 +3,14 @@ dispatch, draft PR, branch deletion) only with ``AUTOFIX_TOKEN`` and only on
 ``BRANCH_PREFIX`` branches (``check_branch()``)."""
 
 import base64
+import collections
 import os
 import re
 import subprocess
+import tarfile
 import tempfile
 import threading
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -20,14 +23,13 @@ from autofix_config import (
     BRANCH_PREFIX,
     MAX_ARTIFACT_BYTES,
     MAX_ARTIFACT_FILE_CHARS,
+    MAX_ARTIFACT_FILES,
     MAX_ARTIFACT_TOTAL_CHARS,
     MAX_OPEN_PRS_SCANNED,
 )
 from utils import (
     REPO,
     _download_artifact_archive,
-    _extract_zip_safely,
-    _list_run_artifacts,
     download_job_logs,
     get_pr_changed_files,
     get_pr_diff,
@@ -51,6 +53,8 @@ class GitHub:
         self._logs: dict[int, str] = {}
         self._scheduled: dict[str, list[dict]] = {}
         self._files: dict[int, list[dict]] = {}
+        self._artifacts: dict[tuple, dict[str, str]] = {}
+        self._dispatched: set[str] = set()  # workflows this process dispatched on main
 
     # reads ---------------------------------------------------------------
     def _get(self, endpoint: str, **params):
@@ -71,9 +75,13 @@ class GitHub:
         return self._jobs[run_id]
 
     def job_log(self, job_id: int) -> str:
-        if job_id not in self._logs:
-            self._logs[job_id] = download_job_logs(self.token, job_id)
-        return self._logs[job_id]
+        """A job's log; a failed download (``LOG_UNAVAILABLE``) is not kept, so a later call tries again."""
+        if job_id in self._logs:
+            return self._logs[job_id]
+        text = download_job_logs(self.token, job_id)
+        if not text.startswith(LOG_UNAVAILABLE):
+            self._logs[job_id] = text
+        return text
 
     def scheduled_runs(self, workflow: str) -> list[dict]:
         """Completed scheduled runs of *workflow* on main, newest first."""
@@ -128,39 +136,52 @@ class GitHub:
                          event="workflow_dispatch", per_page=20) or {}
         return data.get("workflow_runs") or []
 
-    def log_artifacts(self, run_id: int, rocm: str = "") -> dict[str, str]:
+    def log_artifacts(self, run_id: int, rocm: str = "", prefer: str = "") -> dict[str, str]:
         """The text files of a run's log-like artifacts (``ARTIFACT_NAME_RE``), as ``{path: text}``.
 
         Tests that start servers often keep the server's log only in an
         artifact; the job log then shows just the client side. Artifacts
-        named for another ROCm version than *rocm* are left out; each file
-        keeps its tail, and the total is capped.
+        named for another ROCm version than *rocm* are left out, and those
+        whose name holds *prefer* (the failed job) come first. Log tarballs
+        inside an artifact (the disagg servers') are read too. Each file
+        keeps only its tail, read as a stream, and the file count and total
+        are capped. Kept per run, since a plan's jobs often share one.
         """
+        key = (run_id, rocm, prefer)
+        if key in self._artifacts:
+            return self._artifacts[key]
+        artifacts: list[dict] = []
+        for page in range(1, 11):
+            batch = (self._get(f"actions/runs/{run_id}/artifacts", per_page=100, page=page) or {}).get("artifacts") or []
+            artifacts += batch
+            if len(batch) < 100:
+                break
+        wanted = [a for a in artifacts
+                  if not a.get("expired") and re.search(ARTIFACT_NAME_RE, a.get("name", ""), re.I)
+                  and not (rocm and re.search(r"rocm\d+", a["name"]) and rocm not in a["name"])
+                  and a.get("size_in_bytes", 0) <= MAX_ARTIFACT_BYTES]
+        wanted.sort(key=lambda a: not (prefer and prefer in a["name"]))
         out: dict[str, str] = {}
         total = 0
-        for artifact in _list_run_artifacts(self.token, run_id):
-            name = artifact.get("name", "")
-            other_rocm = rocm and re.search(r"rocm\d+", name) and rocm not in name
-            if (artifact.get("expired") or not re.search(ARTIFACT_NAME_RE, name, re.I) or other_rocm
-                    or artifact.get("size_in_bytes", 0) > MAX_ARTIFACT_BYTES):
-                continue
-            with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
+            for artifact in wanted:
+                if total >= MAX_ARTIFACT_TOTAL_CHARS or len(out) >= MAX_ARTIFACT_FILES:
+                    break
                 zip_path = Path(tmp) / "a.zip"
                 _download_artifact_archive(self.token, artifact, zip_path)
-                for path in sorted(_extract_zip_safely(zip_path, Path(tmp) / "x")):
-                    raw = path.read_bytes()
-                    if b"\0" in raw[:4096]:  # binary
-                        continue
-                    text = raw.decode(errors="replace")[-MAX_ARTIFACT_FILE_CHARS:]
-                    if total + len(text) > MAX_ARTIFACT_TOTAL_CHARS:
-                        return out
-                    out[f"{name}/{path.relative_to(Path(tmp) / 'x').as_posix()}"] = text
-                    total += len(text)
+                for path, text in _artifact_texts(zip_path):
+                    if total + len(text) <= MAX_ARTIFACT_TOTAL_CHARS and len(out) < MAX_ARTIFACT_FILES:
+                        out[f"{artifact['name']}/{path}"] = text
+                        total += len(text)
+        self._artifacts[key] = out
         return out
 
     def dispatch_busy(self, workflow: str) -> bool:
         """Whether a hand-dispatched run of *workflow* is queued or running: dispatching
-        another into its concurrency group could cancel it."""
+        another into its concurrency group could cancel it. A run this process dispatched
+        counts too, since GitHub may not list it yet."""
+        if workflow in self._dispatched:
+            return True
         data = self._get(f"actions/workflows/{workflow}/runs", event="workflow_dispatch", per_page=10) or {}
         return any(r.get("status") in ("queued", "in_progress", "waiting", "pending", "requested")
                    for r in data.get("workflow_runs") or [])
@@ -187,17 +208,21 @@ class GitHub:
         user = resp.json()
         return user["login"], f"{user['id']}+{user['login']}@users.noreply.github.com"
 
-    def dispatch(self, branch: str, recipe: dict) -> None:
-        """Run *recipe* on *branch*: on the branch itself, or on main with the branch in the
-        recipe's ``ref_input`` (the Crusoe workflow). Nothing but an autofix branch is ever run."""
+    def dispatch(self, branch: str, sha: str, recipe: dict) -> None:
+        """Run *recipe* on *branch*: on the branch itself, or on main with the branch's commit
+        *sha* in the recipe's ``ref_input`` (the Crusoe workflow). The commit, not the branch
+        name: checking out a commit logs ``HEAD is now at <sha>``, which ``verify_run()`` reads.
+        Nothing but an autofix branch's commit is ever run."""
         check_branch(branch)
         ref = recipe.get("dispatch_ref") or branch
         inputs = dict(recipe["inputs"])
         if ref != branch:
-            if ref != "main" or not recipe.get("ref_input"):
-                raise RuntimeError(f"refusing to dispatch on {ref!r} without the autofix branch as an input")
-            inputs[recipe["ref_input"]] = branch
+            if ref != "main" or not recipe.get("ref_input") or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+                raise RuntimeError(f"refusing to dispatch on {ref!r} without the autofix commit as an input")
+            inputs[recipe["ref_input"]] = sha
         self._write("POST", f"actions/workflows/{recipe['workflow']}/dispatches", json={"ref": ref, "inputs": inputs})
+        if ref != branch:
+            self._dispatched.add(recipe["workflow"])
 
     def create_draft_pr(self, title: str, body: str, branch: str) -> dict:
         check_branch(branch)
@@ -215,6 +240,48 @@ class GitHub:
         resp = requests.delete(f"{API}/git/refs/heads/{branch}", headers=gh_headers(self.write_token), timeout=60)
         if resp.status_code not in (204, 404, 422):
             resp.raise_for_status()
+
+
+LOG_UNAVAILABLE = "[Failed to fetch logs"  # how download_job_logs() reports a failed download
+
+
+def _tail(stream, size: int) -> tuple[bytes, bytes]:
+    """The first 4 KB and the last *size* bytes of *stream*, read in chunks (a log may be GBs)."""
+    head = stream.read(4096)
+    chunks, kept = collections.deque([head]), len(head)
+    while chunk := stream.read(1 << 20):
+        chunks.append(chunk)
+        kept += len(chunk)
+        while len(chunks) > 1 and kept - len(chunks[0]) >= size:
+            kept -= len(chunks.popleft())
+    return head, b"".join(chunks)[-size:]
+
+
+def _text_or_none(stream) -> str | None:
+    head, tail = _tail(stream, MAX_ARTIFACT_FILE_CHARS * 4)
+    if b"\0" in head:  # binary
+        return None
+    return tail.decode(errors="replace")[-MAX_ARTIFACT_FILE_CHARS:]
+
+
+def _artifact_texts(zip_path: Path):
+    """``(path, tail)`` for the text files of an artifact zip, and of log tarballs inside it."""
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in sorted(zf.infolist(), key=lambda m: m.filename):
+            if member.is_dir():
+                continue
+            if member.filename.endswith((".tar.gz", ".tgz", ".tar")):
+                with zf.open(member) as raw, tarfile.open(fileobj=raw, mode="r|*") as tf:
+                    for t in tf:
+                        src = tf.extractfile(t) if t.isfile() else None
+                        text = _text_or_none(src) if src else None
+                        if text is not None:
+                            yield f"{member.filename}/{t.name.lstrip('./')}", text
+                continue
+            with zf.open(member) as src:
+                text = _text_or_none(src)
+            if text is not None:
+                yield member.filename, text
 
 
 def check_branch(branch: str) -> None:
@@ -285,15 +352,20 @@ def push_branch(wt: Path, branch: str, message: str, gh: GitHub, env: dict | Non
     return sha
 
 
-def find_dispatched_run(gh: GitHub, recipe: dict, branch: str, sha: str, after: datetime) -> dict | None:
+def find_dispatched_run(gh: GitHub, recipe: dict, branch: str, sha: str, after: datetime,
+                        started: datetime | None = None) -> dict | None:
     """The run our dispatch started. On the branch: by commit. On main (Crusoe): the first run
-    the token's owner dispatched after *after*; ``verify_run()`` then checks the commit in its log."""
+    the token's owner dispatched between *started* (just before our dispatch) and shortly
+    after *after* (when it returned); ``verify_run()`` then checks the commit in its log. The
+    window is narrow because the owner also dispatches that workflow by hand."""
     def created(run: dict) -> datetime:
         return datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
 
     if recipe.get("dispatch_ref"):
+        low = (started or after - timedelta(minutes=2)) - timedelta(seconds=30)
         mine = [r for r in gh.branch_runs(recipe["workflow"], recipe["dispatch_ref"])
-                if (r.get("actor") or {}).get("login") == AUTOFIX_LOGIN and created(r) >= after - timedelta(minutes=2)]
+                if (r.get("actor") or {}).get("login") == AUTOFIX_LOGIN
+                and low <= created(r) <= after + timedelta(minutes=2)]
         return min(mine, key=created, default=None)
     for run in gh.branch_runs(recipe["workflow"], branch):
         if run.get("head_sha") == sha and created(run) >= after - timedelta(minutes=2):

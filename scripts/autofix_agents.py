@@ -31,6 +31,7 @@ from autofix_pr import (
     parse_fix_report,
     parse_review,
 )
+from autofix_select import run_id_of
 from utils import (
     SGLANG_REPO_PATH,
     ModelUnavailable,
@@ -72,6 +73,14 @@ def render_problem_context(plan: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def context_list(files: dict[str, str]) -> str:
+    """The prompt's list of context files; the artifacts (up to ``MAX_ARTIFACT_FILES``) as one folder."""
+    names = sorted(n for n in files if not n.startswith("artifacts/"))
+    arts = sum(n.startswith("artifacts/") for n in files)
+    return ", ".join([f".ci-context/{n}" for n in names] +
+                     ([f".ci-context/artifacts/ ({arts} files)"] if arts else []))
+
+
 def run_fix_agent(wt: Path, plan: dict, attempt: int, base_sha: str, context: dict[str, str],
                   feedback: str = "") -> dict:
     files = dict(context)
@@ -82,7 +91,7 @@ def run_fix_agent(wt: Path, plan: dict, attempt: int, base_sha: str, context: di
         f"Problem: {plan['name']}",
         f"Attempt: {attempt} of {MAX_ATTEMPTS}",
         f"Base: main at {base_sha}",
-        "Context: " + ", ".join(f".ci-context/{n}" for n in sorted(files)),
+        "Context: " + context_list(files),
     ])
     text = claude_code_analyze(prompt, work_dir=wt, context_files=files, max_turns=AGENT_MAX_TURNS,
                                timeout_secs=AGENT_TIMEOUT_SECS, output_must_contain="```json autofix")
@@ -191,11 +200,12 @@ def start_attempt(plan: dict, attempt: int, gh: GitHub, base_ref: str = "origin/
                 "\n".join(clean_log(gh.job_log(j["job_id"]))[-400:])
             context[f"logs/{j['job_id']}.txt"] = text[-60_000:]
         for j in plan["jobs"][:3]:  # server-side logs that only the run's artifacts hold
-            run_id = int(j["run_url"].rstrip("/").rsplit("/", 1)[-1])
+            name = parse_job_name(j["job_name"])
             try:
-                arts = gh.log_artifacts(run_id, parse_job_name(j["job_name"]).rocm)
+                run_id = run_id_of(j["run_url"])
+                arts = gh.log_artifacts(run_id, name.rocm, prefer=name.base)
             except Exception as exc:  # the job logs are still there; say what is missing
-                log.warning("%s: artifacts of run %s unreadable (%s)", plan["id"], run_id, exc)
+                log.warning("%s: artifacts of %s unreadable (%s)", plan["id"], j["run_url"], exc)
                 continue
             for path, text in arts.items():
                 context.setdefault(f"artifacts/{run_id}/{path}", text)

@@ -66,7 +66,6 @@ class Recipe:
     dispatch_ref: str = ""   # ref to dispatch on; "" = the autofix branch itself
     ref_input: str = ""      # input that names the autofix branch, when dispatch_ref is main
     verify_family: str = ""  # family of the dispatched job, when its name is not the failed job's
-    labels: tuple = ()       # runner labels the dispatched job runs on, when not the failed job's
 
 
 def recipe_for(workflow: str, job_name: str, workflow_yaml) -> tuple[Recipe | None, str]:
@@ -450,6 +449,9 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
     # A family with no job yet may be a later stage still waiting on `needs`: only a finished run says it is absent.
     all_listed = families <= {job_family(j["name"]) for j in mine}
     if any(j.get("status") != "completed" for j in mine) or (not all_listed and run.get("status") != "completed"):
+        return out
+    # A log GitHub could not serve yet (it often 404s just after a job ends): ask again next tick.
+    if any(job_log(j["id"]).startswith("[Failed to fetch logs") for j in mine):
         return out
     out["done"] = True
     # Reasons that say the fix failed; the rest only say this run cannot tell.

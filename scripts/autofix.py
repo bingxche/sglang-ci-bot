@@ -33,7 +33,7 @@ draft PR; a failed run gives the agent a second attempt, and after
 ``MAX_ATTEMPTS`` the branch is deleted. It also writes the daily issue.
 
 ``--smoke-*`` runs the chain for one past problem without opening a PR or
-writing the daily issue (E3 in the spec).
+writing the daily issue.
 """
 
 import argparse
@@ -65,6 +65,7 @@ from autofix_config import (  # noqa: E402
     MAX_ATTEMPTS,
     MAX_UNAVAILABLE,
     MODES,
+    SPUR_TIMEOUT_HOURS,
     max_per_hour_from_env,
     mode_from_env,
 )
@@ -125,9 +126,11 @@ def patch_path(handoff: Path, pid: str) -> Path:
 def poll_dispatched(pid: str, entry: dict, gh: GitHub, now: datetime) -> tuple[str, dict | None]:
     """``("waiting" | "verified" | "failed", verification)`` for a dispatched attempt."""
     rec, plan = entry["attempt"], entry["plan"]
+    started = rec.get("dispatch_started")
     if not entry.get("run_id"):
         run = find_dispatched_run(gh, plan["recipe"], rec["branch"], rec["head_sha"],
-                                  datetime.fromisoformat(rec["dispatched_at"]))
+                                  datetime.fromisoformat(rec["dispatched_at"]),
+                                  datetime.fromisoformat(started) if started else None)
         if not run:
             if now - datetime.fromisoformat(rec["dispatched_at"]) > timedelta(hours=1):
                 return "failed", {"reasons": ["the dispatched run never appeared"], "results": [], "inconclusive": True}
@@ -136,9 +139,9 @@ def poll_dispatched(pid: str, entry: dict, gh: GitHub, now: datetime) -> tuple[s
     run = gh.run(entry["run_id"], fresh=True)
     v = verify_run(plan, rec, run, gh.jobs(entry["run_id"], fresh=True), gh.job_log)
     if not v["done"]:
-        if now - datetime.fromisoformat(rec["dispatched_at"]) > timedelta(hours=DISPATCH_TIMEOUT_HOURS):
-            return "failed", {**v, "reasons": [f"the run did not finish in {DISPATCH_TIMEOUT_HOURS} h"],
-                              "inconclusive": True}
+        hours = SPUR_TIMEOUT_HOURS if plan["recipe"].get("dispatch_ref") else DISPATCH_TIMEOUT_HOURS
+        if now - datetime.fromisoformat(rec["dispatched_at"]) > timedelta(hours=hours):
+            return "failed", {**v, "reasons": [f"the run did not finish in {hours} h"], "inconclusive": True}
         return "waiting", None
     return ("verified" if v["ok"] else "failed"), v
 
@@ -160,20 +163,35 @@ def push_and_dispatch(plan: dict, rec: dict, patch: bytes, gh: GitHub) -> None:
         git(repo, "-c", "core.hooksPath=/dev/null", "apply", "--binary", "--index", "-", input=patch,
             timeout=120, env=env)
         rec["head_sha"] = push_branch(repo, rec["branch"], rec["message"], gh, env=env)
-    if plan.get("fallback_recipe") and gh.dispatch_busy(plan["recipe"]["workflow"]):
-        # Someone's run is in Crusoe's dispatch group; ours could cancel it. Use ARC.
+    if plan.get("fallback_recipe"):
+        try:
+            # A run in Crusoe's dispatch group (someone's, or ours from this tick) would be cancelled by ours.
+            if not gh.dispatch_busy(plan["recipe"]["workflow"]):
+                dispatch(plan["recipe"], rec, gh)
+                return
+            why = "Crusoe is busy"
+        except Exception as exc:  # e.g. Spur's inputs changed on main: ARC can still run it
+            why = f"the Crusoe dispatch failed ({exc})"[:200]
+        log.info("%s: %s; dispatching on ARC", rec["branch"], why)
         plan["recipe"] = plan.pop("fallback_recipe")
-    gh.dispatch(rec["branch"], plan["recipe"])
-    rec["dispatched_at"] = datetime.now(timezone.utc).isoformat()
+        plan["arc_because"] = why
+    dispatch(plan["recipe"], rec, gh)
+
+
+def dispatch(recipe: dict, rec: dict, gh: GitHub) -> None:
+    """Dispatch *recipe* on the attempt's commit; the times bracket the run ``find_dispatched_run()`` looks for."""
+    started = datetime.now(timezone.utc).isoformat()
+    gh.dispatch(rec["branch"], rec["head_sha"], recipe)
+    rec.update(dispatch_started=started, dispatched_at=datetime.now(timezone.utc).isoformat())
 
 
 def try_fallback(plan: dict, rec: dict, entry: dict, v: dict, gh: GitHub) -> bool:
-    """When Crusoe could not judge the fix, re-run it on ARC (same branch, same attempt)."""
+    """When Crusoe could not judge the fix, re-run it on ARC (same branch, same attempt).
+    The plan changes only once the ARC dispatch went through."""
     if not (v.get("inconclusive") and plan.get("fallback_recipe")):
         return False
+    dispatch(plan["fallback_recipe"], rec, gh)
     plan["recipe"] = plan.pop("fallback_recipe")
-    gh.dispatch(rec["branch"], plan["recipe"])
-    rec["dispatched_at"] = datetime.now(timezone.utc).isoformat()
     entry.update(run_id=None, run_url="")
     return True
 
@@ -409,7 +427,9 @@ def publish_phase(token: str, bot_repo: str, mode: str, cap: int, gh: GitHub, ha
                     continue
                 entry["pushed"] = sorted({*entry.get("pushed", []), rec["branch"]})
                 entry.update(status="dispatched", run_id=None, run_url="", updated=now.isoformat(timespec="seconds"))
-                add_event(state, now, pid, f"attempt {entry['attempts']}: fix pushed, job dispatched", rec["branch"])
+                add_event(state, now, pid, f"attempt {entry['attempts']}: fix pushed, job dispatched",
+                          rec["branch"] + (f" (on ARC: {entry['plan']['arc_because']})"
+                                           if entry["plan"].get("arc_because") else ""))
             elif status == "dispatched":
                 check_dispatched(pid, entry, gh, state, now, template)
             elif status == "retry" and now - datetime.fromisoformat(entry["updated"]) > timedelta(days=3):
@@ -557,7 +577,7 @@ def smoke_publish(gh: GitHub, handoff: Path, out_dir: Path) -> int:
                        gpu_secs=round(time.time() - t0))
         if status == "verified":
             (out_dir / "pr.md").write_text(f"# {rec['title']}\n\n"
-                                           + render_pr_body(pr_template(), plan, rec["fix"], v, rec["checks"]))
+                                           + render_pr_body(pr_template(), plan, rec["fix"], v, rec["checks"], rec["head_sha"]))
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     log.info("Smoke test of %s: %s", plan["id"], json.dumps(summary))
     return 0
@@ -572,15 +592,15 @@ def main() -> int:
     parser.add_argument("--mode", choices=MODES, default=mode_from_env(),
                         help="off / live (default: the AUTOFIX_MODE switch, off when unset)")
     parser.add_argument("--max-per-hour", type=int, default=max_per_hour_from_env())
-    parser.add_argument("--smoke-problem", help="E3: problem ID (R…) to fix end to end without opening a PR")
-    parser.add_argument("--smoke-date", help="E3: date (YYYY-MM-DD) of the daily report holding the problem")
-    parser.add_argument("--smoke-base", help="E3: sglang commit to build the fix on (before the human fix)")
+    parser.add_argument("--smoke-problem", help="smoke test: problem ID (R…) to fix end to end without opening a PR")
+    parser.add_argument("--smoke-date", help="smoke test: date (YYYY-MM-DD) of the daily report holding the problem")
+    parser.add_argument("--smoke-base", help="smoke test: sglang commit to build the fix on (before the human fix)")
     parser.add_argument("--smoke-job", default="",
-                        help="E3: only the problem's jobs whose name contains this (e.g. a 1-GPU job of a problem "
+                        help="smoke test: only the problem's jobs whose name contains this (e.g. a 1-GPU job of a problem "
                              "that also failed on 8 GPUs)")
     parser.add_argument("--smoke-live", action="store_true",
-                        help="E3: the problem is in the current report; plan it as the hourly job does")
-    parser.add_argument("--smoke-out", default="autofix-smoke", help="E3: output directory")
+                        help="smoke test: the problem is in the current report; plan it as the hourly job does")
+    parser.add_argument("--smoke-out", default="autofix-smoke", help="smoke test: output directory")
     args = parser.parse_args()
     logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO, stream=sys.stdout)
     handoff = Path(args.handoff)

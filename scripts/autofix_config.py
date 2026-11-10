@@ -31,6 +31,8 @@ REVIEW_TIMEOUT_SECS = int(os.environ.get("AUTOFIX_REVIEW_TIMEOUT_SECS", "3600"))
 REVIEW_MAX_TURNS = int(os.environ.get("AUTOFIX_REVIEW_MAX_TURNS", "150"))
 # A dispatched run that has not finished its jobs by then is given up.
 DISPATCH_TIMEOUT_HOURS = 24
+# Crusoe has no queue to wait in: a run not done by then goes to the ARC fallback.
+SPUR_TIMEOUT_HOURS = 6
 # Scheduled runs read back per job when checking that a failure is not flaky, and how
 # many of the workflow's latest scheduled runs are looked through to find them.
 HISTORY_RUNS = 6
@@ -50,6 +52,7 @@ ARTIFACT_NAME_RE = r"fail|log|error|crash|debug|dump"
 MAX_ARTIFACT_BYTES = 50_000_000   # an artifact zip larger than this is not downloaded
 MAX_ARTIFACT_FILE_CHARS = 200_000  # each text file: its last this many characters
 MAX_ARTIFACT_TOTAL_CHARS = 1_000_000
+MAX_ARTIFACT_FILES = 200        # files kept in all (each is a context file)
 # A model-unavailable problem gives up after this many hours, so it stops taking a slot.
 MAX_UNAVAILABLE = 3
 

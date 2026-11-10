@@ -9,6 +9,7 @@ import re
 import requests
 
 from autofix_ci import job_label
+from autofix_ci import job_family
 from autofix_config import MAX_BODY_WORDS
 from autofix_github import GitHub
 from autofix_state import hidden_json
@@ -202,7 +203,8 @@ def template_sections(template: str) -> list[str]:
     return re.findall(r"^## (.+?)\s*$", template, re.MULTILINE)
 
 
-def render_pr_body(template: str, plan: dict, fix: dict, verification: dict, checks: dict) -> str:
+def render_pr_body(template: str, plan: dict, fix: dict, verification: dict, checks: dict,
+                   head_sha: str = "") -> str:
     """The sglang PR template with every section kept and filled in; ``## Test plan`` added."""
     pr = fix["pr"]
     ff = plan.get("first_fail") or {}
@@ -254,7 +256,12 @@ def render_pr_body(template: str, plan: dict, fix: dict, verification: dict, che
     data = {"problem": plan["id"], "fix_kind": fix["fix_kind"], "workflow": recipe["workflow"],
             "families": recipe["families"], "ref_input": recipe.get("ref_input", ""),
             "gpu": recipe.get("gpu", ""), "tests": plan["tests"], "run_id": verification.get("run_id"),
-            "review": checks.get("review", "")}
+            "head_sha": head_sha, "review": checks.get("review", ""),
+            # Where the failure was: the post-merge check reads that workflow's scheduled runs.
+            "failed": {"workflow": next((j["workflow"] for j in plan.get("jobs") or [] if j.get("workflow")),
+                                        recipe["workflow"]),
+                       "families": sorted({job_family(j["job_name"]) for j in plan.get("jobs") or []})
+                       or recipe["families"]}}
     out += [
         "",
         "---",
@@ -289,7 +296,7 @@ def open_pr(plan: dict, rec: dict, verification: dict, gh: GitHub, template: str
     existing = gh.pr_for_branch(rec["branch"], rec["head_sha"])
     if existing:
         return existing
-    body = render_pr_body(template, plan, rec["fix"], verification, rec["checks"])
+    body = render_pr_body(template, plan, rec["fix"], verification, rec["checks"], rec["head_sha"])
     pr = gh.create_draft_pr(rec["title"], body, rec["branch"])
     if rec["fix"]["fix_kind"] == "workaround":
         try:
