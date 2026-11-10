@@ -482,10 +482,28 @@ def clone_up_to(base_sha: str) -> None:
 
 
 def smoke_fix(token: str, bot_repo: str, gh: GitHub, date_str: str, pid: str, base_sha: str,
-              handoff: Path, job_filter: str = "") -> int:
-    """Smoke test, fix job: the agents' first attempt on *base_sha*, handed to the publish job."""
+              handoff: Path, job_filter: str = "", live: bool = False) -> int:
+    """Smoke test, fix job: the agents' first attempt on *base_sha*, handed to the publish job.
+
+    *live*: a problem of the current report, planned exactly as the hourly job
+    plans it (``build_plan()``, with the failure's history and fix-PR checks)
+    instead of ``smoke_plan()``, which skips those for problems already fixed.
+    """
     clone_up_to(base_sha)
-    plan = smoke_plan(token, bot_repo, gh, date_str, pid, base_sha, job_filter)
+    if live:
+        issue_num = find_issue(token, bot_repo, date_str)
+        problem = next((p for p in load_problems(token, bot_repo, issue_num) if p.id == pid), None) \
+            if issue_num else None
+        plan, why = build_plan(problem, gh, workflow_yaml_at(base_sha), datetime.now(timezone.utc)) \
+            if problem else (None, f"no problem {pid} in the {date_str} report")
+        if not plan:
+            handoff.mkdir(parents=True, exist_ok=True)
+            (handoff / SMOKE_FILE).write_text(json.dumps({"plan": {"id": pid}, "status": "not-planned",
+                                                          "reason": why, "agent_secs": 0, "record": {}}))
+            log.info("Smoke test of %s: not planned: %s", pid, why)
+            return 0
+    else:
+        plan = smoke_plan(token, bot_repo, gh, date_str, pid, base_sha, job_filter)
     if not plan:
         return 1
     t0 = time.time()
@@ -558,6 +576,8 @@ def main() -> int:
     parser.add_argument("--smoke-job", default="",
                         help="E3: only the problem's jobs whose name contains this (e.g. a 1-GPU job of a problem "
                              "that also failed on 8 GPUs)")
+    parser.add_argument("--smoke-live", action="store_true",
+                        help="E3: the problem is in the current report; plan it as the hourly job does")
     parser.add_argument("--smoke-out", default="autofix-smoke", help="E3: output directory")
     args = parser.parse_args()
     logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO, stream=sys.stdout)
@@ -580,7 +600,7 @@ def main() -> int:
                 log.error("--smoke-problem needs --smoke-date and --smoke-base")
                 return 1
             return smoke_fix(token, args.bot_repo, gh, args.smoke_date, args.smoke_problem, args.smoke_base,
-                             handoff, args.smoke_job)
+                             handoff, args.smoke_job, args.smoke_live)
         if not write_token:
             log.error("The smoke test's publish job needs AUTOFIX_TOKEN")
             return 1
