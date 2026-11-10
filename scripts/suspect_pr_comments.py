@@ -215,6 +215,16 @@ def pr_people(pr: int, pull: dict, author: str, gh: GitHub) -> list[tuple[str, l
     return list(roles.values())[:MAX_CC]
 
 
+_AUTOFIX_DATA_RE = re.compile(r'<!-- amd-bot-autofix-data:v1 \{.*?"fix_kind":"([\w-]+)"')
+
+
+def is_autofix_workaround(pull: dict) -> bool:
+    """A draft PR from ci-autofix (``autofix.py``) that works around the failure instead of fixing its cause.
+    Its hidden data block says so (``fix_kind``); edited prose or labels do not change it."""
+    m = _AUTOFIX_DATA_RE.search(pull.get("body") or "")
+    return bool(m) and m.group(1) == "workaround"
+
+
 def check_fix(fix_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:
     """``(fix, "")`` when the fix PR is open and worth a review request,
     ``(None, "")`` when it is gone (closed unmerged: comment as if there were
@@ -225,6 +235,9 @@ def check_fix(fix_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:
     if pull.get("merged_at"):
         return None, f"fix PR #{fix_pr} already merged"
     if pull.get("state") != "open":
+        return None, ""
+    if is_autofix_workaround(pull):
+        # The bot's own workaround does not fix this PR's change; the author is told as if there were no fix.
         return None, ""
     fix_author = (pull.get("user") or {}).get("login", "")
     if fix_author.lower() == author.lower():

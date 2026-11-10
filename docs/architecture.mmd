@@ -36,4 +36,9 @@ flowchart TB
         P6["<b>⑥ Coverage audit</b><br/>find NVIDIA-only tests<br/>that can never run on AMD"]:::purpose ~~~ F1(["every Monday"]):::trigger --> F2["coverage-audit.yml"]:::workflow --> F3{{"agents: can this test<br/>ever run on ROCm?"}}:::agent --> F4["update exclusion list,<br/>run tests (code)"]:::code --> F5[("PR merged into<br/>ROCm/sglang-ci")]:::output
     end
 
-    L1 ~~~ L2 ~~~ L3 ~~~ L4 ~~~ L5 ~~~ L6
+    subgraph L7[" "]
+        direction LR
+        P7["<b>⑦ CI autofix</b><br/>fix a scheduled AMD<br/>failure, prove it on GPUs"]:::purpose ~~~ G1(["after each<br/>CI-monitor tick"]):::trigger --> G2["ci-autofix.yml"]:::workflow --> G3["pick problems,<br/>≤ 3 per hour (code)"]:::code --> G4{{"fix agent →<br/>review agent"}}:::agent --> G5["patch gates; push branch,<br/>re-run job, check log (code)"]:::code --> G6[("draft PR on<br/>sgl-project/sglang")]:::output
+    end
+
+    L1 ~~~ L2 ~~~ L3 ~~~ L4 ~~~ L5 ~~~ L6 ~~~ L7
