@@ -215,14 +215,17 @@ def audit_pr_runs(pr: dict, data: dict, gh: af_github.GitHub) -> list[str]:
         return [f"D1: #{n} has no autofix data block"]
     if data.get("review") != "PASS":
         v.append(f"D3: #{n} review verdict is {data.get('review') or 'missing'}")
-    commits = {c["sha"] for c in gh._get(f"pulls/{n}/commits", per_page=100) or []}
+    commits = [c["sha"] for c in gh._get(f"pulls/{n}/commits", per_page=100) or []]
     run = gh.run(data["run_id"]) if data.get("run_id") else {}
-    if not run or run.get("head_sha") not in commits:
+    # A Crusoe run is dispatched on main; verify_run reads the tested commit from its log.
+    head = commits[-1] if data.get("ref_input") and commits else run.get("head_sha")
+    if not run or head not in commits:
         v.append(f"D1: #{n} has no dispatched run on one of its commits")
     else:
-        plan = {"recipe": {"workflow": data["workflow"], "families": data["families"]},
+        plan = {"recipe": {"workflow": data["workflow"], "families": data["families"],
+                           "ref_input": data.get("ref_input", ""), "labels": data.get("labels") or []},
                 "tests": data["tests"], "jobs": []}
-        rec = {"head_sha": run["head_sha"], "fix": {"fix_kind": data.get("fix_kind")}}
+        rec = {"head_sha": head, "fix": {"fix_kind": data.get("fix_kind")}}
         result = af_ci.verify_run(plan, rec, run, gh.jobs(run["id"]), gh.job_log)
         if not result["ok"]:
             v.append(f"D1: #{n} run {run['html_url']}: " + "; ".join(result["reasons"])[:300])

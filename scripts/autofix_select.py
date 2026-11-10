@@ -14,6 +14,7 @@ from pathlib import Path
 from autofix_ci import (
     Recipe,
     classify_infra,
+    crusoe_recipe_for,
     dispatch_inputs,
     fails_for_sure,
     failure_window,
@@ -289,7 +290,7 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
                        for ja in p.jobs if ja["job_id"] not in in_group],
         "tests": [list(t) for t in tests],
         "errors": list(dict.fromkeys(errors))[:10],
-        "recipe": plan_recipe(group),
+        **plan_recipes(group, workflow_yaml),
         "first_fail": first_fail,
         "last_pass": last_pass,
         "failing_runs": streak,
@@ -312,8 +313,24 @@ def plan_jobs(gh: GitHub, jobs: list[dict], own: set) -> list[dict]:
 
 
 def plan_recipe(group: list[tuple[Recipe, dict]]) -> dict:
-    return {"workflow": group[0][0].workflow, "inputs": dispatch_inputs([r for r, _ in group]),
-            "families": list(dict.fromkeys(job_family(j["job_name"]) for _, j in group))}
+    r = group[0][0]
+    return {"workflow": r.workflow, "inputs": dispatch_inputs([r for r, _ in group]),
+            "families": list(dict.fromkeys(r.verify_family or job_family(j["job_name"]) for r, j in group)),
+            "dispatch_ref": r.dispatch_ref, "ref_input": r.ref_input, "labels": list(r.labels)}
+
+
+def plan_recipes(group: list[tuple[Recipe, dict]], workflow_yaml) -> dict:
+    """``recipe``, plus ``fallback_recipe`` when the jobs can be re-run on Crusoe first.
+
+    Crusoe has no queue; ARC (the failed job's own workflow) is the fallback
+    when Crusoe is busy or its run cannot tell (the test did not run, the run
+    was cancelled).
+    """
+    arc = plan_recipe(group)
+    crusoe = [(crusoe_recipe_for(j["workflow"], j["job_name"], workflow_yaml), j) for _, j in group]
+    if all(r for r, _ in crusoe) and len({r.group for r, _ in crusoe}) == 1:
+        return {"recipe": plan_recipe(crusoe), "fallback_recipe": arc}
+    return {"recipe": arc}
 
 
 def find_fix_pr(gh: GitHub, tests: list[tuple[str, str]], since: str, exclude=frozenset()) -> int | None:

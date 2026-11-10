@@ -250,8 +250,10 @@ def render_pr_body(template: str, plan: dict, fix: dict, verification: dict, che
         out.append(line)
     if section in filled:
         out += ["", filled[section]]
-    data = {"problem": plan["id"], "fix_kind": fix["fix_kind"], "workflow": plan["recipe"]["workflow"],
-            "families": plan["recipe"]["families"], "tests": plan["tests"], "run_id": verification.get("run_id"),
+    recipe = plan["recipe"]
+    data = {"problem": plan["id"], "fix_kind": fix["fix_kind"], "workflow": recipe["workflow"],
+            "families": recipe["families"], "ref_input": recipe.get("ref_input", ""),
+            "labels": recipe.get("labels") or [], "tests": plan["tests"], "run_id": verification.get("run_id"),
             "review": checks.get("review", "")}
     out += [
         "",

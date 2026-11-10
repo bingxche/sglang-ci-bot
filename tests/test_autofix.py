@@ -978,6 +978,119 @@ class ReviewFixesTest(unittest.TestCase):
         self.assertEqual(state["problems"]["R386"]["attempts"], 1)
 
 
+SPUR_YAML = """
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to test.'
+      suite:
+        options: [stage-a-test-1-gpu-small-amd, stage-b-test-1-gpu-small-amd-mi35x, all]
+"""
+MI35X = "stage-b-test-1-gpu-small-amd-mi35x (rocm10, linux-mi35x-gpu-1)"
+
+
+class CrusoeTest(unittest.TestCase):
+    """Re-running an MI35x 1-GPU failure on Crusoe first, ARC as the fallback."""
+
+    yaml = staticmethod({**YAMLS, "test-amd-mi35x-spur.yml": SPUR_YAML,
+                         "pr-test-amd.yml": PR_TEST_YAML + "\n  stage-b-test-1-gpu-small-amd-mi35x:\n    if: "
+                         "contains(format(',{0},', inputs.target_stage), ',stage-b-test-1-gpu-small-amd-mi35x,')\n"}.get)
+
+    def test_only_the_mi35x_suite_goes_to_crusoe(self):
+        r = af_ci.crusoe_recipe_for("pr-test-amd.yml", MI35X, self.yaml)
+        self.assertEqual((r.workflow, r.dispatch_ref, r.ref_input, r.labels),
+                         ("test-amd-mi35x-spur.yml", "main", "ref", ("linux-sglang-mi35x-spur",)))
+        self.assertEqual(dict(r.inputs), {"suite": "stage-b-test-1-gpu-small-amd-mi35x", "rocm_version": "rocm10"})
+        # The MI300 suite would change GPUs; nightly and extra jobs have no Spur suite.
+        self.assertIsNone(af_ci.crusoe_recipe_for("pr-test-amd.yml", SMALL, self.yaml))
+        self.assertIsNone(af_ci.crusoe_recipe_for("nightly-test-amd.yml", MI35X, self.yaml))
+        # A Spur workflow without a ref input cannot test a branch.
+        self.assertIsNone(af_ci.crusoe_recipe_for("pr-test-amd.yml", MI35X, {**YAMLS, "test-amd-mi35x-spur.yml": "on: {}"}.get))
+
+    def test_the_plan_carries_crusoe_first_and_arc_as_fallback(self):
+        r, _ = af_ci.recipe_for("pr-test-amd.yml", MI35X, self.yaml)
+        recipes = af_select.plan_recipes([(r, {"workflow": "pr-test-amd.yml", "job_name": MI35X})], self.yaml)
+        self.assertEqual(recipes["recipe"]["workflow"], "test-amd-mi35x-spur.yml")
+        self.assertEqual(recipes["recipe"]["families"], [af_ci.job_family("stage-b-test-1-gpu-small-amd-mi35x-spur")])
+        self.assertEqual(recipes["fallback_recipe"]["inputs"]["target_stage"], "stage-b-test-1-gpu-small-amd-mi35x")
+        r, _ = af_ci.recipe_for("pr-test-amd.yml", SMALL, self.yaml)
+        self.assertNotIn("fallback_recipe", af_select.plan_recipes([(r, {"workflow": "pr-test-amd.yml", "job_name": SMALL})],
+                                                                 self.yaml))
+
+    def test_main_is_dispatched_only_with_the_autofix_branch_as_input(self):
+        gh = af_github.GitHub("t", "w")
+        spur = {"workflow": "test-amd-mi35x-spur.yml", "inputs": {"suite": "s"}, "dispatch_ref": "main", "ref_input": "ref"}
+        with mock.patch.object(gh, "_write") as write:
+            gh.dispatch("bingxche/autofix-r1-x", spur)
+        self.assertEqual(write.call_args.kwargs["json"],
+                         {"ref": "main", "inputs": {"suite": "s", "ref": "bingxche/autofix-r1-x"}})
+        with mock.patch.object(gh, "_write") as write, self.assertRaises(RuntimeError):
+            gh.dispatch("bingxche/autofix-r1-x", {**spur, "ref_input": ""})
+        write.assert_not_called()
+
+    def test_our_run_on_main_is_the_first_one_we_dispatched_after_the_push(self):
+        gh = mock.Mock()
+        gh.branch_runs.return_value = [
+            {"id": 3, "created_at": "2026-11-09T15:10:00Z", "actor": {"login": "bingxche"}},
+            {"id": 2, "created_at": "2026-11-09T15:05:00Z", "actor": {"login": "michaelzhang-ai"}},
+            {"id": 1, "created_at": "2026-11-09T14:00:00Z", "actor": {"login": "bingxche"}},
+        ]
+        recipe = {"workflow": "test-amd-mi35x-spur.yml", "dispatch_ref": "main"}
+        run = af_github.find_dispatched_run(gh, recipe, "bingxche/autofix-r1-x", "abc",
+                                            datetime(2026, 11, 9, 15, 4, tzinfo=timezone.utc))
+        self.assertEqual(run["id"], 3)
+
+    def plan(self):
+        return {"tests": [[TEST_FILE, TEST_FUNC]], "jobs": [],
+                "recipe": {"workflow": "test-amd-mi35x-spur.yml", "ref_input": "ref",
+                           "labels": ["linux-sglang-mi35x-spur"],
+                           "families": [af_ci.job_family("stage-b-test-1-gpu-small-amd-mi35x-spur")]}}
+
+    def test_a_crusoe_run_is_checked_against_the_commit_in_its_log(self):
+        rec = {"head_sha": "abcdef1234", "fix": {"fix_kind": "root-cause"}}
+        run = {"id": 9, "path": ".github/workflows/test-amd-mi35x-spur.yml", "head_sha": "mainsha",
+               "status": "completed", "html_url": "u"}
+        jobs = [{"id": 1, "name": "stage-b-test-1-gpu-small-amd-mi35x-spur", "status": "completed",
+                 "labels": ["linux-sglang-mi35x-spur"], "html_url": "j"}]
+        ours = "2026-11-09T01:00:00Z HEAD is now at abcdef1 fix\n" + PASSED_LOG
+        self.assertTrue(af_ci.verify_run(self.plan(), rec, run, jobs, lambda _: ours)["ok"])
+        v = af_ci.verify_run(self.plan(), rec, run, jobs, lambda _: "HEAD is now at 0000000 main\n" + PASSED_LOG)
+        self.assertEqual((v["ok"], v["inconclusive"]), (False, True))
+        # A test that did not run (the suite stopped at an earlier failure) cannot tell either.
+        other = "HEAD is now at abcdef1 fix\n" + PASSED_LOG.replace(TEST_FILE, "test/registered/a/test_z.py")
+        v = af_ci.verify_run(self.plan(), rec, run, jobs, lambda _: other)
+        self.assertEqual((v["ok"], v["inconclusive"]), (False, True))
+        # A real failure is not inconclusive.
+        v = af_ci.verify_run(self.plan(), rec, run, jobs, lambda _: "HEAD is now at abcdef1 fix\n" + FAILED_LOG)
+        self.assertEqual((v["ok"], v["inconclusive"]), (False, False))
+
+    def test_fallback_to_arc_only_when_crusoe_cannot_tell(self):
+        arc = {"workflow": "pr-test-amd.yml", "inputs": {"target_stage": "x"}}
+        for inconclusive, falls_back in ((True, True), (False, False)):
+            plan = {"recipe": {"workflow": "test-amd-mi35x-spur.yml"}, "fallback_recipe": dict(arc)}
+            rec, entry, gh = {"branch": "bingxche/autofix-r1-x"}, {"run_id": 9}, mock.Mock()
+            self.assertEqual(autofix.try_fallback(plan, rec, entry, {"inconclusive": inconclusive}, gh), falls_back)
+            if falls_back:
+                self.assertEqual((plan["recipe"], entry["run_id"]), (arc, None))
+                gh.dispatch.assert_called_once_with("bingxche/autofix-r1-x", arc)
+            else:
+                gh.dispatch.assert_not_called()
+
+    def test_a_busy_crusoe_queue_sends_the_run_to_arc(self):
+        arc = {"workflow": "pr-test-amd.yml", "inputs": {}}
+        plan = {"recipe": {"workflow": "test-amd-mi35x-spur.yml", "inputs": {}, "dispatch_ref": "main",
+                           "ref_input": "ref"}, "fallback_recipe": arc}
+        rec = {"branch": "bingxche/autofix-r1-x", "base_sha": "b", "message": "m"}
+        gh = mock.Mock()
+        gh.dispatch_busy.return_value = True
+        with mock.patch.multiple(autofix, clean_checkout=mock.Mock(), git=mock.Mock(),
+                                 push_branch=mock.Mock(return_value="sha")):
+            autofix.push_and_dispatch(plan, rec, b"patch", gh)
+        gh.dispatch.assert_called_once_with("bingxche/autofix-r1-x", arc)
+        self.assertEqual(rec["head_sha"], "sha")
+
+
 class PushGuardTest(unittest.TestCase):
     def test_push_refuses_a_token_of_another_account(self):
         gh = mock.Mock(write_token="t")
@@ -990,7 +1103,7 @@ class PushGuardTest(unittest.TestCase):
 class BranchGuardTest(unittest.TestCase):
     def test_only_autofix_branches(self):
         gh = autofix.GitHub("t", "w")
-        for call in (lambda: gh.delete_branch("main"), lambda: gh.dispatch("x.yml", "feature/x", {}),
+        for call in (lambda: gh.delete_branch("main"), lambda: gh.dispatch("feature/x", {"workflow": "x.yml", "inputs": {}}),
                      lambda: gh.create_draft_pr("t", "b", "michael/fix")):
             with self.assertRaises(RuntimeError):
                 call()

@@ -12,6 +12,9 @@ from autofix_config import (
     NOT_FIXED,
     PR_TEST_EXTRA_WORKFLOW,
     PR_TEST_WORKFLOW,
+    SPUR_LABELS,
+    SPUR_SUITES,
+    SPUR_WORKFLOW,
 )
 from utils import SGLANG_REPO_PATH
 
@@ -59,6 +62,10 @@ class Recipe:
     target: str          # job id or config the dispatch selects ("" = all)
     select_input: str    # input that takes the comma-joined targets
     inputs: tuple        # other inputs, as (name, value) pairs
+    dispatch_ref: str = ""   # ref to dispatch on; "" = the autofix branch itself
+    ref_input: str = ""      # input that names the autofix branch, when dispatch_ref is main
+    verify_family: str = ""  # family of the dispatched job, when its name is not the failed job's
+    labels: tuple = ()       # runner labels the dispatched job runs on, when not the failed job's
 
 
 def recipe_for(workflow: str, job_name: str, workflow_yaml) -> tuple[Recipe | None, str]:
@@ -97,6 +104,25 @@ def recipe_for(workflow: str, job_name: str, workflow_yaml) -> tuple[Recipe | No
         return Recipe(workflow, (workflow, inputs), j.base, "target_stage", inputs), ""
     inputs = (("rocm_version", j.rocm), ("continue_on_error", "true"))
     return Recipe(workflow, (workflow, inputs), j.base, "job_filter", inputs), ""
+
+
+def crusoe_recipe_for(workflow: str, job_name: str, workflow_yaml) -> Recipe | None:
+    """The same suite on Crusoe (``SPUR_WORKFLOW``), when that runs it on the failed job's GPU.
+
+    The Spur workflow is dispatched on main and checks out the branch named in
+    its ``ref`` input (its runners' job-start hook only accepts runs from main).
+    """
+    j = parse_job_name(job_name)
+    if workflow != PR_TEST_WORKFLOW or j.caller or j.base not in SPUR_SUITES or not j.rocm:
+        return None
+    text = workflow_yaml(SPUR_WORKFLOW) or ""
+    if "workflow_dispatch:" not in text or not re.search(r"^\s+ref:\s*$", text, re.M) or j.base not in text:
+        return None
+    inputs = (("suite", j.base), ("rocm_version", j.rocm))
+    if re.search(r"^\s+continue_on_error:\s*$", text, re.M):
+        inputs += (("continue_on_error", "true"),)
+    return Recipe(SPUR_WORKFLOW, (SPUR_WORKFLOW, inputs), "", "", inputs, dispatch_ref="main", ref_input="ref",
+                  verify_family=job_family(f"{j.base}-spur"), labels=SPUR_LABELS)
 
 
 def dispatch_inputs(recipes: list[Recipe]) -> dict:
@@ -403,22 +429,32 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
 
     ``done`` is False while a job the check needs is still running.
     """
-    out = {"done": False, "ok": False, "reasons": [], "results": [], "unrelated": [],
+    out = {"done": False, "ok": False, "reasons": [], "results": [], "unrelated": [], "inconclusive": False,
            "run_id": run.get("id"), "run_url": run.get("html_url", "")}
-    if not run.get("path", "").endswith(plan["recipe"]["workflow"]):
-        out.update(done=True, reasons=[f"the run is {run.get('path')}, not {plan['recipe']['workflow']}"])
+    recipe = plan["recipe"]
+    if not run.get("path", "").endswith(recipe["workflow"]):
+        out.update(done=True, inconclusive=True, reasons=[f"the run is {run.get('path')}, not {recipe['workflow']}"])
         return out
-    if run.get("head_sha") != rec["head_sha"]:
-        out.update(done=True, reasons=["the run did not test the pushed commit"])
+    # A run dispatched on main tests the branch in its `ref` input; its job log shows which commit.
+    if not recipe.get("ref_input") and run.get("head_sha") != rec["head_sha"]:
+        out.update(done=True, inconclusive=True, reasons=["the run did not test the pushed commit"])
         return out
-    families = set(plan["recipe"]["families"])
+    families = set(recipe["families"])
     mine = [j for j in jobs if job_family(j["name"]) in families]
     # A family with no job yet may be a later stage still waiting on `needs`: only a finished run says it is absent.
     all_listed = families <= {job_family(j["name"]) for j in mine}
     if any(j.get("status") != "completed" for j in mine) or (not all_listed and run.get("status") != "completed"):
         return out
     out["done"] = True
-    want_labels = {job_family(j["job_name"]): sorted(j.get("labels") or []) for j in plan["jobs"]}
+    # Reasons that say the fix failed; the rest only say this run cannot tell.
+    definite: list[str] = []
+    if recipe.get("ref_input"):
+        sha7 = rec["head_sha"][:7]
+        if not mine or any(f"HEAD is now at {sha7}" not in job_log(j["id"]) for j in mine):
+            out.update(inconclusive=True, reasons=["the run did not test the pushed commit"])
+            return out
+    want_labels = ({fam: sorted(recipe["labels"]) for fam in families} if recipe.get("labels") else
+                   {job_family(j["job_name"]): sorted(j.get("labels") or []) for j in plan["jobs"]})
     for fam in families:
         got = [j for j in mine if job_family(j["name"]) == fam]
         if not got:
@@ -445,8 +481,10 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
         out["results"].append({"file": f, "func": fn, "status": o.status + (" after a retry" if o.retried else ""),
                                "job_url": j["html_url"], "before_url": before.get((f, fn))})
         if not ok:
-            out["reasons"].append(f"`{f}::{fn}` {o.status}{' after a retry' if o.retried else ''}"
-                                  + (f" ({o.note})" if o.note else ""))
+            reason = f"`{f}::{fn}` {o.status}{' after a retry' if o.retried else ''}" + (f" ({o.note})" if o.note else "")
+            out["reasons"].append(reason)
+            if o.status != "unknown":
+                definite.append(reason)
         a, s = verified_numbers(segment_text(job_log(j["id"]), f, max_lines=2000))
         accuracy += a
         speed += s
@@ -457,4 +495,5 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
     out["accuracy_lines"] = accuracy[:5] if fix.get("affects_accuracy") else []
     out["speed_lines"] = speed[:5] if fix.get("affects_speed") else []
     out["ok"] = not out["reasons"]
+    out["inconclusive"] = bool(out["reasons"]) and not definite
     return out

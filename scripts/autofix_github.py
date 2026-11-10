@@ -106,6 +106,13 @@ class GitHub:
                          event="workflow_dispatch", per_page=20) or {}
         return data.get("workflow_runs") or []
 
+    def dispatch_busy(self, workflow: str) -> bool:
+        """Whether a hand-dispatched run of *workflow* is queued or running: dispatching
+        another into its concurrency group could cancel it."""
+        data = self._get(f"actions/workflows/{workflow}/runs", event="workflow_dispatch", per_page=10) or {}
+        return any(r.get("status") in ("queued", "in_progress", "waiting", "pending", "requested")
+                   for r in data.get("workflow_runs") or [])
+
     def pr_for_branch(self, branch: str, sha: str) -> dict | None:
         """The PR already opened from *branch* at commit *sha* (a tick that died after opening it);
         an older PR from a branch of the same name does not count."""
@@ -128,9 +135,17 @@ class GitHub:
         user = resp.json()
         return user["login"], f"{user['id']}+{user['login']}@users.noreply.github.com"
 
-    def dispatch(self, workflow: str, branch: str, inputs: dict) -> None:
+    def dispatch(self, branch: str, recipe: dict) -> None:
+        """Run *recipe* on *branch*: on the branch itself, or on main with the branch in the
+        recipe's ``ref_input`` (the Crusoe workflow). Nothing but an autofix branch is ever run."""
         check_branch(branch)
-        self._write("POST", f"actions/workflows/{workflow}/dispatches", json={"ref": branch, "inputs": inputs})
+        ref = recipe.get("dispatch_ref") or branch
+        inputs = dict(recipe["inputs"])
+        if ref != branch:
+            if ref != "main" or not recipe.get("ref_input"):
+                raise RuntimeError(f"refusing to dispatch on {ref!r} without the autofix branch as an input")
+            inputs[recipe["ref_input"]] = branch
+        self._write("POST", f"actions/workflows/{recipe['workflow']}/dispatches", json={"ref": ref, "inputs": inputs})
 
     def create_draft_pr(self, title: str, body: str, branch: str) -> dict:
         check_branch(branch)
@@ -218,10 +233,18 @@ def push_branch(wt: Path, branch: str, message: str, gh: GitHub, env: dict | Non
     return sha
 
 
-def find_dispatched_run(gh: GitHub, workflow: str, branch: str, sha: str, after: datetime) -> dict | None:
-    for run in gh.branch_runs(workflow, branch):
-        created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
-        if run.get("head_sha") == sha and created >= after - timedelta(minutes=2):
+def find_dispatched_run(gh: GitHub, recipe: dict, branch: str, sha: str, after: datetime) -> dict | None:
+    """The run our dispatch started. On the branch: by commit. On main (Crusoe): the first run
+    the token's owner dispatched after *after*; ``verify_run()`` then checks the commit in its log."""
+    def created(run: dict) -> datetime:
+        return datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+
+    if recipe.get("dispatch_ref"):
+        mine = [r for r in gh.branch_runs(recipe["workflow"], recipe["dispatch_ref"])
+                if (r.get("actor") or {}).get("login") == AUTOFIX_LOGIN and created(r) >= after - timedelta(minutes=2)]
+        return min(mine, key=created, default=None)
+    for run in gh.branch_runs(recipe["workflow"], branch):
+        if run.get("head_sha") == sha and created(run) >= after - timedelta(minutes=2):
             return run
     return None
 

@@ -126,18 +126,19 @@ def poll_dispatched(pid: str, entry: dict, gh: GitHub, now: datetime) -> tuple[s
     """``("waiting" | "verified" | "failed", verification)`` for a dispatched attempt."""
     rec, plan = entry["attempt"], entry["plan"]
     if not entry.get("run_id"):
-        run = find_dispatched_run(gh, plan["recipe"]["workflow"], rec["branch"], rec["head_sha"],
+        run = find_dispatched_run(gh, plan["recipe"], rec["branch"], rec["head_sha"],
                                   datetime.fromisoformat(rec["dispatched_at"]))
         if not run:
             if now - datetime.fromisoformat(rec["dispatched_at"]) > timedelta(hours=1):
-                return "failed", {"reasons": ["the dispatched run never appeared"], "results": []}
+                return "failed", {"reasons": ["the dispatched run never appeared"], "results": [], "inconclusive": True}
             return "waiting", None
         entry["run_id"], entry["run_url"] = run["id"], run["html_url"]
     run = gh.run(entry["run_id"], fresh=True)
     v = verify_run(plan, rec, run, gh.jobs(entry["run_id"], fresh=True), gh.job_log)
     if not v["done"]:
         if now - datetime.fromisoformat(rec["dispatched_at"]) > timedelta(hours=DISPATCH_TIMEOUT_HOURS):
-            return "failed", {**v, "reasons": [f"the run did not finish in {DISPATCH_TIMEOUT_HOURS} h"]}
+            return "failed", {**v, "reasons": [f"the run did not finish in {DISPATCH_TIMEOUT_HOURS} h"],
+                              "inconclusive": True}
         return "waiting", None
     return ("verified" if v["ok"] else "failed"), v
 
@@ -159,8 +160,22 @@ def push_and_dispatch(plan: dict, rec: dict, patch: bytes, gh: GitHub) -> None:
         git(repo, "-c", "core.hooksPath=/dev/null", "apply", "--binary", "--index", "-", input=patch,
             timeout=120, env=env)
         rec["head_sha"] = push_branch(repo, rec["branch"], rec["message"], gh, env=env)
-    gh.dispatch(plan["recipe"]["workflow"], rec["branch"], plan["recipe"]["inputs"])
+    if plan.get("fallback_recipe") and gh.dispatch_busy(plan["recipe"]["workflow"]):
+        # Someone's run is in Crusoe's dispatch group; ours could cancel it. Use ARC.
+        plan["recipe"] = plan.pop("fallback_recipe")
+    gh.dispatch(rec["branch"], plan["recipe"])
     rec["dispatched_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def try_fallback(plan: dict, rec: dict, entry: dict, v: dict, gh: GitHub) -> bool:
+    """When Crusoe could not judge the fix, re-run it on ARC (same branch, same attempt)."""
+    if not (v.get("inconclusive") and plan.get("fallback_recipe")):
+        return False
+    plan["recipe"] = plan.pop("fallback_recipe")
+    gh.dispatch(rec["branch"], plan["recipe"])
+    rec["dispatched_at"] = datetime.now(timezone.utc).isoformat()
+    entry.update(run_id=None, run_url="")
+    return True
 
 
 def delete_pushed(entry: dict, gh: GitHub) -> None:
@@ -211,6 +226,10 @@ def check_dispatched(pid: str, entry: dict, gh: GitHub, state: dict, now: dateti
         entry.update(status="opened", pr=pr["html_url"])
         add_event(state, now, pid, "fix passed on AMD GPUs; draft PR opened", pr["html_url"])
         _slim(entry)
+        return
+    if try_fallback(plan, rec, entry, v, gh):
+        add_event(state, now, pid, "the Crusoe run could not tell; re-running the job on ARC",
+                  "; ".join(v.get("reasons") or [])[:300])
         return
     end_attempt(state, pid, entry, now, "GPU check failed", "; ".join(v.get("reasons") or [])[:400], gh,
                 previous=previous_attempt_text(rec, v, gh, plan))
@@ -505,6 +524,9 @@ def smoke_publish(gh: GitHub, handoff: Path, out_dir: Path) -> int:
             push_and_dispatch(plan, rec, patch_path(handoff, plan["id"]).read_bytes(), gh)
             while True:
                 status, v = poll_dispatched(plan["id"], entry, gh, datetime.now(timezone.utc))
+                if status == "failed" and try_fallback(plan, rec, entry, v, gh):
+                    summary.setdefault("fell_back", []).append(v.get("reasons"))
+                    continue
                 if status != "waiting":
                     break
                 time.sleep(300)

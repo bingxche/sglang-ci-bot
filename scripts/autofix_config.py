@@ -51,6 +51,11 @@ PR_TEST_WORKFLOW = "pr-test-amd.yml"
 PR_TEST_EXTRA_WORKFLOW = "pr-test-amd-extra.yml"
 NIGHTLY_WORKFLOW = "nightly-test-amd.yml"
 DISAGG_WORKFLOW = "nightly-amd-mi355x-disagg.yml"
+# Crusoe's Spur workflow: re-runs a suite on Crusoe's MI355X nodes, from `main` with a `ref`
+# input, without the ARC queue. Only suites on the same GPU as the failed job use it.
+SPUR_WORKFLOW = "test-amd-mi35x-spur.yml"
+SPUR_SUITES = ("stage-b-test-1-gpu-small-amd-mi35x",)
+SPUR_LABELS = ("linux-sglang-mi35x-spur",)
 # Workflows whose scheduled failures the bot fixes.
 AUTOFIX_WORKFLOWS = (PR_TEST_WORKFLOW, NIGHTLY_WORKFLOW, DISAGG_WORKFLOW)
 # Monitored workflows the bot leaves alone, and why.
