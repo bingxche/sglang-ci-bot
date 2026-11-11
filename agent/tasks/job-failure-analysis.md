@@ -106,6 +106,35 @@ and the nightly, not other PRs' runs.
 Do not name the cluster node (`node` in `result.json`, hostnames in the logs);
 write "the CI node".
 
+### radixark/miles PR Test (ROCm) (REQUIRED for `radixark/miles/pr-test-rocm.yml`)
+
+This workflow runs in [radixark/miles](https://github.com/radixark/miles) (the
+prompt's `Repo:` line; see the Ground Rules). The monitor reads its scheduled
+runs on `main`: the current directory is radixark/miles at the run's commit,
+with full history. The tests run on a cluster node, inside the Miles image
+named on the log's `container_image:` line (by default
+`rocm/sgl-dev:miles-rocm10-mi35x`, the undated tag that every sglang
+`release-docker-amd-miles-rocm10-nightly.yml` build overwrites).
+
+- **Jobs.** `resolve-ci-*` jobs pick the cadence, the image and whether
+  dependencies are overridden; `stage-c-4-gpu-mi350 (<n>) / run` runs one
+  shard of `tests/ci/run_suite.py`. Its `Run tests on a cluster node` step
+  ends with `Test Summary: <k>/<n> passed` and a `FAILED:` list of test files;
+  `[CI Retry]` lines say whether a test was retried. Name the failing test
+  file and the error from its traceback (Ray job output is inlined).
+- **What else ran.** The log's `Resolved: megatron=... sglang=...` line and
+  the install step say whether SGLang or Megatron-LM were installed over the
+  image's own copies; otherwise the image's baked SGLang (branch
+  `sglang-miles`) and Megatron-LM ran.
+- **Why.** Tell a radixark/miles change (`git log` here between the last
+  passing and the failing run's commits) from a change in the image: compare
+  the image the last passing run used, and check sglang's
+  `nightly-test-amd-miles-rocm10.yml` on the same image. Cite sglang commits
+  and PRs as usual when the image's sglang is to blame. Look up in-flight
+  fixes in radixark/miles as well as sglang.
+- A job that fails in `Set up runner` or never starts is a runner problem,
+  not a test failure.
+
 ### Miles workflows (REQUIRED for `nightly-test-amd-miles-*.yml` and `release-docker-amd-miles-*.yml`)
 
 These workflows test [radixark/miles](https://github.com/radixark/miles), an RL

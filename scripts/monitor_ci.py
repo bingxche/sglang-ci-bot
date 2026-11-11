@@ -85,6 +85,9 @@ MONITORED_WORKFLOWS = [
     "sgl-project/sgl-amd-mono/nightly-amd.yml",
     # sgl-amd-mono's PR test: one run per PR (PER_PR_WORKFLOWS).
     "sgl-project/sgl-amd-mono/pr-test-amd.yml",
+    # radixark/miles' own PR test, scheduled on main: the repo at the run's
+    # commit, on the Miles image the sglang Miles builds publish.
+    "radixark/miles/pr-test-rocm.yml",
 ]
 
 # Order of the jobs within a workflow's report: first by the ROCm version in

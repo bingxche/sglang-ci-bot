@@ -48,6 +48,7 @@ env:
     amd-aiter-scout.yml
     sgl-project/sgl-amd-mono/nightly-amd.yml
     sgl-project/sgl-amd-mono/pr-test-amd.yml
+    radixark/miles/pr-test-rocm.yml
 
 jobs:
   prepare:
