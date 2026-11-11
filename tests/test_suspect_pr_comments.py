@@ -36,8 +36,18 @@ def _suspect(**overrides) -> dict:
 
 class FakeGitHub:
     def __init__(self, merged_at="2026-10-21T05:32:30Z", merge_sha=SHA,
-                 statuses=None, comments=None):
+                 statuses=None, comments=None, fixes=None, author="pr-author",
+                 merged_by="merger", commits=None, reviews=None, user_types=None):
         self.merged_at = merged_at
+        self.author = author
+        self.merged_by = merged_by
+        self.commits = commits or []
+        self.reviews = reviews or []
+        # login -> account type, for co-author trailers
+        self.user_types = user_types or {}
+        self.user_lookups = []
+        # fix PR number -> its pull payload
+        self.fixes = fixes or {}
         self.merge_sha = merge_sha
         # (base, head) -> status; default puts SHA inside PASS..FAIL.
         self.statuses = statuses or {(PASS, SHA): "ahead", (SHA, FAIL): "ahead"}
@@ -46,7 +56,11 @@ class FakeGitHub:
 
     def pull(self, pr):
         self.calls += 1
-        return {"number": pr, "merged_at": self.merged_at, "merge_commit_sha": self.merge_sha}
+        if pr in self.fixes:
+            return self.fixes[pr]
+        return {"number": pr, "merged_at": self.merged_at, "merge_commit_sha": self.merge_sha,
+                "user": {"login": self.author, "type": "User"},
+                "merged_by": {"login": self.merged_by, "type": "User"} if self.merged_by else None}
 
     def full_sha(self, sha):
         return SHA if SHA.startswith(sha) else None
@@ -59,6 +73,18 @@ class FakeGitHub:
 
     def pr_comments(self, pr):
         return self.comments
+
+    def pr_commits(self, pr):
+        self.calls += 1
+        return self.commits
+
+    def pr_reviews(self, pr):
+        self.calls += 1
+        return self.reviews
+
+    def user_type(self, login):
+        self.user_lookups.append(login)
+        return self.user_types.get(login, "")
 
 
 class SuspectBlockTest(unittest.TestCase):
@@ -109,11 +135,71 @@ class CheckSuspectTest(unittest.TestCase):
         self.assertIn("MEDIUM", d.reason)
         self.assertEqual(gh.calls, 0)
 
-    def test_linked_fix_pr_is_skipped(self):
-        self.assertIn("fix PR #45656", self.check(_suspect(fix_pr=45656)).reason)
+    def _fix(self, state="open", merged_at=None, author="fixer"):
+        return {45656: {"number": 45656, "state": state, "merged_at": merged_at,
+                        "title": "Fix it", "user": {"login": author}}}
+
+    def test_open_fix_pr_asks_the_author_to_review(self):
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix()))
+        self.assertEqual((d.result, d.fix["number"], d.pr_author), ("post", 45656, "pr-author"))
+        body = spc.render_pr_comment(d, {})
+        self.assertTrue(body.startswith(spc.fix_marker(45656)))
+        self.assertIn("@pr-author AMD CI jobs started failing", body)
+        self.assertIn("#45656 proposes a fix. Could you review it?", body)
+        self.assertIn("\ncc @merger (merged)\n", body)
+        # Only the PR's people are mentioned; the evidence's are still neutralized.
+        self.assertIn("`@someone`", body)
+        log_body = spc.render_log_comment([d], "post", "2026-10-28 18:00 UTC")
+        self.assertIn("would comment (review request for #45656)", log_body)
+
+    def test_review_request_goes_out_after_an_earlier_suspect_comment(self):
+        gh = FakeGitHub(fixes=self._fix(), comments=[{"body": spc.pr_marker("R281"), "html_url": "u"}])
+        self.assertEqual(self.check(_suspect(fix_pr=45656), gh=gh).result, "post")
+
+    def test_review_request_is_sent_once_per_fix(self):
+        gh = FakeGitHub(fixes=self._fix(), comments=[{"body": spc.fix_marker(45656), "html_url": "u"}])
+        d = self.check(_suspect(fix_pr=45656), gh=gh)
+        self.assertEqual((d.result, d.reason), ("already", "asked to review #45656"))
+
+    def test_merged_fix_is_skipped(self):
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix("closed", "2026-10-22T00:00:00Z")))
+        self.assertEqual(d.reason, "fix PR #45656 already merged")
+
+    def test_fix_by_the_pr_author_is_skipped(self):
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix(author="PR-Author")))
+        self.assertEqual(d.reason, "fix PR #45656 is by the PR's author")
+
+    def test_abandoned_fix_falls_back_to_a_plain_comment(self):
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=self._fix("closed")))
+        self.assertEqual((d.result, d.fix), ("post", None))
+        self.assertTrue(spc.render_pr_comment(d, {}).startswith(spc.pr_marker("R281")))
+
+    def test_autofix_workaround_gets_no_review_request(self):
+        # ci-autofix asks the suspect PR's author to review only a fix of the root cause.
+        fixes = self._fix(author="bingxche")
+        data = '<!-- amd-bot-autofix-data:v1 {"problem":"R281","fix_kind":"%s","workflow":"pr-test-amd.yml"} -->'
+        fixes[45656]["body"] = "## Modifications\n\nskip\n\n<!-- amd-bot-autofix: R281 -->\n" + data % "workaround"
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=fixes))
+        self.assertEqual((d.result, d.fix), ("post", None))
+        # A root-cause fix is reviewed, even if its prose mentions a workaround heading.
+        fixes[45656]["body"] = "### Workaround\n\n<!-- amd-bot-autofix: R281 -->\n" + data % "root-cause"
+        d = self.check(_suspect(fix_pr=45656), gh=FakeGitHub(fixes=fixes))
+        self.assertEqual(d.fix["number"], 45656)
 
     def test_single_failed_job_is_skipped(self):
         self.assertIn("needs 2", self.check(jobs=[1]).reason)
+
+    def test_jobs_of_another_repo_do_not_count(self):
+        mono = "https://github.com/sgl-project/sgl-amd-mono/actions/runs/7"
+        sglang = "https://github.com/sgl-project/sglang/actions/runs/8"
+        info = {1: {"run_url": mono}, 2: {"run_url": mono}, 3: {"run_url": sglang}}
+        d = spc.check_suspect(_suspect(), [1, 2, 3], FakeGitHub(), NOW, info)
+        self.assertEqual(d.result, "skip")
+        self.assertIn("1 failed sglang job(s)", d.reason)
+        self.assertIn("the others are from sgl-project/sgl-amd-mono", d.reason)
+        info[4] = {"run_url": sglang}
+        d = spc.check_suspect(_suspect(), [1, 2, 3, 4], FakeGitHub(), NOW, info)
+        self.assertEqual(d.result, "post")
 
     def test_missing_window_is_skipped(self):
         self.assertIn("first-failing", self.check(_suspect(first_fail_sha=None)).reason)
@@ -140,6 +226,14 @@ class CheckSuspectTest(unittest.TestCase):
         d = self.check(gh=gh)
         self.assertEqual((d.result, d.comment_url), ("already", "u"))
 
+    def test_comment_under_an_earlier_cluster_id_is_not_repeated(self):
+        # #45791 was R327 at 22:05 and R332 at 23:05 on Oct 27.
+        gh = FakeGitHub(comments=[{"body": spc.pr_marker("R327") + "\nhi", "html_url": "u"}])
+        d = self.check(_suspect(cluster="R332"), gh=gh)
+        self.assertEqual((d.result, d.reason), ("already", "commented earlier as R327"))
+        log_body = spc.render_log_comment([d], "post", "2026-10-28 18:00 UTC")
+        self.assertIn("[already commented (commented earlier as R327)](u)", log_body)
+
 
 class RenderTest(unittest.TestCase):
     def test_pr_comment(self):
@@ -152,7 +246,71 @@ class RenderTest(unittest.TestCase):
         self.assertIn(f"[stage-b (rocm10)]({RUN}/job/1)", body)
         self.assertIn("…and 1 more", body)
         self.assertIn("Also involved: #45112.", body)
+        self.assertIn("Posted automatically by [amd-bot](https://github.com/amd-bot)", body)
         self.assertNotIn("sglang-ci-bot", body)
+
+    def test_mentions_the_author_and_ccs_who_worked_on_the_pr(self):
+        def commit(login, message="Change", type_="User"):
+            return {"author": {"login": login, "type": type_} if login else None,
+                    "commit": {"message": message}}
+
+        def review(login, state, type_="User"):
+            return {"user": {"login": login, "type": type_}, "state": state}
+
+        gh = FakeGitHub(
+            # sgl-project/sglang#48547: merged by a maintainer who also pushed commits.
+            merged_by="hnyls2002",
+            commits=[
+                commit("pr-author"),
+                commit("HNYLS2002"),
+                commit(None, "Fix\n\nCo-authored-by: Pair <123+pair@users.noreply.github.com>\n"
+                             "Co-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>\n"
+                             "Co-authored-by: Claude <noreply@anthropic.com>"),
+                commit("dependabot[bot]", type_="Bot"),
+            ],
+            reviews=[
+                review("claude[bot]", "COMMENTED", "Bot"),
+                review("rev1", "APPROVED"),
+                review("hnyls2002", "APPROVED"),
+                review("drafty", "PENDING"),
+                review("pr-author", "COMMENTED"),
+            ],
+            user_types={"pair": "User", "Copilot": "Bot"},
+        )
+        d = spc.check_suspect(_suspect(), [1, 2], gh, NOW)
+        self.assertEqual(d.cc, [
+            ("hnyls2002", ["merged", "co-author", "reviewed"]),
+            ("pair", ["co-author"]),
+            ("rev1", ["reviewed"]),
+        ])
+        self.assertEqual(gh.user_lookups, ["pair", "Copilot"])
+        body = spc.render_pr_comment(d, {})
+        self.assertIn("@pr-author AMD CI jobs started failing", body)
+        self.assertIn(
+            "\ncc @hnyls2002 (merged, co-author, reviewed), @pair (co-author), @rev1 (reviewed)\n",
+            body,
+        )
+        self.assertNotIn("@Copilot", body)
+        self.assertNotIn("@claude", body)
+        self.assertNotIn("@drafty", body)
+
+    def test_cc_is_capped(self):
+        reviews = [{"user": {"login": f"r{i}", "type": "User"}, "state": "APPROVED"} for i in range(10)]
+        d = spc.check_suspect(_suspect(), [1, 2], FakeGitHub(reviews=reviews), NOW)
+        self.assertEqual(len(d.cc), spc.MAX_CC)
+        self.assertEqual(d.cc[0], ("merger", ["merged"]))
+
+    def test_bot_author_is_not_mentioned(self):
+        d = spc.check_suspect(_suspect(), [1, 2], FakeGitHub(author="sglang-bot[bot]", merged_by=None), NOW)
+        body = spc.render_pr_comment(d, {})
+        self.assertIn(spc.pr_marker("R281") + "\nAMD CI jobs started failing", body)
+        self.assertNotIn("cc @", body)
+
+    def test_people_are_not_looked_up_unless_posting(self):
+        gh = FakeGitHub(comments=[{"body": spc.pr_marker("R281"), "html_url": "u"}])
+        d = spc.check_suspect(_suspect(), [1, 2], gh, NOW)
+        self.assertEqual((d.result, d.cc), ("already", []))
+        self.assertEqual(gh.calls, 1)  # the PR itself only
 
     def test_mentions(self):
         self.assertEqual(
@@ -162,7 +320,7 @@ class RenderTest(unittest.TestCase):
 
     def test_dry_run_holds_over_limit_and_logs(self):
         gh = FakeGitHub()
-        suspects = [_suspect(cluster=f"R{i}") for i in range(1, spc.MAX_POSTS_PER_RUN + 2)]
+        suspects = [_suspect(cluster=f"R{i}", pr=42229 + i) for i in range(1, spc.MAX_POSTS_PER_RUN + 2)]
         suspects.append(_suspect(cluster="R99", confidence="LOW"))
         clusters = {s["cluster"]: [1, 2] for s in suspects}
         decisions = spc.decide_all(suspects, clusters, {}, gh, NOW)
@@ -184,6 +342,18 @@ class RenderTest(unittest.TestCase):
             [_suspect(), _suspect()], {"R281": [1, 2]}, {}, FakeGitHub(), NOW,
         )
         self.assertEqual(len(decisions), 1)
+
+    def test_two_clusters_on_one_pr_post_once(self):
+        decisions = spc.decide_all(
+            [_suspect(cluster="R1"), _suspect(cluster="R2")],
+            {"R1": [1, 2], "R2": [1, 2, 3]}, {}, FakeGitHub(), NOW,
+        )
+        self.assertEqual(
+            [(d.suspect["cluster"], d.result) for d in decisions],
+            [("R2", "post"), ("R1", "skip")],
+        )
+        self.assertEqual(decisions[1].reason, "#42229 gets one comment, for R2")
+        self.assertEqual(decisions[1].body, "")
 
 
 if __name__ == "__main__":

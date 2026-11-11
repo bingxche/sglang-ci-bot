@@ -1,0 +1,44 @@
+name: PR Checks
+
+# Every pull request: the unit tests (including tests/test_readme.py, which
+# keeps README.md in step with the code) and the rules for changes in
+# AGENTS.md (scripts/check_pr_rules.py). Runs on a GitHub-hosted runner with
+# a read-only token and no secrets, so it is safe for pull requests from forks.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Unit tests
+        run: PYTHONPATH=scripts python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Rules for changes
+        env:
+          # Passed through the environment, never interpolated into the script.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python scripts/check_pr_rules.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}"

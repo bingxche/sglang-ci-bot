@@ -9,13 +9,13 @@ name: Coverage Exclusion Audit
 # GitHub-hosted runners llm-api.amd.com does not resolve. The code it runs
 # lives in ROCm/sglang-ci (upstream_ci/coverage_audit/: audit.py and the agent
 # prompt), next to the file it edits, and so does its state: the ledger of
-# audited files, upstream_ci/coverage_audit/reviewed.json on that repo's `log`
-# branch.
+# audited files, upstream_ci/coverage_audit/reviewed.json on that repo's
+# `coverage-ledger` branch.
 #
 # The agent reads upstream sglang test files, which anyone who lands an
 # upstream PR controls. So it gets no token and no shell: it runs in this
 # job's temp directory (never the shared workspace, which holds the bot
-# checkout and agent/CLAUDE.md), under `env -i` with only the gateway
+# checkout and agent/ground-rules.md), under `env -i` with only the gateway
 # variables, with `--tools Read,Grep,Glob --restricted`: those three tools
 # are all it has, confined to that directory, with no settings files or MCP
 # servers. Its answer is data: audit.py
@@ -62,6 +62,7 @@ jobs:
     env:
       TARGET_REPO: ROCm/sglang-ci
       LEDGER_PATH: upstream_ci/coverage_audit/reviewed.json
+      LEDGER_BRANCH: coverage-ledger
       DRY_RUN: ${{ github.event.inputs.dry_run == 'true' }}
       MAX_FILES: ${{ github.event.inputs.max_files || '0' }}
       MODEL: ${{ github.event.inputs.model || vars.COVERAGE_AUDIT_MODEL || 'opus' }}
@@ -151,7 +152,7 @@ jobs:
           GH_TOKEN: ${{ secrets.SGLANG_CI_TOKEN || secrets.GH_PAT }}
         run: |
           cd "$W"
-          gh api "repos/$TARGET_REPO/contents/$LEDGER_PATH?ref=log" \
+          gh api "repos/$TARGET_REPO/contents/$LEDGER_PATH?ref=$LEDGER_BRANCH" \
             -H "Accept: application/vnd.github.raw" > out/ledger.json
           python3 "$AUDIT" report --rules-dir base --out out/gap.json
           python3 "$AUDIT" prepare --report out/gap.json --ledger out/ledger.json \
@@ -311,13 +312,13 @@ jobs:
             echo "ledger unchanged"; exit 0
           fi
           # Request body from a file: the base64 ledger outgrows one argv entry.
-          SHA=$(gh api "repos/$TARGET_REPO/contents/$LEDGER_PATH?ref=log" --jq .sha)
-          python3 - out/ledger.new.json "$SHA" > out/ledger_put.json <<'EOF'
+          SHA=$(gh api "repos/$TARGET_REPO/contents/$LEDGER_PATH?ref=$LEDGER_BRANCH" --jq .sha)
+          python3 - out/ledger.new.json "$SHA" "$LEDGER_BRANCH" > out/ledger_put.json <<'EOF'
           import base64, json, sys, time
           print(json.dumps({
               "message": "coverage audit: ledger " + time.strftime("%Y-%m-%d", time.gmtime()),
               "content": base64.b64encode(open(sys.argv[1], "rb").read()).decode(),
-              "branch": "log",
+              "branch": sys.argv[3],
               "sha": sys.argv[2],
           }))
           EOF

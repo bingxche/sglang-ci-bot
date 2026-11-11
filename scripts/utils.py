@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -34,6 +35,23 @@ REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
 
+
+def workflow_repo(workflow: str) -> tuple[str, str]:
+    """``(repo, workflow file)`` of a monitored workflow.
+
+    sglang's workflows are named by their file alone (``pr-test-amd.yml``);
+    another repo's carry it in front (``sgl-project/sgl-amd-mono/nightly-amd.yml``),
+    so the name says where the runs are and cannot clash with an sglang file.
+    """
+    repo, _, file = workflow.rpartition("/")
+    return repo or REPO, file
+
+
+def job_repo(job: dict) -> str:
+    """The repo a job from the Actions API belongs to (its ``url``)."""
+    m = re.match(r"https://api\.github\.com/repos/([^/]+/[^/]+)/", job.get("url") or "")
+    return m.group(1) if m else REPO
+
 CLAUDE_MODEL = "claude-opus-5-5"
 
 STEP_LOG_PREFILTER_THRESHOLD = 150_000
@@ -41,6 +59,22 @@ STEP_LOG_PREFILTER_THRESHOLD = 150_000
 MI355X_DISAGG_WORKFLOW = "nightly-amd-mi355x-disagg.yml"
 MI355X_ARTIFACT_PREFIX = "mi355x-"
 MI355X_ARTIFACT_CONTEXT_MAX_CHARS = 120_000
+
+MONO_NIGHTLY_WORKFLOW = "sgl-project/sgl-amd-mono/nightly-amd.yml"
+MONO_PR_TEST_WORKFLOW = "sgl-project/sgl-amd-mono/pr-test-amd.yml"
+
+# Workflows whose evidence is in run artifacts rather than the job log, and
+# the prefix of those artifacts' names. They are downloaded for the agent
+# into ``.ci-context/<prefix>artifacts`` (``prepare_run_artifact_context``).
+RUN_ARTIFACT_PREFIXES = {
+    # The prefill / decode / router server logs of the multi-node benchmark.
+    MI355X_DISAGG_WORKFLOW: MI355X_ARTIFACT_PREFIX,
+    # Per model: result.json and the logs of every step (unit, kernels,
+    # pinned contract, server, evals, benchmarks). The failing job is often
+    # ``report``, whose own log only has the exit code.
+    MONO_NIGHTLY_WORKFLOW: "mono-ci-",
+    MONO_PR_TEST_WORKFLOW: "mono-ci-",
+}
 
 # Miles (radixark/miles) RL-training workflows. Their runs are on sglang main,
 # but what they test is /root/miles inside a dated image that the build
@@ -130,13 +164,97 @@ def is_gate_job(job: dict) -> bool:
     return all(GATE_STEP_PATTERNS.search(s["name"]) for s in failed_steps)
 
 
-def get_failed_jobs(token: str, run_id: int) -> list[dict]:
+RUNNER_LOST_ANNOTATION = "lost communication with the server"
+_STEP_FAILED = ("failure", "cancelled", "timed_out")
+
+
+def is_runner_lost(job: dict) -> bool:
+    """True when a failed job's runner went away mid-job rather than a step failing.
+
+    GitHub reports this as "The self-hosted runner lost communication with the
+    server" -- a check-run annotation, which the jobs endpoint does not carry --
+    and usually keeps no log. The step list gives it away: the job is
+    ``failure`` but no step is, because the step that was running is left
+    ``in_progress``, the list stops short, or (most often) it is empty. A real
+    failure always fails a step, and ``timeout-minutes`` cancels one.
+
+    Checked against the annotation on 1,384 failed jobs of the four AMD
+    workflows: it matched all 22 annotated jobs and one more from the same
+    outage that GitHub never annotated. The same rule drives the "Runner lost"
+    column on the ROCm/sglang-ci Runner Health page.
+    """
+    if job.get("status") != "completed" or job.get("conclusion") != "failure":
+        return False
+    # A job that never got a runner (startup failure) has nothing to lose.
+    if not job.get("runner_name"):
+        return False
+    return not any(s.get("conclusion") in _STEP_FAILED for s in job.get("steps") or [])
+
+
+def get_job_annotations(token: str, job_id: int, repo: str = REPO) -> list[dict] | None:
+    """The check-run annotations of a job, or None when they could not be read."""
+    url = f"https://api.github.com/repos/{repo}/check-runs/{job_id}/annotations"
+    try:
+        resp = gh_get(url, headers=gh_headers(token), timeout=30)
+    except requests.RequestException:
+        return None
+    return resp.json() if resp.status_code == 200 else None
+
+
+def _lost_at_step(job: dict) -> str:
+    steps = job.get("steps") or []
+    running = next((s for s in steps if s.get("status") == "in_progress"), None)
+    if running:
+        return f"`{running['name']}` (step {running['number']}, left in progress)"
+    if not steps:
+        return "before any step was reported (the job has no steps)"
+    last = steps[-1]
+    return f"after `{last['name']}` (step {last['number']}); the step list stops there"
+
+
+def runner_lost_evidence(
+    token: str | None, job: dict, run_jobs: list[dict] | None = None,
+) -> str:
+    """Facts about a lost-runner job, for the analysis prompt and evidence packs.
+
+    *run_jobs* are the other jobs of the same run; the lost ones among them
+    tell a host outage (several jobs, one runner, one window) from a job that
+    takes its own runner down.
+    """
+    lines = [
+        f"- Runner: `{job.get('runner_name')}` (labels: "
+        + ", ".join(f"`{x}`" for x in job.get("labels") or []) + ")",
+        f"- Started {job.get('started_at')}, marked failed {job.get('completed_at')}",
+        f"- Lost during: {_lost_at_step(job)}",
+    ]
+    anns = get_job_annotations(token, job["id"], job_repo(job)) if token else None
+    msg = next((a.get("message", "") for a in anns or []
+                if RUNNER_LOST_ANNOTATION in a.get("message", "")), None)
+    if msg:
+        lines.append(f"- GitHub annotation: \"{msg.splitlines()[0]}\"")
+    elif anns is not None:
+        lines.append("- GitHub annotation: none (GitHub does not always annotate a lost runner)")
+    others = [j for j in run_jobs or [] if j.get("id") != job["id"] and is_runner_lost(j)]
+    if others:
+        others.sort(key=lambda j: j.get("completed_at") or "")
+        lines.append(f"- Other jobs in this run that lost their runner: {len(others)}")
+        lines += [
+            f"  - `{j.get('runner_name')}` · {j.get('completed_at')} · "
+            f"[{j['name']}]({j.get('html_url')})"
+            for j in others
+        ]
+    else:
+        lines.append("- Other jobs in this run that lost their runner: none")
+    return "\n".join(lines)
+
+
+def get_failed_jobs(token: str, run_id: int, repo: str = REPO) -> list[dict]:
     """Get completed non-success, non-skipped jobs for a workflow run.
 
     Only returns jobs whose status is 'completed' so that still-running
     jobs in an in-progress workflow are not picked up prematurely.
     """
-    jobs = get_run_jobs(token, run_id)
+    jobs = get_run_jobs(token, run_id, repo)
     return [
         j for j in jobs
         if j.get("status") == "completed"
@@ -179,10 +297,40 @@ def gh_headers(token: str) -> dict:
     }
 
 
-def download_job_logs(token: str, job_id: int) -> str:
+# GitHub's API returns the odd 502/503/504 under load; on 2026-10-29 and -30
+# a single 502 failed a whole monitor job. Reads are retried; writes are not,
+# because a write that timed out may still have happened (a duplicate comment).
+GH_RETRY_STATUSES = frozenset({500, 502, 503, 504})
+GH_RETRY_DELAYS = (5, 15, 45)
+
+
+def gh_get(url: str, headers: dict, **kwargs) -> requests.Response:
+    """``requests.get`` for GitHub reads, retried on 5xx and connection errors.
+
+    Returns the last response; callers check its status as before. A connection
+    error on the last attempt is raised.
+    """
+    for delay in (*GH_RETRY_DELAYS, None):
+        try:
+            resp = requests.get(url, headers=headers, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if delay is None:
+                raise
+            logging.getLogger("github").warning("GET %s failed (%s); retrying in %ds", url, exc, delay)
+        else:
+            if resp.status_code not in GH_RETRY_STATUSES or delay is None:
+                return resp
+            logging.getLogger("github").warning(
+                "GET %s returned %d; retrying in %ds", url, resp.status_code, delay,
+            )
+        time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def download_job_logs(token: str, job_id: int, repo: str = REPO) -> str:
     """Download full logs for a GitHub Actions job."""
-    url = f"https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs"
-    resp = requests.get(url, headers=gh_headers(token), allow_redirects=True)
+    url = f"https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs"
+    resp = gh_get(url, headers=gh_headers(token), allow_redirects=True)
     if resp.status_code == 200:
         # The log response has no charset, so requests would decode it as
         # Latin-1 and garble markers such as "✗ FAILED".
@@ -254,12 +402,12 @@ def _extract_tar_safely(tar_path: Path, dest_dir: Path) -> list[Path]:
     return extracted
 
 
-def _list_run_artifacts(token: str, run_id: int) -> list[dict]:
-    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/artifacts"
+def _list_run_artifacts(token: str, run_id: int, repo: str = REPO) -> list[dict]:
+    url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts"
     artifacts: list[dict] = []
     page = 1
     while True:
-        resp = requests.get(
+        resp = gh_get(
             url,
             headers=gh_headers(token),
             params={"per_page": 100, "page": page},
@@ -292,52 +440,56 @@ def _download_artifact_archive(token: str, artifact: dict, target: Path) -> None
                     f.write(chunk)
 
 
-def prepare_mi355x_artifact_context(
+def prepare_run_artifact_context(
     token: str | None,
     run_id: int,
     work_dir: Path,
+    workflow_file: str = MI355X_DISAGG_WORKFLOW,
 ) -> Path | None:
-    """Download and unpack MI355X disagg workflow artifacts for an agent.
+    """Download and unpack a run's evidence artifacts for an agent.
 
-    The nightly MI355X disagg workflow uploads the useful server-side evidence
+    Some workflows (``RUN_ARTIFACT_PREFIXES``) upload their useful evidence
     as run artifacts, not only as GitHub job logs.  This helper materializes
-    those artifacts under ``.ci-context/mi355x-artifacts`` and writes a manifest
-    that the agent can read before diagnosing the failure.
+    the artifacts with the workflow's prefix under
+    ``.ci-context/<prefix>artifacts`` and writes a manifest that the agent can
+    read before diagnosing the failure.
     """
     _log = logging.getLogger("ci-monitor")
+    prefix = RUN_ARTIFACT_PREFIXES[workflow_file]
+    repo, _ = workflow_repo(workflow_file)
     if not token:
-        _log.warning("No GitHub token available; cannot pre-download MI355X artifacts")
+        _log.warning("No GitHub token available; cannot pre-download %s* artifacts", prefix)
         return None
 
     context_dir = work_dir / ".ci-context"
-    artifact_root = context_dir / "mi355x-artifacts"
+    artifact_root = context_dir / f"{prefix}artifacts"
     if artifact_root.exists():
         shutil.rmtree(artifact_root)
     artifact_root.mkdir(parents=True, exist_ok=True)
 
     try:
-        run_artifacts = _list_run_artifacts(token, run_id)
+        run_artifacts = _list_run_artifacts(token, run_id, repo)
     except Exception as exc:
-        _log.warning("Failed to list MI355X artifacts for run %s: %s", run_id, exc)
+        _log.warning("Failed to list %s* artifacts for run %s: %s", prefix, run_id, exc)
         shutil.rmtree(artifact_root, ignore_errors=True)
         return None
 
     artifacts = [
         a for a in run_artifacts
-        if not a.get("expired") and a.get("name", "").startswith(MI355X_ARTIFACT_PREFIX)
+        if not a.get("expired") and a.get("name", "").startswith(prefix)
     ]
     if not artifacts:
-        _log.warning("No MI355X artifacts found for run %s", run_id)
+        _log.warning("No %s* artifacts found for run %s", prefix, run_id)
         shutil.rmtree(artifact_root, ignore_errors=True)
         return None
 
     manifest: list[str] = [
-        "# MI355X Disagg Artifact Context",
+        f"# Artifact Context: {workflow_file}",
         "",
-        f"Workflow run: https://github.com/{REPO}/actions/runs/{run_id}",
+        f"Workflow run: https://github.com/{repo}/actions/runs/{run_id}",
         "",
         "These files were downloaded from run artifacts before analysis. "
-        "For this workflow, prefill/decode/router evidence usually lives here.",
+        "For this workflow, the failure's evidence usually lives here.",
         "",
         "## Downloaded Artifacts",
         "",
@@ -394,8 +546,8 @@ def prepare_mi355x_artifact_context(
     manifest_path = artifact_root / "MANIFEST.md"
     manifest_path.write_text("\n".join(manifest) + "\n")
     _log.info(
-        "Prepared MI355X artifact context for run %s: %d artifact(s), %d extracted file(s)",
-        run_id, len(artifacts), len(important_files),
+        "Prepared %s* artifact context for run %s: %d artifact(s), %d extracted file(s)",
+        prefix, run_id, len(artifacts), len(important_files),
     )
     return artifact_root
 
@@ -551,13 +703,13 @@ def render_miles_evidence(
         lines += [
             "",
             "The dashboard payload could not be fetched, so there is no evidence "
-            "beyond the job itself. Follow the Miles workflow fallback in CLAUDE.md.",
+            "beyond the job itself. Follow the Miles workflow fallback in your task instructions.",
         ]
     elif not rows:
         lines += [
             "",
             "The dashboard has no row for this job yet (its log may still be "
-            "queued there). Follow the Miles workflow fallback in CLAUDE.md.",
+            "queued there). Follow the Miles workflow fallback in your task instructions.",
         ]
 
     for n, row in enumerate(rows, 1):
@@ -856,7 +1008,7 @@ def checkout_sglang_for_miles(
     if ref:
         git("fetch", "origin", ref, "--depth", "300")
     if git("cat-file", "-t", sha).returncode != 0 and token:
-        resp = requests.get(
+        resp = gh_get(
             f"https://api.github.com/repos/{REPO}/commits/{sha}",
             headers=gh_headers(token), timeout=60,
         )
@@ -954,7 +1106,7 @@ def update_comment(token: str, repo: str, comment_id: int, body: str) -> dict:
 def get_issue(token: str, repo: str, issue_number: int) -> dict:
     """Fetch an issue's full payload (title, body, labels, ...)."""
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
-    resp = requests.get(url, headers=gh_headers(token))
+    resp = gh_get(url, headers=gh_headers(token))
     resp.raise_for_status()
     return resp.json()
 
@@ -1008,7 +1160,7 @@ def get_workflow_runs_for_sha(token: str, head_sha: str) -> list[dict]:
     all_runs: list[dict] = []
     page = 1
     while True:
-        resp = requests.get(
+        resp = gh_get(
             url,
             headers=gh_headers(token),
             params={"head_sha": head_sha, "per_page": 100, "page": page},
@@ -1024,14 +1176,14 @@ def get_workflow_runs_for_sha(token: str, head_sha: str) -> list[dict]:
     return all_runs
 
 
-def get_run_jobs(token: str, run_id: int) -> list[dict]:
+def get_run_jobs(token: str, run_id: int, repo: str = REPO) -> list[dict]:
     """Get every latest-attempt job for a workflow run across all API pages."""
-    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
+    url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
     all_jobs: list[dict] = []
     seen_job_ids: set[int] = set()
     page = 1
     while True:
-        resp = requests.get(
+        resp = gh_get(
             url,
             headers=gh_headers(token),
             params={"filter": "latest", "per_page": 100, "page": page},
@@ -1058,7 +1210,7 @@ def get_pr_diff(token: str, pr_number: int) -> str:
     url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}"
     headers = gh_headers(token)
     headers["Accept"] = "application/vnd.github.diff"
-    resp = requests.get(url, headers=headers)
+    resp = gh_get(url, headers=headers)
     if resp.status_code == 200:
         return resp.text
     return ""
@@ -1070,7 +1222,7 @@ def get_pr_changed_files(token: str, pr_number: int) -> list[dict]:
     all_files: list[dict] = []
     page = 1
     while True:
-        resp = requests.get(
+        resp = gh_get(
             url,
             headers=gh_headers(token),
             params={"per_page": 100, "page": page},
@@ -1091,7 +1243,7 @@ def get_file_content_at_ref(token: str, path: str, ref: str) -> str | None:
     url = f"https://api.github.com/repos/{REPO}/contents/{path}"
     headers = gh_headers(token)
     headers["Accept"] = "application/vnd.github.raw"
-    resp = requests.get(url, headers=headers, params={"ref": ref})
+    resp = gh_get(url, headers=headers, params={"ref": ref})
     if resp.status_code == 200:
         return resp.text
     return None
@@ -1104,6 +1256,7 @@ def extract_error_lines(
     job_id: int,
     failed_step_names: set[str] | None = None,
     max_errors_per_step: int = 10,
+    repo: str = REPO,
 ) -> list[dict]:
     """Extract errors from failed steps using structural signals.
 
@@ -1157,7 +1310,7 @@ def extract_error_lines(
                 step_errors.append({
                     "step_name": step_name,
                     "preview": msg[:200],
-                    "url": _step_url(run_id, job_id, step_num, line_idx),
+                    "url": _step_url(run_id, job_id, step_num, line_idx, repo),
                     "line_number": line_idx + 1,
                     "source": "annotation",
                 })
@@ -1167,7 +1320,7 @@ def extract_error_lines(
                 step_errors.append({
                     "step_name": step_name,
                     "preview": clean[:200],
-                    "url": _step_url(run_id, job_id, step_num, line_idx),
+                    "url": _step_url(run_id, job_id, step_num, line_idx, repo),
                     "line_number": line_idx + 1,
                     "source": "exception",
                 })
@@ -1179,7 +1332,7 @@ def extract_error_lines(
                     step_errors.append({
                         "step_name": step_name,
                         "preview": clean[:200],
-                        "url": _step_url(run_id, job_id, step_num, line_idx),
+                        "url": _step_url(run_id, job_id, step_num, line_idx, repo),
                         "line_number": line_idx + 1,
                         "source": "tail",
                     })
@@ -1191,9 +1344,9 @@ def extract_error_lines(
 
 
 def _step_url(
-    run_id: int, job_id: int, step_num: int | None, line_idx: int,
+    run_id: int, job_id: int, step_num: int | None, line_idx: int, repo: str = REPO,
 ) -> str:
-    base = f"https://github.com/{REPO}/actions/runs/{run_id}/job/{job_id}"
+    base = f"https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}"
     if step_num is not None:
         return f"{base}#step:{step_num}:{line_idx + 1}"
     return base
@@ -1369,14 +1522,14 @@ def build_artifact_context_excerpt(
 
 
 # ---------------------------------------------------------------------------
-# Prompt template loading from CLAUDE.md
+# Agent instructions (agent/) and API-mode prompt templates
 # ---------------------------------------------------------------------------
 
-def _find_claude_md() -> Path | None:
-    """Locate the CLAUDE.md file (checks multiple candidate paths)."""
+def _find_agent_file(name: str) -> Path | None:
+    """Locate ``agent/<name>`` in the bot repo (checks multiple candidate roots)."""
     candidates = [
-        Path(__file__).resolve().parent.parent / "agent" / "CLAUDE.md",
-        Path("/tmp/bot/agent/CLAUDE.md"),
+        Path(__file__).resolve().parent.parent / "agent" / name,
+        Path("/tmp/bot/agent") / name,
     ]
     for p in candidates:
         if p.exists():
@@ -1384,18 +1537,131 @@ def _find_claude_md() -> Path | None:
     return None
 
 
+@dataclass(frozen=True)
+class AgentTask:
+    doc: str          # methodology file under agent/tasks/
+    model: str = ""   # "" = the runner's default (ANTHROPIC_MODEL)
+    effort: str = ""  # --effort level; "" = the CLI's default
+    # Model and effort are fixed: AGENT_MODEL_<TASK> cannot change them, and a
+    # model the gateway does not serve fails the task (ModelUnavailable)
+    # instead of falling back to the default model.
+    pinned: bool = False
+    # The only tools the agent may use (--allowedTools); every other tool call
+    # is denied. Empty: every tool, without prompts.
+    tools: tuple[str, ...] = ()
+    # False: no GitHub token of any kind in the agent's environment.
+    github_token: bool = True
+
+
+# The autofix agent edits its own worktree and runs tests, linters and
+# read-only git; the reviewer only reads.
+AUTOFIX_TOOLS = (
+    "Read", "Grep", "Glob", "Edit", "Write",
+    "Bash(python -m pytest:*)", "Bash(python3 -m pytest:*)", "Bash(pytest:*)",
+    "Bash(python -m py_compile:*)", "Bash(pre-commit:*)",
+    "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)",
+    "Bash(git blame:*)", "Bash(git grep:*)",
+)
+AUTOFIX_REVIEW_TOOLS = (
+    "Read", "Grep", "Glob",
+    "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git blame:*)",
+)
+# Fixed by the user (2026-11-09) for both autofix tasks: never overridden, never downgraded.
+AUTOFIX_MODEL = "Claude-Opus-5.5[1m]"
+
+# Every agent task, keyed by the prompt's ``Task:`` line. All use the runner's
+# default model (ANTHROPIC_MODEL); give one its own with ``model=`` here, or
+# AGENT_MODEL_<TASK> (e.g. AGENT_MODEL_FAILURE_TRACKER_DATA=sonnet), unless
+# the task is ``pinned``.
+AGENT_TASKS: dict[str, AgentTask] = {
+    "Job Failure Analysis": AgentTask("job-failure-analysis.md"),
+    "Cross-Job Summary": AgentTask("cross-job-summary.md"),
+    "Cross-Run Pattern Analysis": AgentTask("cross-run-pattern-analysis.md"),
+    "Daily Cross-Workflow Summary": AgentTask("daily-cross-workflow-summary.md"),
+    "Failure Tracker Data": AgentTask("failure-tracker-data.md"),
+    "SGLang AMD CI Staging Candidates": AgentTask("staging-candidates.md"),
+    "PR CI Status Check": AgentTask("pr-ci-status-check.md"),
+    "PR Code Review": AgentTask("pr-code-review.md"),
+    "CI Autofix": AgentTask(
+        "ci-autofix.md", model=AUTOFIX_MODEL, effort="max", pinned=True,
+        tools=AUTOFIX_TOOLS, github_token=False,
+    ),
+    "CI Autofix Review": AgentTask(
+        "ci-autofix-review.md", model=AUTOFIX_MODEL, effort="max", pinned=True,
+        tools=AUTOFIX_REVIEW_TOOLS, github_token=False,
+    ),
+}
+
+
+class ModelUnavailable(RuntimeError):
+    """A pinned task's model was not served, or the session used another model."""
+
+
+_MODEL_ALIASES = ("opus", "sonnet", "haiku")
+# The gateway's answer for a model name it has no deployment of, e.g.
+# 'API Error: 400 Deployment of "Claude-Sonnet-4.7" for "..." is not found!'
+_MODEL_UNAVAILABLE_RE = re.compile(
+    r"API Error: 40[04].*(?:Deployment of .* not found|model.*(?:not found|not_found|does not exist))",
+    re.IGNORECASE,
+)
+
+
+def task_name(prompt: str) -> str:
+    """The task named by the prompt's first line (``Task: <name>``)."""
+    first = prompt.split("\n", 1)[0]
+    return first.removeprefix("Task:").strip() if first.startswith("Task:") else ""
+
+
+def agent_instructions(task: str) -> str:
+    """Shared rules (agent/ground-rules.md) followed by the task's methodology."""
+    spec = AGENT_TASKS.get(task)
+    if spec is None:
+        raise RuntimeError(f"Unknown agent task {task!r}; add it to AGENT_TASKS")
+    parts = []
+    for name in ("ground-rules.md", f"tasks/{spec.doc}"):
+        path = _find_agent_file(name)
+        if path is None:
+            raise RuntimeError(f"agent/{name} not found")
+        parts.append(path.read_text().strip())
+    return "\n\n---\n\n".join(parts) + "\n"
+
+
+def task_model(task: str) -> str | None:
+    """The ``--model`` value for *task*, or None for the runner's default.
+
+    Through the LLM gateway an alias only works when the runner maps it
+    (ANTHROPIC_DEFAULT_<ALIAS>_MODEL); an unmapped alias would name a model
+    the gateway does not serve, so the task keeps the default instead.
+    """
+    spec = AGENT_TASKS.get(task)
+    if spec and spec.pinned:
+        return spec.model
+    slug = re.sub(r"[^A-Z0-9]+", "_", task.upper()).strip("_")
+    model = os.environ.get(f"AGENT_MODEL_{slug}") or (spec.model if spec else "")
+    if not model:
+        return None
+    if (model in _MODEL_ALIASES and os.environ.get("ANTHROPIC_BASE_URL")
+            and not os.environ.get(f"ANTHROPIC_DEFAULT_{model.upper()}_MODEL")):
+        logging.getLogger("claude-agent").warning(
+            "%s: model alias %r is not mapped on this runner; using the default model",
+            task, model,
+        )
+        return None
+    return model
+
+
 _TEMPLATE_HEADING_RE = re.compile(r"^### ([a-z][a-z0-9-]+)$", re.MULTILINE)
 
 
 def load_prompt_template(section_name: str) -> str | None:
-    """Load a prompt template from CLAUDE.md by section heading.
+    """Load a prompt template from agent/api-prompts.md by section heading.
 
     Looks for ``### <section_name>`` (kebab-case) under ``## API Mode Prompts``
     and returns the text up to the next kebab-case ``### `` heading or
     section end.  Content headings like ``### Failure Summary`` (Title Case)
     inside the template are preserved.
     """
-    path = _find_claude_md()
+    path = _find_agent_file("api-prompts.md")
     if path is None:
         return None
 
@@ -1426,6 +1692,7 @@ def analyze_job_with_agent(
     workflow_file: str = "", head_sha: str = "",
     event_filter: str = "",
     github_token: str | None = None,
+    run_jobs: list[dict] | None = None,
 ) -> dict:
     """Invoke Claude Code agent to fully analyze a CI failure.
 
@@ -1433,7 +1700,10 @@ def analyze_job_with_agent(
     GitHub API (using ``$GH_PAT`` from the environment), parsing errors,
     reading sglang source code, checking git history, and producing a
     root-cause analysis.  Investigation methodology is defined in
-    ``CLAUDE.md`` which Claude Code reads automatically.
+    ``agent/tasks/job-failure-analysis.md``, appended to the system prompt.
+
+    *run_jobs* (the failed jobs of the same run) only matter when this job's
+    runner was lost: the other lost jobs are listed for the agent.
     """
     job_name = job["name"]
     job_id = job["id"]
@@ -1444,8 +1714,9 @@ def analyze_job_with_agent(
         if s.get("conclusion") not in ("success", "skipped", None)
     }
 
+    repo, _ = workflow_repo(workflow_file)
     artifact_lines = ""
-    if _is_mi355x_disagg_workflow(workflow_file):
+    if workflow_file in RUN_ARTIFACT_PREFIXES:
         run_id = _run_id_from_url(run_url)
         if run_id is not None:
             artifact_token = (
@@ -1454,16 +1725,16 @@ def analyze_job_with_agent(
                 or os.environ.get("BOT_PAT")
                 or os.environ.get("GITHUB_TOKEN")
             )
-            artifact_root = prepare_mi355x_artifact_context(
-                artifact_token, run_id, repo_path,
+            artifact_root = prepare_run_artifact_context(
+                artifact_token, run_id, repo_path, workflow_file,
             )
             manifest = (
                 f"{artifact_root.relative_to(repo_path)}/MANIFEST.md"
                 if artifact_root is not None else "unavailable"
             )
             artifact_lines = (
-                f"Artifact API URL: https://api.github.com/repos/{REPO}/actions/runs/{run_id}/artifacts\n"
-                f"Artifact name prefix: {MI355X_ARTIFACT_PREFIX}\n"
+                f"Artifact API URL: https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts\n"
+                f"Artifact name prefix: {RUN_ARTIFACT_PREFIXES[workflow_file]}\n"
                 f"Artifact context: {manifest}\n"
             )
     elif is_miles_workflow(workflow_file):
@@ -1496,7 +1767,15 @@ def analyze_job_with_agent(
             f"sglang source: {sglang_src}\n"
         )
 
+    repo_line = f"Repo: {repo}\n" if repo != REPO else ""
     event_line = f"Event filter: {event_filter}\n" if event_filter else ""
+    runner_lost_lines = ""
+    if is_runner_lost(job):
+        token = github_token or os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
+        runner_lost_lines = (
+            "Runner lost: yes\n"
+            f"{runner_lost_evidence(token, job, run_jobs)}\n"
+        )
     prompt = (
         f"Task: Job Failure Analysis\n"
         f"Job: {job_name}\n"
@@ -1504,8 +1783,10 @@ def analyze_job_with_agent(
         f"Job ID: {job_id}\n"
         f"Commit SHA: {head_sha}\n"
         f"Workflow file: {workflow_file}\n"
+        f"{repo_line}"
         f"{event_line}"
-        f"Log URL: https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs\n"
+        f"Log URL: https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs\n"
+        f"{runner_lost_lines}"
         f"{artifact_lines}"
         f"Source: current directory\n"
         f"GitHub API token: $GH_PAT"
@@ -1539,6 +1820,7 @@ def analyze_job_api(
     run_url: str,
     head_sha: str = "",
     workflow_file: str = "",
+    run_jobs: list[dict] | None = None,
 ) -> dict:
     """Download logs, extract errors, and run focused API analysis for one job."""
     _log = logging.getLogger("ci-monitor")
@@ -1552,17 +1834,24 @@ def analyze_job_api(
         if s.get("conclusion") not in ("success", "skipped", None)
     }
 
+    repo, _ = workflow_repo(workflow_file)
     _log.info("  [%s] Downloading logs...", job_name)
-    raw_log = download_job_logs(token, job_id)
+    raw_log = download_job_logs(token, job_id, repo)
     _log.info("  [%s] Log: %s chars", job_name, f"{len(raw_log):,}")
 
     all_errors = extract_error_lines(
-        raw_log, job.get("steps", []), run_id, job_id,
+        raw_log, job.get("steps", []), run_id, job_id, repo=repo,
     )
     error_lines = [e for e in all_errors if e["source"] != "tail"]
     _log.info("  [%s] Extracted %d error signal(s)", job_name, len(error_lines))
 
     filtered_log = prefilter_large_step_log(raw_log)
+    if is_runner_lost(job):
+        _log.info("  [%s] Runner lost mid-job", job_name)
+        filtered_log = (
+            "## Runner lost\n"
+            f"{runner_lost_evidence(token, job, run_jobs)}\n\n{filtered_log}"
+        )
     if len(filtered_log) < len(raw_log):
         _log.info(
             "  [%s] Pre-filtered log: %s -> %s chars",
@@ -1572,7 +1861,7 @@ def analyze_job_api(
     if _is_mi355x_disagg_workflow(workflow_file):
         _log.info("  [%s] Downloading MI355X run artifacts...", job_name)
         with tempfile.TemporaryDirectory(prefix="mi355x-artifacts-") as tmp:
-            artifact_root = prepare_mi355x_artifact_context(token, run_id, Path(tmp))
+            artifact_root = prepare_run_artifact_context(token, run_id, Path(tmp))
             if artifact_root is not None:
                 artifact_excerpt = build_artifact_context_excerpt(artifact_root)
                 if artifact_excerpt:
@@ -1612,7 +1901,7 @@ def focused_job_analysis(
 ) -> str:
     """Analyze a failed CI job using pre-extracted errors and pre-filtered logs.
 
-    Prompt template is loaded from CLAUDE.md ``### focused-job-analysis``.
+    Prompt template is loaded from agent/api-prompts.md ``### focused-job-analysis``.
     """
     if error_lines:
         errors_section = "\n".join(
@@ -1696,9 +1985,12 @@ def cross_job_analysis(
         if not work_dir.exists():
             raise FileNotFoundError(f"Repo not found at {work_dir}")
 
+        repo, _ = workflow_repo(workflow_name)
+        repo_line = f"Repo: {repo}\n" if repo != REPO else ""
         prompt = (
             f"Task: Cross-Job Summary\n"
             f"Workflow: {workflow_name}\n"
+            f"{repo_line}"
             f"Number of failed jobs: {len(job_analyses)}\n"
             f"Per-job analyses: .ci-context/per-job-analyses.md\n"
             f"Source: current directory\n"
@@ -1776,13 +2068,13 @@ def agent_failure_notice(what: str, reason: object) -> str:
     )
 
 
-def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
+def create_agent_worktree(tag: str, head_sha: str = "", source: Path | None = None) -> Path:
     """Create an isolated git worktree for a parallel agent.
 
-    Requires the main repo at ``SGLANG_REPO_PATH`` to exist (call
-    ``ensure_sglang_repo()`` first).  Each worktree lives at
-    ``/workspace/sglang-wt-{tag}`` and is a cheap copy that shares
-    the git object store with the main repo.
+    Requires the main repo at *source* (default ``SGLANG_REPO_PATH``) to
+    exist (call ``ensure_sglang_repo()`` or ``ensure_source_repo()`` first).
+    Each worktree lives at ``/workspace/<source name>-wt-{tag}`` and is a
+    cheap copy that shares the git object store with the main repo.
 
     If *head_sha* is provided, the worktree is checked out to that
     commit so the agent sees the exact code that was tested in CI.
@@ -1790,29 +2082,30 @@ def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
     Returns the worktree path.  Call ``remove_agent_worktree()`` to
     clean up when done.
     """
+    source = source or SGLANG_REPO_PATH
     safe_tag = re.sub(r"[^\w\-]", "_", str(tag))
-    wt_path = AGENT_WORKSPACE / f"sglang-wt-{safe_tag}"
+    wt_path = AGENT_WORKSPACE / f"{source.name}-wt-{safe_tag}"
     branch_name = f"wt-{safe_tag}"
 
     if wt_path.exists():
         _agent_log.info("Removing stale worktree %s", wt_path)
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(wt_path)],
-            cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
+            cwd=source, capture_output=True, timeout=30,
         )
         if wt_path.exists():
             shutil.rmtree(wt_path)
 
     subprocess.run(
         ["git", "branch", "-D", branch_name],
-        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=10,
+        cwd=source, capture_output=True, timeout=10,
     )
 
     start_point = head_sha if head_sha else "HEAD"
     _agent_log.info("Creating worktree %s (at %s)", wt_path, start_point[:12])
     result = subprocess.run(
         ["git", "worktree", "add", "-b", branch_name, str(wt_path), start_point],
-        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=60,
+        cwd=source, capture_output=True, timeout=60,
     )
     if result.returncode != 0:
         if head_sha:
@@ -1821,26 +2114,27 @@ def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
             )
             result = subprocess.run(
                 ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
-                cwd=SGLANG_REPO_PATH, capture_output=True, timeout=60,
+                cwd=source, capture_output=True, timeout=60,
             )
         if result.returncode != 0:
             raise RuntimeError(
                 f"git worktree add failed: {result.stderr.decode(errors='replace')}"
             )
 
-    _deploy_claude_md(wt_path)
+    _remove_deployed_claude_md(wt_path)
     _agent_log.info("Worktree ready at %s", wt_path)
     return wt_path
 
 
-def remove_agent_worktree(wt_path: Path):
-    """Remove a worktree created by ``create_agent_worktree()``."""
+def remove_agent_worktree(wt_path: Path, source: Path | None = None):
+    """Remove a worktree created by ``create_agent_worktree()`` from *source*."""
     if not wt_path.exists():
         return
+    source = source or SGLANG_REPO_PATH
     _agent_log.info("Removing worktree %s", wt_path)
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(wt_path)],
-        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
+        cwd=source, capture_output=True, timeout=30,
     )
     if wt_path.exists():
         shutil.rmtree(wt_path, ignore_errors=True)
@@ -1919,7 +2213,17 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
                 ["git", "checkout", "FETCH_HEAD", "--force"],
                 cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
             )
-    else:
+        # Seen on runner-7: HEAD stopped resolving ("invalid reference: HEAD"),
+        # so every worktree failed. A fresh clone is cheap; a broken one stays broken.
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            cwd=SGLANG_REPO_PATH, capture_output=True, text=True, timeout=30,
+        )
+        if head.returncode != 0:
+            _agent_log.warning("sglang repo at %s has no valid HEAD; cloning it again", SGLANG_REPO_PATH)
+            shutil.rmtree(SGLANG_REPO_PATH)
+
+    if not (SGLANG_REPO_PATH / ".git").exists():
         if SGLANG_REPO_PATH.exists():
             shutil.rmtree(SGLANG_REPO_PATH)
         _agent_log.info("Cloning sglang repo to %s...", SGLANG_REPO_PATH)
@@ -1939,34 +2243,69 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
                 cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
             )
 
-    _deploy_claude_md()
+    _remove_deployed_claude_md()
     _agent_log.info("sglang repo ready at %s", SGLANG_REPO_PATH)
     return SGLANG_REPO_PATH
 
 
-def _deploy_claude_md(target_dir: Path | None = None):
-    """Copy agent/CLAUDE.md to the workspace (or a specific directory).
+_source_repo_lock = threading.Lock()
 
-    Checks multiple possible locations for the bot repo source tree
-    (GitHub Actions checkout, daemon clone at /tmp/bot, relative to
-    this script).  Always overwrites so the latest version is used.
+
+def ensure_source_repo(repo: str) -> Path:
+    """The clone the agents read for a workflow of *repo*.
+
+    sglang's is ``ensure_sglang_repo()``, radixark/miles' the one the Miles
+    workflows already use (``ensure_miles_repo()``). Another repo (see
+    ``workflow_repo()``) gets a full clone at ``/workspace/<owner>__<name>``,
+    fetched on every call, so a worktree can be made at any commit of a run.
     """
-    candidates = [
-        Path(__file__).resolve().parent.parent / "agent" / "CLAUDE.md",
-        Path("/tmp/bot/agent/CLAUDE.md"),
-    ]
-    dest_parent = target_dir.parent if target_dir else AGENT_WORKSPACE
-    for src in candidates:
-        if src.exists():
-            dst = dest_parent / "CLAUDE.md"
-            shutil.copy2(src, dst)
-            _agent_log.info("Deployed CLAUDE.md to %s", dst)
-            return
-    _agent_log.warning("agent/CLAUDE.md not found, skipping deployment")
+    if repo == REPO:
+        return ensure_sglang_repo()
+    if repo == MILES_REPO:
+        path = ensure_miles_repo()
+        if path is None:
+            raise RuntimeError(f"Could not prepare the {MILES_REPO} clone")
+        return path
+    path = AGENT_WORKSPACE / repo.replace("/", "__")
+    with _source_repo_lock:
+        if (path / ".git").exists():
+            subprocess.run(["git", "worktree", "prune"], cwd=path, capture_output=True, timeout=30)
+            subprocess.run(["git", "fetch", "origin", "--prune"], cwd=path,
+                           capture_output=True, timeout=300)
+        else:
+            if path.exists():
+                shutil.rmtree(path)
+            AGENT_WORKSPACE.mkdir(parents=True, exist_ok=True)
+            _agent_log.info("Cloning %s to %s...", repo, path)
+            subprocess.run(["git", "clone", f"https://github.com/{repo}.git", str(path)],
+                           capture_output=True, timeout=600, check=True)
+    return path
+
+
+def _remove_deployed_claude_md(target_dir: Path | None = None):
+    """Delete a CLAUDE.md an older bot version copied above the worktrees.
+
+    The agent's instructions now arrive through ``--append-system-prompt``
+    (see ``agent_instructions()``); a stale full copy left in the workspace
+    would be loaded alongside them.
+    """
+    stale = (target_dir.parent if target_dir else AGENT_WORKSPACE) / "CLAUDE.md"
+    if stale.exists():
+        stale.unlink()
+        _agent_log.info("Removed stale %s", stale)
 
 
 _SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_CUSTOM_HEADERS", "GH_PAT", "GH_TOKEN",
-               "GITHUB_TOKEN", "AGENT_GH_TOKEN", "LLM_GATEWAY_KEY", "BOT_PAT")
+               "GITHUB_TOKEN", "AGENT_GH_TOKEN", "LLM_GATEWAY_KEY", "BOT_PAT", "AUTOFIX_TOKEN")
+# Every GitHub (and Notion) token a workflow may export; a task with
+# ``github_token=False`` gets none of them.
+_TOKEN_ENV = ("GH_PAT", "GH_TOKEN", "GITHUB_TOKEN", "AGENT_GH_TOKEN", "BOT_PAT", "AUTOFIX_TOKEN",
+              "RUNNER_STATUS_TOKEN", "SGLANG_CI_TOKEN", "NOTION_TOKEN")
+
+
+def env_without_tokens() -> dict:
+    """This process's environment minus every GitHub and Notion token and the LLM gateway key."""
+    return {k: v for k, v in os.environ.items() if k not in (*_TOKEN_ENV, "LLM_GATEWAY_KEY")}
 _TOKEN_RE = re.compile(r"\b(ghp_|gho_|ghs_|github_pat_|sk-)[A-Za-z0-9_\-]{16,}")
 
 
@@ -1993,7 +2332,9 @@ def _archive_agent_session(work_dir: Path, started_at: float, prompt: str) -> No
         return
     try:
         task = prompt.split("\n", 1)[0].removeprefix("Task:").strip() or "agent"
-        dest = Path(archive_root) / f"{time.strftime('%Y%m%d-%H%M%S')}-{_safe_name(task)}"
+        # Parallel agents (review verifiers) can finish in the same second.
+        stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(3).hex()}"
+        dest = Path(archive_root) / f"{stamp}-{_safe_name(task)}"
         dest.mkdir(parents=True, exist_ok=True)
         (dest / "prompt.txt").write_text(redact_secrets(prompt))
         cwd = str(work_dir.resolve())
@@ -2073,6 +2414,35 @@ def _recover_text_from_session_log(
         return last_text
 
     return None
+
+
+def _session_models(work_dir: Path, started_at: float) -> set[str]:
+    """Models named by the assistant turns of the sessions started in *work_dir* since *started_at*."""
+    cwd = str(work_dir.resolve())
+    projects = Path.home() / ".claude" / "projects"
+    models: set[str] = set()
+    for project in {projects / cwd.replace("/", "-"), projects / re.sub(r"[^A-Za-z0-9]", "-", cwd)}:
+        for session in project.glob("*.jsonl"):
+            if session.stat().st_mtime < started_at - 5:
+                continue
+            for line in session.read_text(errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                msg = entry.get("message") if entry.get("type") == "assistant" else None
+                model = msg.get("model") if isinstance(msg, dict) else None
+                # Claude Code writes "<synthetic>" for messages it makes up itself.
+                if model and model != "<synthetic>":
+                    models.add(model)
+    return models
+
+
+def model_matches(expected: str, used: str) -> bool:
+    """``Claude-Opus-5.5[1m]`` matches ``Claude-Opus-5.5`` and ``claude-opus-5-5-2026…``."""
+    def norm(name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", re.sub(r"\[.*?\]", "", name.lower()))
+    return bool(norm(expected)) and norm(used).startswith(norm(expected))
 
 
 # Files that set the environment AMD PR CI tests actually run with. PR CI pulls
@@ -2236,25 +2606,39 @@ def claude_code_analyze(
     *work_dir* so the agent can read them, runs ``claude -p``, and
     returns the text output.
 
+    The prompt's ``Task:`` line picks the instructions (``agent/ground-rules.md``
+    plus that task's file under ``agent/tasks/``), which are appended to the
+    system prompt, and the model (``task_model()``). Only user-level settings
+    are loaded: the working directory is an sglang checkout, often a PR's,
+    whose ``.claude/`` (settings, hooks, rules) anyone can write.
+
     If *output_must_contain* is set and the agent's final stdout does
     not contain that substring, scan the session log for the last
     assistant message that does — this catches the failure mode where
     the agent writes the canonical report and then overwrites it with
     a short reply like "already delivered above".
 
-    Raises ``RuntimeError`` on failure so callers can fall back to
-    the single-shot API approach.
+    A ``pinned`` task (``AgentTask``) runs only on its own model: an unserved
+    model, or a session log that shows another model, raises
+    ``ModelUnavailable``, and a timeout returns nothing.
+
+    Raises ``RuntimeError`` on failure, including an unknown task.
     """
+    task = task_name(prompt)
+    instructions = agent_instructions(task)
+    model = task_model(task)
+    spec = AGENT_TASKS[task]
+
     context_dir = work_dir / ".ci-context"
     context_dir.mkdir(parents=True, exist_ok=True)
 
     # The agent reads PR content written by anyone; when a read-only token is
     # configured, it replaces the bot's posting token in the agent's env.
-    env = dict(os.environ)
-    if env.get("AGENT_GH_TOKEN"):
+    env = dict(os.environ) if spec.github_token else env_without_tokens()
+    if spec.github_token and env.get("AGENT_GH_TOKEN"):
         env["GH_PAT"] = env["GH_TOKEN"] = env["AGENT_GH_TOKEN"]
         env.pop("GITHUB_TOKEN", None)
-    for name in ("BOT_PAT", "LLM_GATEWAY_KEY"):
+    for name in ("BOT_PAT", "LLM_GATEWAY_KEY", "AUTOFIX_TOKEN"):
         env.pop(name, None)
 
     started_at = time.time()
@@ -2263,38 +2647,79 @@ def claude_code_analyze(
         if context_files:
             for filename, content in context_files.items():
                 p = context_dir / filename
+                p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(content)
                 written.append(p)
 
         cmd = [
             "claude", "-p", prompt,
+            "--append-system-prompt", instructions,
+            "--setting-sources", "user",
             "--output-format", "text",
             "--max-turns", str(max_turns),
-            "--dangerously-skip-permissions",
             # The sglang checkout ships developer skills (e.g. ones that push
             # fixes or rerun CI); none of the bot's tasks use skills.
             "--disable-slash-commands",
         ]
+        if spec.tools:
+            # dontAsk denies every tool call the allowlist does not cover; --restricted keeps
+            # the file tools inside the working directory (no ~/.claude, no shared clone's .git).
+            cmd += ["--restricted", "--tools", ",".join(dict.fromkeys(t.split("(")[0] for t in spec.tools)),
+                    "--permission-mode", "dontAsk", "--allowedTools", *spec.tools]
+        else:
+            cmd.append("--dangerously-skip-permissions")
+        if model:
+            cmd += ["--model", model]
+        if spec.effort:
+            cmd += ["--effort", spec.effort]
 
         _agent_log.info(
-            "Running Claude Code (max_turns=%d, timeout=%ds, cwd=%s)...",
-            max_turns, timeout_secs, work_dir,
+            "Running Claude Code (task=%s, model=%s, effort=%s, max_turns=%d, timeout=%ds, cwd=%s)...",
+            task, model or "default", spec.effort or "default", max_turns, timeout_secs, work_dir,
         )
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(work_dir),
-            timeout=timeout_secs,
-            stdin=subprocess.DEVNULL,
-            env=env,
-        )
+        def run_cli() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(work_dir),
+                timeout=timeout_secs,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+
+        result = run_cli()
+        if (model and result.returncode != 0
+                and _MODEL_UNAVAILABLE_RE.search(f"{result.stdout}\n{result.stderr}")):
+            if spec.pinned:
+                raise ModelUnavailable(
+                    f"{task}: model {model!r} is not served by the gateway: "
+                    + " ".join((result.stdout or result.stderr).split())[:200]
+                )
+            # A task model the gateway does not serve (e.g. a stale
+            # ANTHROPIC_DEFAULT_SONNET_MODEL) must not fail the task.
+            _agent_log.warning(
+                "%s: model %r is not served by the gateway (%s); retrying with the default model",
+                task, model, " ".join((result.stdout or result.stderr).split())[:200],
+            )
+            i = cmd.index("--model")
+            del cmd[i:i + 2]
+            result = run_cli()
 
         _agent_log.info(
             "Claude Code exit=%d, stdout=%d chars, stderr=%d chars",
             result.returncode, len(result.stdout or ""), len(result.stderr or ""),
         )
+        if spec.pinned and result.returncode == 0:
+            base = re.sub(r"\[.*?\]", "", model).lower()
+            expected = (os.environ.get(f"ANTHROPIC_DEFAULT_{base.upper()}_MODEL", model)
+                        if base in _MODEL_ALIASES else model)
+            used = _session_models(work_dir, started_at)
+            if not used or not all(model_matches(expected, m) for m in used):
+                raise ModelUnavailable(
+                    f"{task}: expected {expected}, the session log shows {sorted(used) or 'no model'}"
+                )
         if result.returncode == 0 and result.stdout.strip():
             text = result.stdout.strip()
             if output_must_contain and output_must_contain not in text:
@@ -2328,7 +2753,7 @@ def claude_code_analyze(
         )
 
     except subprocess.TimeoutExpired:
-        recovered = _recover_text_from_session_log(work_dir)
+        recovered = None if spec.pinned else _recover_text_from_session_log(work_dir)
         if recovered:
             _agent_log.info(
                 "Claude Code timed out after %ds; recovered %d chars from session log",
@@ -2348,6 +2773,12 @@ def claude_code_analyze(
         _archive_agent_session(work_dir, started_at, prompt)
         for p in written:
             p.unlink(missing_ok=True)
+        subdirs = {d for p in written for d in p.parents if context_dir in d.parents}
+        for d in sorted(subdirs, key=lambda d: len(d.parts), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
         try:
             context_dir.rmdir()
         except OSError:

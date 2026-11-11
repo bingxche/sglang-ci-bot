@@ -26,7 +26,7 @@ On each invocation:
     the legacy summary comment for issues that pre-date the body-pinning
     move) for trend / NEW-cluster detection.
   - Run the agent (``Task: Daily Cross-Workflow Summary``) which reads the
-    methodology in ``agent/CLAUDE.md`` and produces a Markdown report.
+    methodology in ``agent/tasks/daily-cross-workflow-summary.md`` and produces a Markdown report.
   - PATCH the issue body, replacing the content between the placeholder
     markers (matching the legacy ``ci-monitor-daily-status-board`` markers
     too, so older issues migrate in place). If the markers are missing,
@@ -36,7 +36,7 @@ On each invocation:
 
 Output methodology (cluster IDs, confidence labels, no-priority rule,
 in-flight-fix lookup, completed-runs-only filter) lives entirely in
-``agent/CLAUDE.md`` under ``## Daily Cross-Workflow Summary``.
+``agent/tasks/daily-cross-workflow-summary.md``.
 This script is a data-only harness.
 """
 
@@ -258,7 +258,7 @@ def build_agent_prompt(
 ) -> str:
     """Compose the data-only prompt for ``Task: Daily Cross-Workflow Summary``.
 
-    Methodology and output format live in ``agent/CLAUDE.md``. This prompt
+    Methodology and output format live in ``agent/tasks/daily-cross-workflow-summary.md``. This prompt
     only routes the task and points to the context files written into
     ``.ci-context/`` by ``claude_code_analyze``.
     """
@@ -336,7 +336,7 @@ def run_api(
     """
     template = load_prompt_template("daily-cross-workflow-summary")
     if not template:
-        log.error("daily-cross-workflow-summary template not found in CLAUDE.md")
+        log.error("daily-cross-workflow-summary template not found in agent/api-prompts.md")
         return None
 
     prompt = template.format(
@@ -388,6 +388,7 @@ _JOB_LINK_RE = re.compile(r"/actions/runs/\d+/job/(\d+)")
 # `R25`, but not the model names `DeepSeek-R1` or `R1-MXFP4`.
 _CLUSTER_ID_RE = re.compile(r"(?<![\w-])R\d+(?![\w-])")
 _MD_LINK_TARGET_RE = re.compile(r"\]\([^)]*\)")
+_HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->")
 _HOW_GENERATED_RE = re.compile(r"^##\s+How this report is generated", re.MULTILINE)
 
 
@@ -427,6 +428,18 @@ def split_job_cluster_block(report: str) -> tuple[str, dict[int, list[str]] | No
     return stripped, by_job
 
 
+def _cluster_ids(text: str) -> list[str]:
+    """Cluster IDs on one line: the hidden ``<!-- R386 -->`` ones when present.
+
+    The plain-language summary names problems in words, so visible text
+    can hold a model name such as ``R1`` that is not a cluster.
+    """
+    hidden = _HTML_COMMENT_RE.findall(text)
+    if hidden:
+        return _CLUSTER_ID_RE.findall(" ".join(hidden))
+    return _CLUSTER_ID_RE.findall(_MD_LINK_TARGET_RE.sub("]", text))
+
+
 def job_clusters_from_markdown(report: str) -> dict[int, list[str]]:
     """Best-effort job -> cluster map read from the report's own tables.
 
@@ -441,7 +454,7 @@ def job_clusters_from_markdown(report: str) -> dict[int, list[str]]:
     for line in report.splitlines():
         stripped = line.strip()
         if stripped.startswith("### "):
-            section_ids = _CLUSTER_ID_RE.findall(_MD_LINK_TARGET_RE.sub("]", stripped))
+            section_ids = _cluster_ids(stripped)
             continue
         if stripped.startswith(("## ", "# ", "<details")):
             section_ids = []
@@ -451,7 +464,7 @@ def job_clusters_from_markdown(report: str) -> dict[int, list[str]]:
             continue
         ids = section_ids
         if stripped.startswith("|"):
-            ids = _CLUSTER_ID_RE.findall(_MD_LINK_TARGET_RE.sub("]", stripped)) or section_ids
+            ids = _cluster_ids(stripped) or section_ids
         for job_id in job_ids:
             entry = by_job.setdefault(int(job_id), [])
             entry.extend(i for i in dict.fromkeys(ids) if i not in entry)

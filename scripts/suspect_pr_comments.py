@@ -9,13 +9,25 @@ run once per tick by the ``finalize`` job, reads that copy and decides in
 code whether each suspect is solid enough to tell the PR's author:
 
   - confidence is ``FACT`` or ``HIGH``
-  - no fix PR is linked for the cluster
-  - the cluster has at least ``MIN_FAILED_JOBS`` failed jobs
+  - the cluster has at least ``MIN_FAILED_JOBS`` failed jobs of sglang's own
+    workflows (a job of another repo's, such as sgl-amd-mono's, does not count)
   - the PR is merged, within ``MAX_PR_AGE_DAYS``, and the cited commit is
     the PR's
   - the commit lies between the last passing and the first failing commit
     the agent cited (checked with the compare API)
-  - the PR has no comment from an earlier tick for the same cluster
+  - the PR has no suspect-PR comment yet, for any cluster: cluster IDs are
+    reassigned from day to day, so a per-cluster check would comment on the
+    same break again under its new ID
+
+The comment ``@``-mentions the PR's author and cc's the people who worked
+on the PR with them: who merged it, its co-authors and its reviewers (bots
+dropped, at most ``MAX_CC``), so the break reaches someone even when the
+author is away.
+
+When the cluster has a fix PR, the comment instead asks the author to
+review it, once per fix PR, even on a PR that already had a suspect
+comment. That needs the fix PR to be open and by someone else; a merged
+fix skips the suspect, and one closed without merging is treated as no fix.
 
 Modes (``--mode`` / ``SUSPECT_PR_COMMENTS``):
 
@@ -47,7 +59,7 @@ from daily_cross_workflow_summary import (
     parse_suspect_prs_comment,
 )
 from monitor_ci import find_daily_issue, get_issue_comments
-from utils import REPO, get_issue, gh_headers, post_comment, update_comment
+from utils import REPO, get_issue, gh_get, gh_headers, post_comment, update_comment
 
 log = logging.getLogger("suspect-prs")
 
@@ -58,14 +70,30 @@ MIN_FAILED_JOBS = 2
 MAX_PR_AGE_DAYS = 14
 MAX_POSTS_PER_RUN = 3
 MAX_JOBS_LISTED = 8
+# People cc'd on a suspect comment besides the author.
+MAX_CC = 6
+# Reviews that mean the person read the change (not PENDING or DISMISSED).
+_REVIEW_STATES = ("APPROVED", "CHANGES_REQUESTED", "COMMENTED")
 
 LOG_COMMENT_MARKER = "<!-- ci-monitor-suspect-pr-log -->"
 _PR_MARKER = "<!-- amd-bot-suspect-pr:{cluster} -->"
+_PR_MARKER_RE = re.compile(r"<!-- amd-bot-suspect-pr:(R\d+) -->")
+# On a comment that asks the suspect PR's author to review an open fix PR.
+_FIX_MARKER = "<!-- amd-bot-suspect-fix:{fix_pr} -->"
 _MENTION_RE = re.compile(r"(?<![\w`])@([A-Za-z0-9][\w-]*(?:/[\w.-]+)?)")
+# A co-author trailer with a GitHub noreply address, the only kind that names a login.
+_COAUTHOR_RE = re.compile(
+    r"^co-authored-by:[^<\n]*<(?:\d+\+)?([A-Za-z0-9][\w-]*)@users\.noreply\.github\.com>",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def pr_marker(cluster: str) -> str:
     return _PR_MARKER.format(cluster=cluster)
+
+
+def fix_marker(fix_pr: int) -> str:
+    return _FIX_MARKER.format(fix_pr=fix_pr)
 
 
 def _pr_url(pr: int) -> str:
@@ -91,7 +119,7 @@ class GitHub:
         self._comments: dict[int, list[dict]] = {}
 
     def _get(self, path: str) -> dict | list | None:
-        resp = requests.get(
+        resp = gh_get(
             f"https://api.github.com/repos/{REPO}/{path}", headers=gh_headers(self.token),
         )
         if resp.status_code in (404, 422):
@@ -118,6 +146,19 @@ class GitHub:
             self._comments[pr] = get_issue_comments(self.token, REPO, pr)
         return self._comments[pr]
 
+    def pr_commits(self, pr: int) -> list[dict]:
+        return self._get(f"pulls/{pr}/commits?per_page=100") or []
+
+    def pr_reviews(self, pr: int) -> list[dict]:
+        return self._get(f"pulls/{pr}/reviews?per_page=100") or []
+
+    def user_type(self, login: str) -> str:
+        resp = gh_get(f"https://api.github.com/users/{login}", headers=gh_headers(self.token))
+        if resp.status_code == 404:
+            return ""
+        resp.raise_for_status()
+        return resp.json().get("type", "")
+
 
 # ---------------------------------------------------------------------------
 # Decision
@@ -132,12 +173,93 @@ class Decision:
     full_sha: str = ""
     comment_url: str = ""
     body: str = field(default="", repr=False)
+    # Set when the comment asks the PR's author to review an open fix PR.
+    fix: dict | None = None
+    pr_author: str = ""
+    # Others who worked on the PR, cc'd: [(login, ["merged", "reviewed"]), ...].
+    cc: list[tuple[str, list[str]]] = field(default_factory=list)
+
+
+def _person(user: dict | None) -> str:
+    """The login of a person, or "" for a bot or no account."""
+    user = user or {}
+    login = user.get("login") or ""
+    if user.get("type", "User") != "User" or login.endswith("[bot]"):
+        return ""
+    return login
+
+
+def pr_people(pr: int, pull: dict, author: str, gh: GitHub) -> list[tuple[str, list[str]]]:
+    """Who worked on the PR besides its author, with their roles: who merged
+    it, then co-authors, then reviewers. Bots are dropped; at most ``MAX_CC``."""
+    roles: dict[str, tuple[str, list[str]]] = {}  # lowercased login -> (login, roles)
+
+    def add(login: str, role: str) -> None:
+        if not login or login.lower() == author.lower():
+            return
+        _, rs = roles.setdefault(login.lower(), (login, []))
+        if role not in rs:
+            rs.append(role)
+
+    add(_person(pull.get("merged_by")), "merged")
+    trailers: list[str] = []
+    for c in gh.pr_commits(pr):
+        add(_person(c.get("author")), "co-author")
+        trailers += _COAUTHOR_RE.findall((c.get("commit") or {}).get("message") or "")
+    for login in dict.fromkeys(trailers):
+        # A trailer carries no account type, and AI tools (Copilot, …) sign with one.
+        if login.lower() in roles or gh.user_type(login) == "User":
+            add(login, "co-author")
+    for r in gh.pr_reviews(pr):
+        if r.get("state") in _REVIEW_STATES:
+            add(_person(r.get("user")), "reviewed")
+    return list(roles.values())[:MAX_CC]
+
+
+_AUTOFIX_DATA_RE = re.compile(r'<!-- amd-bot-autofix-data:v1 \{.*?"fix_kind":"([\w-]+)"')
+
+
+def is_autofix_workaround(pull: dict) -> bool:
+    """A draft PR from ci-autofix (``autofix.py``) that works around the failure instead of fixing its cause.
+    Its hidden data block says so (``fix_kind``); edited prose or labels do not change it."""
+    m = _AUTOFIX_DATA_RE.search(pull.get("body") or "")
+    return bool(m) and m.group(1) == "workaround"
+
+
+def check_fix(fix_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:
+    """``(fix, "")`` when the fix PR is open and worth a review request,
+    ``(None, "")`` when it is gone (closed unmerged: comment as if there were
+    no fix), or ``(None, reason)`` to skip the suspect."""
+    pull = gh.pull(fix_pr)
+    if not pull:
+        return None, f"fix PR #{fix_pr} not found"
+    if pull.get("merged_at"):
+        return None, f"fix PR #{fix_pr} already merged"
+    if pull.get("state") != "open":
+        return None, ""
+    if is_autofix_workaround(pull):
+        # The bot's own workaround does not fix this PR's change; the author is told as if there were no fix.
+        return None, ""
+    fix_author = (pull.get("user") or {}).get("login", "")
+    if fix_author.lower() == author.lower():
+        return None, f"fix PR #{fix_pr} is by the PR's author"
+    return {"number": fix_pr, "title": pull.get("title", ""), "author": fix_author}, ""
+
+
+def _run_repo(run_url: str) -> str:
+    """The repo of a run URL, or "" when it is not one."""
+    m = re.match(r"https://github\.com/([^/]+/[^/]+)/actions/runs/", run_url or "")
+    return m.group(1) if m else ""
 
 
 def check_suspect(
     suspect: dict, jobs: list[int], gh: GitHub, now: datetime,
+    job_info: dict[int, dict] | None = None,
 ) -> Decision:
-    """Run every check on one suspect; the first failure is the reason."""
+    """Run every check on one suspect; the first failure is the reason.
+
+    *job_info* (job ID -> analysis) tells which jobs ran in another repo.
+    """
     d = Decision(suspect, jobs)
 
     def skip(reason: str) -> Decision:
@@ -147,10 +269,15 @@ def check_suspect(
     s = suspect
     if s["confidence"] not in POSTABLE_CONFIDENCE:
         return skip(f"confidence {s['confidence']} (needs FACT or HIGH)")
-    if s.get("fix_pr"):
-        return skip(f"fix PR #{s['fix_pr']} already linked")
-    if len(jobs) < MIN_FAILED_JOBS:
-        return skip(f"{len(jobs)} failed job(s) in {s['cluster']} (needs {MIN_FAILED_JOBS})")
+    # A job not in job_info counts as sglang's, as before other repos were monitored.
+    repos = [_run_repo((job_info or {}).get(j, {}).get("run_url", "")) or REPO for j in jobs]
+    if repos.count(REPO) < MIN_FAILED_JOBS:
+        others = sorted(set(repos) - {REPO})
+        where = f"; the others are from {', '.join(others)}" if others else ""
+        return skip(
+            f"{repos.count(REPO)} failed sglang job(s) in {s['cluster']} "
+            f"(needs {MIN_FAILED_JOBS}){where}"
+        )
     if not s.get("last_pass_sha") or not s.get("first_fail_sha"):
         return skip("no last-passing / first-failing commit given")
 
@@ -179,12 +306,30 @@ def check_suspect(
             f"and first failing {s['first_fail_sha'][:8]}"
         )
 
-    marker = pr_marker(s["cluster"])
-    for c in gh.pr_comments(s["pr"]):
-        if marker in (c.get("body") or ""):
-            d.result, d.reason, d.comment_url = "already", "already commented", c.get("html_url", "")
-            return d
+    d.pr_author = _person(pull.get("user"))
+    if s.get("fix_pr"):
+        d.fix, reason = check_fix(s["fix_pr"], d.pr_author, gh)
+        if reason:
+            return skip(reason)
 
+    if d.fix:
+        # One review request per fix PR, even after an earlier suspect comment.
+        marker = fix_marker(d.fix["number"])
+        for c in gh.pr_comments(s["pr"]):
+            if marker in (c.get("body") or ""):
+                d.result, d.comment_url = "already", c.get("html_url", "")
+                d.reason = f"asked to review #{d.fix['number']}"
+                return d
+    else:
+        for c in gh.pr_comments(s["pr"]):
+            m = _PR_MARKER_RE.search(c.get("body") or "")
+            if m:
+                d.result, d.comment_url = "already", c.get("html_url", "")
+                if m.group(1) != s["cluster"]:
+                    d.reason = f"commented earlier as {m.group(1)}"
+                return d
+
+    d.cc = pr_people(s["pr"], pull, d.pr_author, gh)
     d.result = "post"
     return d
 
@@ -196,11 +341,24 @@ def check_suspect(
 def render_pr_comment(d: Decision, job_info: dict[int, dict]) -> str:
     """The comment posted on the suspect PR."""
     s = d.suspect
-    lines = [
-        pr_marker(s["cluster"]),
-        "AMD CI jobs started failing after this PR was merged, and the evidence points at this change.",
-        "",
-    ]
+    # The deliberate mentions: the author, and cc the others who worked on the PR.
+    ping = f"@{d.pr_author} " if d.pr_author else ""
+    if d.fix:
+        lines = [
+            fix_marker(d.fix["number"]),
+            f"{ping}AMD CI jobs started failing after this PR was merged, and "
+            f"#{d.fix['number']} proposes a fix. Could you review it?",
+            "",
+        ]
+    else:
+        lines = [
+            pr_marker(s["cluster"]),
+            f"{ping}AMD CI jobs started failing after this PR was merged, and the evidence "
+            "points at this change.",
+            "",
+        ]
+    if d.cc:
+        lines += ["cc " + ", ".join(f"@{login} ({', '.join(roles)})" for login, roles in d.cc), ""]
     if s.get("evidence"):
         lines += [neutralize_mentions(s["evidence"]), ""]
     window = (
@@ -227,12 +385,22 @@ def render_pr_comment(d: Decision, job_info: dict[int, dict]) -> str:
         lines.append(f"- [{name}]({url})")
     if len(d.jobs) > len(listed):
         lines.append(f"- …and {len(d.jobs) - len(listed)} more")
+    if d.fix:
+        closing = (
+            "If this PR isn't the cause, please say so here so the attribution can be corrected."
+        )
+    else:
+        closing = (
+            "If this PR is the cause, a fix or a revert would turn these jobs green again. "
+            "If it isn't, please say so here so the attribution can be corrected."
+        )
     lines += [
         "",
-        "If this PR is the cause, a fix or a revert would turn these jobs green again. "
-        "If it isn't, please say so here so the attribution can be corrected.",
+        closing,
         "",
-        f"<sub>Posted automatically by the AMD CI monitor. Confidence: {s['confidence']}.</sub>",
+        # Says amd-bot even while another account's token does the posting.
+        f"<sub>Posted automatically by [amd-bot](https://github.com/amd-bot), the AMD CI monitor. "
+        f"Confidence: {s['confidence']}.</sub>",
     ]
     return "\n".join(lines)
 
@@ -273,6 +441,10 @@ def render_log_comment(decisions: list[Decision], mode: str, snapshot_utc: str) 
     for d in decisions:
         s = d.suspect
         result = _RESULT_TEXT.get(d.result, f"skipped: {d.reason}")
+        if d.result == "already" and d.reason:
+            result += f" ({d.reason})"
+        elif d.fix and d.result in ("post", "posted", "held"):
+            result += f" (review request for #{d.fix['number']})"
         if d.comment_url:
             result = f"[{result}]({d.comment_url})"
         lines.append(
@@ -314,7 +486,7 @@ def decide_all(
         seen.add(key)
         jobs = sorted(clusters.get(s["cluster"]) or [])
         try:
-            d = check_suspect(s, jobs, gh, now)
+            d = check_suspect(s, jobs, gh, now, job_info)
         except requests.RequestException as exc:
             d = Decision(s, jobs, result="skip", reason=f"GitHub API error ({exc.__class__.__name__})")
         if d.result == "post":
@@ -324,6 +496,16 @@ def decide_all(
     decisions.sort(key=lambda d: (
         d.result != "post", rank.get(d.suspect["confidence"], 9), -len(d.jobs),
     ))
+    # Two clusters naming the same PR in one tick: only the strongest is posted.
+    posting: dict[int, str] = {}
+    for d in decisions:
+        if d.result != "post":
+            continue
+        pr = d.suspect["pr"]
+        if pr in posting:
+            d.result, d.reason, d.body = "skip", f"#{pr} gets one comment, for {posting[pr]}", ""
+        else:
+            posting[pr] = d.suspect["cluster"]
     return decisions
 
 

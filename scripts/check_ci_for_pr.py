@@ -588,7 +588,7 @@ def _check_ci_with_agent(
     as_of: str | None = None,
     out_dir: Path | None = None,
 ) -> str:
-    """Let the agent check PR CI status (methodology defined in CLAUDE.md).
+    """Let the agent check PR CI status (methodology in agent/tasks/pr-ci-status-check.md).
 
     The harness first collects the evidence pack and checks out the commit CI
     tested; afterwards it checks the agent's verdicts against that pack.

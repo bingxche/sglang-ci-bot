@@ -46,6 +46,9 @@ env:
     nightly-test-amd-miles-rocm10.yml
     nightly-test-amd-miles-rocm10-mi30x.yml
     amd-aiter-scout.yml
+    sgl-project/sgl-amd-mono/nightly-amd.yml
+    sgl-project/sgl-amd-mono/pr-test-amd.yml
+    radixark/miles/pr-test-rocm.yml
 
 jobs:
   prepare:
@@ -175,6 +178,15 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           BOT_REPO: ${{ github.repository }}
         run: python scripts/order_daily_comments.py
+
+      # Writes only the daily issue; must not hold back the trackers either.
+      - name: Check runner health
+        continue-on-error: true
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RUNNER_STATUS_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+          BOT_REPO: ${{ github.repository }}
+        run: python scripts/runner_health.py --output daily-issue
 
       # dry-run unless the SUSPECT_PR_COMMENTS repository variable is "post".
       - name: Comment on suspect PRs

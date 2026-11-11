@@ -1,0 +1,139 @@
+name: CI Autofix
+
+# After every CI-monitor tick: fix AMD scheduled-CI failures on sglang main,
+# re-run the failing job on the fix's branch, and open a draft PR when it passes.
+# The repository variable AUTOFIX_MODE (off | live) switches it; off does nothing.
+#
+# Two jobs, so no write token is ever in a job that runs an agent: code an agent
+# runs can read its parent processes' environment.
+#   fix:     agents and code gates; a read-only token; writes nothing to GitHub.
+#   publish: no agents; pushes, dispatches, opens draft PRs, writes the daily issue.
+on:
+  workflow_run:
+    workflows: [Cron CI Monitor]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      smoke_problem:
+        description: 'Smoke test (E3): problem ID (R…) to fix end to end without opening a PR. Empty = a normal tick.'
+        required: false
+        default: ''
+      smoke_date:
+        description: 'Smoke test: date (YYYY-MM-DD) of the daily report holding the problem'
+        required: false
+        default: ''
+      smoke_base:
+        description: 'Smoke test: sglang commit to build the fix on (before the human fix)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ci-autofix
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.smoke_problem != '') || vars.AUTOFIX_MODE == 'live'
+    runs-on: [self-hosted, amd-internal]
+    # Effort-max agents, the started problems in parallel.
+    timeout-minutes: 600
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pre-commit pytest
+
+      - name: Fix
+        env:
+          # Read-only when AGENT_GH_TOKEN is set; never AUTOFIX_TOKEN (autofix.py refuses it here).
+          GH_PAT: ${{ secrets.AGENT_GH_TOKEN || secrets.GH_PAT }}
+          AUTOFIX_MODE: ${{ vars.AUTOFIX_MODE || 'off' }}
+          AUTOFIX_MAX_PER_HOUR: ${{ vars.AUTOFIX_MAX_PER_HOUR || '3' }}
+          AGENT_ARCHIVE_DIR: ${{ runner.temp }}/agent-sessions
+          # The smoke test builds a clone that ends at an old commit: never in the runner's shared /workspace.
+          AGENT_WORKSPACE: ${{ github.event.inputs.smoke_problem != '' && format('{0}/autofix-smoke', runner.temp) || '/workspace' }}
+          SMOKE_PROBLEM: ${{ github.event.inputs.smoke_problem }}
+          SMOKE_DATE: ${{ github.event.inputs.smoke_date }}
+          SMOKE_BASE: ${{ github.event.inputs.smoke_base }}
+        run: |
+          ARGS=(fix --bot-repo "${{ github.repository }}" --handoff autofix-handoff)
+          if [ -n "$SMOKE_PROBLEM" ]; then
+            ARGS+=(--smoke-problem "$SMOKE_PROBLEM" --smoke-date "$SMOKE_DATE" --smoke-base "$SMOKE_BASE")
+          fi
+          python scripts/autofix.py "${ARGS[@]}"
+
+      - name: Hand over to publish
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autofix-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: autofix-handoff
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Upload agent sessions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autofix-agent-sessions-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/agent-sessions
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    needs: fix
+    # Also after a failed fix job: dispatched runs still need checking.
+    if: always() && ((github.event_name == 'workflow_dispatch' && github.event.inputs.smoke_problem != '') || vars.AUTOFIX_MODE == 'live')
+    runs-on: [self-hosted, amd-internal]
+    # The smoke test waits here for its GPU run.
+    timeout-minutes: 1440
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch the fix job's state and patches
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: autofix-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: autofix-handoff
+
+      - name: Publish
+        env:
+          BOT_GH_PAT: ${{ secrets.GH_PAT }}
+          # Optional. Unset, autofix writes with the PAT the runner containers already carry as
+          # GH_PAT (bingxche's, from runner/setup.sh --pat); autofix_github.push_branch() refuses
+          # any other account.
+          AUTOFIX_TOKEN: ${{ secrets.AUTOFIX_TOKEN }}
+          AUTOFIX_MODE: ${{ vars.AUTOFIX_MODE || 'off' }}
+          AUTOFIX_MAX_PER_HOUR: ${{ vars.AUTOFIX_MAX_PER_HOUR || '3' }}
+          SMOKE_PROBLEM: ${{ github.event.inputs.smoke_problem }}
+        run: |
+          export AUTOFIX_TOKEN="${AUTOFIX_TOKEN:-$GH_PAT}" GH_PAT="$BOT_GH_PAT"
+          ARGS=(publish --bot-repo "${{ github.repository }}" --handoff autofix-handoff)
+          if [ -n "$SMOKE_PROBLEM" ]; then
+            ARGS+=(--smoke-problem "$SMOKE_PROBLEM" --smoke-out autofix-smoke)
+          fi
+          python scripts/autofix.py "${ARGS[@]}"
+
+      - name: Upload smoke test output
+        if: always() && (github.event_name == 'workflow_dispatch' && github.event.inputs.smoke_problem != '')
+        uses: actions/upload-artifact@v4
+        with:
+          name: autofix-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: autofix-smoke
+          if-no-files-found: ignore
+          retention-days: 14

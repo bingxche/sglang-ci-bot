@@ -1,8 +1,0 @@
----
-description: Always update README.md when making any code or feature changes
-alwaysApply: true
----
-
-# README update rule
-
-See `AGENTS.md` in the repo root for the full rules. Key point: every code change must include a README.md update in the same commit.

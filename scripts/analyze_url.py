@@ -38,6 +38,7 @@ from utils import (
     get_failed_jobs,
     gh_headers,
     is_gate_job,
+    is_runner_lost,
     post_comment,
     remove_agent_worktree,
     update_issue_body,
@@ -174,9 +175,13 @@ def run_analysis(
         job = get_job(token, single_job_id)
         jobs = [job]
         title = f"[Analyze] {job['name']} (job {single_job_id})"
+        # Only a lost runner needs its neighbours: they show whether the host
+        # went down for everyone or this job took its own runner down.
+        run_jobs = get_failed_jobs(token, run_id) if is_runner_lost(job) else None
     else:
         log.info("Fetching failed jobs for run %d...", run_id)
         all_failed = get_failed_jobs(token, run_id)
+        run_jobs = all_failed
         gate_jobs = [j for j in all_failed if is_gate_job(j)]
         for gj in gate_jobs:
             log.info("  Skipping gate job: %s", gj["name"])
@@ -256,6 +261,7 @@ def run_analysis(
                         head_sha=head_sha,
                         event_filter=run.get("event", ""),
                         github_token=token,
+                        run_jobs=run_jobs,
                     ): job
                     for job in jobs
                 }
@@ -292,6 +298,7 @@ def run_analysis(
                 executor.submit(
                     analyze_job_api, client, token, job, run_url,
                     head_sha=head_sha, workflow_file=workflow_name,
+                    run_jobs=run_jobs,
                 ): job
                 for job in jobs
             }
