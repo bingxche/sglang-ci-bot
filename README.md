@@ -226,10 +226,10 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
    1. **Find the failed jobs** ([`get_workflow_runs()`](scripts/monitor_ci.py)). A job is analysed as soon as it fails, without waiting for the rest of its run.
       - **Which runs are looked at.** Every unfinished run (in progress, queued, waiting, pending) up to 72 h old (`MAX_RUN_AGE_HOURS`), because AMD runs often last 20–40 h while MI35x jobs queue for a day. Also the failed runs that *finished* in the last 24 h, at most 5; this cap never drops an unfinished run.
       - **Which failed jobs count.** Only those that ended in the last 24 h. A long run's earlier failures were analysed by earlier ticks, while the run was still in view.
-      - **Event filter.** Most workflows count scheduled runs only; AMD AITER Scout also counts manual runs ([`workflow_event_filter()`](scripts/monitor_ci.py)).
+      - **Event filter.** Most workflows count scheduled runs only; AMD AITER Scout also counts manual runs ([`workflow_event_filter()`](scripts/monitor_ci.py)). A per-PR workflow (`PER_PR_WORKFLOWS`, sgl-amd-mono's PR test) has no scheduled runs, so it counts every event and branch ([`workflow_branch_filter()`](scripts/monitor_ci.py)) and gets no Cross-Run Pattern Analysis.
       - **Skipped.** Gate and finish jobs ([`is_gate_job()`](scripts/utils.py)), and jobs already in `processed_job_ids`.
    2. **Analyse each new failed job.** Each gets a Job Failure Analysis agent at the run's commit, 3 in parallel. Some workflows get extra context:
-      - `nightly-amd-mi355x-disagg.yml` and sgl-amd-mono's nightly: the run's evidence artifacts are downloaded (`RUN_ARTIFACT_PREFIXES`, [`prepare_run_artifact_context()`](scripts/utils.py)).
+      - `nightly-amd-mi355x-disagg.yml` and sgl-amd-mono's nightly and PR test: the run's evidence artifacts are downloaded (`RUN_ARTIFACT_PREFIXES`, [`prepare_run_artifact_context()`](scripts/utils.py)).
       - Miles workflows: the worktree is moved to the image's sglang commit, radixark/miles is added, and dashboard evidence is written ([`prepare_miles_context()`](scripts/utils.py)).
       - Jobs whose runner was lost: the facts are passed instead of a missing log ([`is_runner_lost()`](scripts/utils.py)).
       - A job already analysed on an earlier day is copied over, not analysed again.
@@ -548,9 +548,10 @@ nightly-test-amd-miles-rocm10.yml
 nightly-test-amd-miles-rocm10-mi30x.yml
 amd-aiter-scout.yml
 sgl-project/sgl-amd-mono/nightly-amd.yml
+sgl-project/sgl-amd-mono/pr-test-amd.yml
 ```
 
-The same list is `DEFAULT_WORKFLOWS` in [`ci-monitor.yml`](.github/workflows/ci-monitor.yml). Upstream runs ROCm 10, 7.2.4 and 7.2 as matrix legs inside `pr-test-amd.yml` and `nightly-test-amd.yml`. `amd-ci-job-monitor.yml` (housekeeping) and the tag-only `release-docker-amd.yml` are not monitored. Of sgl-amd-mono, only the scheduled nightly is; its `pr-test-amd.yml` runs per PR, on a label.
+The same list is `DEFAULT_WORKFLOWS` in [`ci-monitor.yml`](.github/workflows/ci-monitor.yml). Upstream runs ROCm 10, 7.2.4 and 7.2 as matrix legs inside `pr-test-amd.yml` and `nightly-test-amd.yml`. `amd-ci-job-monitor.yml` (housekeeping) and the tag-only `release-docker-amd.yml` are not monitored. sgl-amd-mono's `pr-test-amd.yml` has no scheduled runs: it runs once per PR, on a label or by hand, so all its runs count (`PER_PR_WORKFLOWS`).
 
 ### Command lines
 

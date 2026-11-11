@@ -61,6 +61,7 @@ MI355X_ARTIFACT_PREFIX = "mi355x-"
 MI355X_ARTIFACT_CONTEXT_MAX_CHARS = 120_000
 
 MONO_NIGHTLY_WORKFLOW = "sgl-project/sgl-amd-mono/nightly-amd.yml"
+MONO_PR_TEST_WORKFLOW = "sgl-project/sgl-amd-mono/pr-test-amd.yml"
 
 # Workflows whose evidence is in run artifacts rather than the job log, and
 # the prefix of those artifacts' names. They are downloaded for the agent
@@ -72,6 +73,7 @@ RUN_ARTIFACT_PREFIXES = {
     # pinned contract, server, evals, benchmarks). The failing job is often
     # ``report``, whose own log only has the exit code.
     MONO_NIGHTLY_WORKFLOW: "mono-ci-",
+    MONO_PR_TEST_WORKFLOW: "mono-ci-",
 }
 
 # Miles (radixark/miles) RL-training workflows. Their runs are on sglang main,

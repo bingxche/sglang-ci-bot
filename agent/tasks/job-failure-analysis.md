@@ -63,7 +63,7 @@ prefill/decode/router failure signal at the artifact-log level. Do not mark a
 historical run "passed for this failure" merely because its GitHub job page log
 does not contain the server-side error.
 
-### sgl-amd-mono nightly (REQUIRED for `sgl-project/sgl-amd-mono/nightly-amd.yml`)
+### sgl-amd-mono nightly and PR test (REQUIRED for `sgl-project/sgl-amd-mono/nightly-amd.yml` and `.../pr-test-amd.yml`)
 
 This workflow runs in [sgl-project/sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono)
 (the prompt's `Repo:` line; see the Ground Rules): the current directory is
@@ -91,6 +91,17 @@ the commit under test. For other failures, check both sides: sgl-amd-mono
 commits since the last passing run (`git log` here), and SGLang commits between
 the last passing and the failing run's image (`sglang` in `result.json`),
 through the sglang compare API. Look up in-flight fixes in both repos.
+
+**PR test (`pr-test-amd.yml`).** One run per PR, started by the `run-ci` /
+`run-ci-extra` label or by hand; jobs are `test (<model>, <tier>)`. The run's
+commit (the prompt's `Commit SHA` and the current directory) is the base
+branch, not the PR: the `plan` job's log names the PR (`PR #<n> head <sha>,
+base <ref> at <sha>`), and `result.json` has `pr_sha` and `base_sha`. Read the
+PR's change through the API (`/repos/<repo>/pulls/<n>/files`, or `compare/
+<base_sha>...<pr_sha>`). A test that also fails on the base (the latest
+nightly, or `base_tests` in `result.json` when present) is not the PR's doing;
+say so, and name it as pre-existing. History is the PR's earlier PR-test runs
+and the nightly, not other PRs' runs.
 
 Do not name the cluster node (`node` in `result.json`, hostnames in the logs);
 write "the CI node".

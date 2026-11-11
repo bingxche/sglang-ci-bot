@@ -83,6 +83,8 @@ MONITORED_WORKFLOWS = [
     # sgl-amd-mono's nightly: the repo at the run's commit, tested on the
     # newest SGLang ROCm image.
     "sgl-project/sgl-amd-mono/nightly-amd.yml",
+    # sgl-amd-mono's PR test: one run per PR (PER_PR_WORKFLOWS).
+    "sgl-project/sgl-amd-mono/pr-test-amd.yml",
 ]
 
 # Order of the jobs within a workflow's report: first by the ROCm version in
@@ -108,19 +110,30 @@ JOB_REPORT_ORDER = {
 # are release-scout signals and belong in the CI monitor.
 UNFILTERED_EVENT_WORKFLOWS = {"amd-aiter-scout.yml"}
 
+# Workflows with no scheduled runs: each run tests one PR, started by a label
+# (pull_request_target) or by hand, so every event and branch counts. Their
+# runs test different code, so they get no cross-run pattern summary.
+PER_PR_WORKFLOWS = {"sgl-project/sgl-amd-mono/pr-test-amd.yml"}
+
 # Workflows that publish a cross-run pattern summary. This is independent of
 # event filtering: AITER Scout includes manual runs but still needs history.
-CROSS_RUN_SUMMARY_WORKFLOWS = set(MONITORED_WORKFLOWS)
+CROSS_RUN_SUMMARY_WORKFLOWS = set(MONITORED_WORKFLOWS) - PER_PR_WORKFLOWS
 
 
 def workflow_event_filter(workflow_file: str) -> str | None:
     """Return the GitHub Actions event filter for a monitored workflow."""
-    if workflow_file in UNFILTERED_EVENT_WORKFLOWS:
+    if workflow_file in UNFILTERED_EVENT_WORKFLOWS | PER_PR_WORKFLOWS:
         return None
     return "schedule"
 
 
-SUCCESS_CONCLUSIONS = {"success"}
+def workflow_branch_filter(workflow_file: str, branch: str) -> str | None:
+    """The branch a monitored workflow's runs are read from (None: any)."""
+    return None if workflow_file in PER_PR_WORKFLOWS else branch
+
+
+# A skipped run (a label that does not start the PR test) has no failed job.
+SUCCESS_CONCLUSIONS = {"success", "skipped"}
 UNFINISHED_RUN_STATUSES = ("in_progress", "queued", "waiting", "requested", "pending")
 # AMD runs often last 20-40 h (MI35x jobs queue for a day; pr-test-amd 40503413710
 # took 41 h), so a run stays in view while unfinished, up to this age.
@@ -238,7 +251,7 @@ def get_workflow_runs(
     workflow_file: str,
     hours_back: int = 24,
     max_runs: int = 5,
-    branch: str = "main",
+    branch: str | None = "main",
     event: str | None = None,
 ) -> list[dict]:
     """The runs whose failed jobs may need analysing, unfinished runs first.
@@ -257,10 +270,11 @@ def get_workflow_runs(
     repo, file = workflow_repo(workflow_file)
     url = f"https://api.github.com/repos/{repo}/actions/workflows/{file}/runs"
     base_params = {
-        "branch": branch,
         "per_page": 100,
         "created": f">={created_since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
     }
+    if branch:
+        base_params["branch"] = branch
     if event:
         base_params["event"] = event
 
@@ -1738,7 +1752,7 @@ def run_oneshot(
                 processed_job_ids=processed_job_ids,
                 reusable_job_analyses=reusable_job_analyses,
                 job_name_filter=job_name_filter,
-                branch=branch,
+                branch=workflow_branch_filter(wf, branch),
                 use_agent=use_agent,
                 agent_repo_path=source_path,
                 event=workflow_event_filter(wf),

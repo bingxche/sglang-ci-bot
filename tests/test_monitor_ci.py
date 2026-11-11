@@ -379,6 +379,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
             "nightly-test-amd-miles-rocm10-mi30x.yml",
             "amd-aiter-scout.yml",
             "sgl-project/sgl-amd-mono/nightly-amd.yml",
+            "sgl-project/sgl-amd-mono/pr-test-amd.yml",
         ]
         self.assertEqual(monitor_ci.MONITORED_WORKFLOWS, expected)
         self.assertEqual(matrix_defaults, expected)
@@ -987,6 +988,31 @@ class OtherRepoWorkflowTests(unittest.TestCase):
             utils.analyze_job_with_agent(job, "https://github.com/sgl-project/sglang/actions/runs/2",
                                          Path("/tmp/wt"), "pr-test-amd.yml")
         self.assertNotIn("Repo:", agent.call_args.kwargs["prompt"])
+
+    def test_per_pr_workflow_reads_every_event_and_branch(self):
+        pr_test = "sgl-project/sgl-amd-mono/pr-test-amd.yml"
+        self.assertIsNone(monitor_ci.workflow_event_filter(pr_test))
+        self.assertIsNone(monitor_ci.workflow_branch_filter(pr_test, "main"))
+        self.assertNotIn(pr_test, monitor_ci.CROSS_RUN_SUMMARY_WORKFLOWS)
+        self.assertEqual(monitor_ci.workflow_event_filter(MONO), "schedule")
+        self.assertEqual(monitor_ci.workflow_branch_filter(MONO, "main"), "main")
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        completed = [
+            {"id": 1, "status": "completed", "conclusion": "skipped", "updated_at": now},
+            {"id": 2, "status": "completed", "conclusion": "failure", "updated_at": now},
+        ]
+        params = []
+
+        def fake_get(url, **kwargs):
+            params.append(kwargs["params"])
+            runs = completed if kwargs["params"]["status"] == "completed" else []
+            return Mock(status_code=200, json=Mock(return_value={"workflow_runs": runs}))
+
+        with patch("utils.requests.get", side_effect=fake_get):
+            runs = monitor_ci.get_workflow_runs("token", pr_test, branch=None, event=None)
+        self.assertEqual([r["id"] for r in runs], [2])  # a skipped run has no failed job
+        self.assertTrue(all("branch" not in p and "event" not in p for p in params))
 
     def test_run_oneshot_gives_the_agents_the_workflow_repo(self):
         mono_clone = Path("/workspace/sgl-project__sgl-amd-mono")
