@@ -189,6 +189,18 @@ class CheckSuspectTest(unittest.TestCase):
     def test_single_failed_job_is_skipped(self):
         self.assertIn("needs 2", self.check(jobs=[1]).reason)
 
+    def test_jobs_of_another_repo_do_not_count(self):
+        mono = "https://github.com/sgl-project/sgl-amd-mono/actions/runs/7"
+        sglang = "https://github.com/sgl-project/sglang/actions/runs/8"
+        info = {1: {"run_url": mono}, 2: {"run_url": mono}, 3: {"run_url": sglang}}
+        d = spc.check_suspect(_suspect(), [1, 2, 3], FakeGitHub(), NOW, info)
+        self.assertEqual(d.result, "skip")
+        self.assertIn("1 failed sglang job(s)", d.reason)
+        self.assertIn("the others are from sgl-project/sgl-amd-mono", d.reason)
+        info[4] = {"run_url": sglang}
+        d = spc.check_suspect(_suspect(), [1, 2, 3, 4], FakeGitHub(), NOW, info)
+        self.assertEqual(d.result, "post")
+
     def test_missing_window_is_skipped(self):
         self.assertIn("first-failing", self.check(_suspect(first_fail_sha=None)).reason)
 

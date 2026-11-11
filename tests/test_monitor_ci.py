@@ -158,8 +158,12 @@ class MonitorWorkflowReuseTests(unittest.TestCase):
         self.assertEqual(reusable[101]["run_url"], "https://example.test/old-run")
         analyze.assert_called_once()
         self.assertEqual(analyze.call_args.args[0]["id"], 202)
-        create_worktree.assert_called_once_with(202, head_sha="current-sha")
-        remove_worktree.assert_called_once_with(Path("/tmp/fresh-worktree"))
+        create_worktree.assert_called_once_with(
+            202, head_sha="current-sha", source=Path("/workspace/sglang"),
+        )
+        remove_worktree.assert_called_once_with(
+            Path("/tmp/fresh-worktree"), Path("/workspace/sglang"),
+        )
 
     @patch.object(monitor_ci, "analyze_job_with_agent")
     @patch.object(monitor_ci, "get_failed_jobs")
@@ -341,7 +345,7 @@ class InProgressRunTests(unittest.TestCase):
         self.assertEqual(job_ids, [301])
         analyze.assert_called_once()
         self.assertEqual(analyze.call_args.args[0]["id"], 301)
-        get_pending.assert_called_once_with("token", 9002)
+        get_pending.assert_called_once_with("token", 9002, "sgl-project/sglang")
         self.assertEqual(pending, [{"count": 1, "run_id": 9002}])
 
 
@@ -374,6 +378,8 @@ class WorkflowConfigurationTests(unittest.TestCase):
             "nightly-test-amd-miles-rocm10.yml",
             "nightly-test-amd-miles-rocm10-mi30x.yml",
             "amd-aiter-scout.yml",
+            "sgl-project/sgl-amd-mono/nightly-amd.yml",
+            "sgl-project/sgl-amd-mono/pr-test-amd.yml",
         ]
         self.assertEqual(monitor_ci.MONITORED_WORKFLOWS, expected)
         self.assertEqual(matrix_defaults, expected)
@@ -878,6 +884,152 @@ class StateRetentionTests(unittest.TestCase):
             state = {"daily_comments": {f"2026-10-{d:02d}": {} for d in range(20, 31)}}
             monitor_ci.save_state(state)
         self.assertEqual(sorted(state["daily_comments"]), [f"2026-10-{d}" for d in (27, 28, 29, 30)])
+
+
+MONO = "sgl-project/sgl-amd-mono/nightly-amd.yml"
+
+
+class OtherRepoWorkflowTests(unittest.TestCase):
+    """A workflow of another repo is named ``owner/repo/<file>`` and read there."""
+
+    def test_workflow_repo(self):
+        import utils
+        self.assertEqual(utils.workflow_repo("pr-test-amd.yml"), ("sgl-project/sglang", "pr-test-amd.yml"))
+        self.assertEqual(utils.workflow_repo(MONO), ("sgl-project/sgl-amd-mono", "nightly-amd.yml"))
+        self.assertEqual(
+            utils.job_repo({"url": "https://api.github.com/repos/sgl-project/sgl-amd-mono/actions/jobs/1"}),
+            "sgl-project/sgl-amd-mono",
+        )
+        self.assertEqual(utils.job_repo({}), "sgl-project/sglang")
+
+    def test_monitored_names_are_unique_files_or_repo_paths(self):
+        import utils
+        names = [utils.workflow_repo(wf) for wf in monitor_ci.MONITORED_WORKFLOWS]
+        self.assertEqual(len(set(names)), len(names))
+        for repo, file in names:
+            self.assertRegex(repo, r"^[\w.-]+/[\w.-]+$")
+            self.assertRegex(file, r"^[\w.-]+\.ya?ml$")
+
+    def test_runs_and_jobs_are_read_from_the_workflow_repo(self):
+        now = datetime.now(timezone.utc)
+        run = {"id": 42852364616, "status": "completed", "conclusion": "failure",
+               "html_url": "https://github.com/sgl-project/sgl-amd-mono/actions/runs/42852364616",
+               "head_sha": "b9f40eb", "updated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        job = {"id": 130044473817, "name": "report", "status": "completed", "conclusion": "failure",
+               "completed_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "steps": [{"name": "Report", "conclusion": "failure"}]}
+
+        def fake_get(url, **kwargs):
+            if url.endswith("/runs"):
+                return Mock(status_code=200, json=Mock(return_value={
+                    "workflow_runs": [run] if kwargs["params"]["status"] == "completed" else []}))
+            return _jobs_response([job], total_count=1)
+
+        source = Path("/workspace/sgl-project__sgl-amd-mono")
+        with (
+            patch("utils.requests.get", side_effect=fake_get) as get,
+            patch.object(monitor_ci, "create_agent_worktree", return_value=Path("/tmp/wt")) as create,
+            patch.object(monitor_ci, "analyze_job_with_agent",
+                         side_effect=lambda j, *a, **k: _analysis(j["id"], "analysis")) as analyze,
+            patch.object(monitor_ci, "remove_agent_worktree") as remove,
+        ):
+            _, job_ids, _ = monitor_ci.monitor_workflow(
+                "token", MONO, use_agent=True, agent_repo_path=source, event="schedule",
+            )
+
+        self.assertEqual(job_ids, [130044473817])
+        urls = [c.args[0] for c in get.call_args_list]
+        self.assertTrue(all(u.startswith("https://api.github.com/repos/sgl-project/sgl-amd-mono/") for u in urls))
+        self.assertIn(
+            "https://api.github.com/repos/sgl-project/sgl-amd-mono/actions/workflows/nightly-amd.yml/runs", urls,
+        )
+        create.assert_called_once_with(130044473817, head_sha="b9f40eb", source=source)
+        remove.assert_called_once_with(Path("/tmp/wt"), source)
+        self.assertEqual(analyze.call_args.args[3], MONO)
+
+    def test_report_links_commits_and_runs_in_the_workflow_repo(self):
+        ja = {**_analysis(1, "analysis"), "head_sha": "b9f40eb562f4",
+              "run_url": "https://github.com/sgl-project/sgl-amd-mono/actions/runs/7"}
+        body = "\n".join(monitor_ci.render_workflow_comment_parts(
+            MONO, [ja], pending_info=[{"count": 1, "run_id": 7}],
+        ))
+        self.assertIn(f"## `{MONO}`", body)
+        self.assertIn(
+            "**Commits**: sgl-project/sgl-amd-mono "
+            "[`b9f40eb`](https://github.com/sgl-project/sgl-amd-mono/commit/b9f40eb562f4)", body,
+        )
+        self.assertIn("[run](https://github.com/sgl-project/sgl-amd-mono/actions/runs/7)", body)
+        self.assertNotIn("sgl-project/sglang", body)
+        self.assertEqual(monitor_ci.find_workflow_comment([{"id": 1, "body": body}], MONO)["id"], 1)
+
+    def test_agent_prompt_names_the_repo_and_gets_the_artifacts(self):
+        import utils
+        job = {"id": 130044473817, "name": "report", "steps": [{"name": "Report", "conclusion": "failure"}]}
+        run_url = "https://github.com/sgl-project/sgl-amd-mono/actions/runs/42852364616"
+        wt = Path("/tmp/wt")
+        with (
+            patch.object(utils, "prepare_run_artifact_context",
+                         return_value=wt / ".ci-context" / "mono-ci-artifacts") as artifacts,
+            patch.object(utils, "claude_code_analyze", return_value="report") as agent,
+        ):
+            utils.analyze_job_with_agent(job, run_url, wt, MONO, head_sha="b9f40eb",
+                                         event_filter="schedule", github_token="tok")
+        artifacts.assert_called_once_with("tok", 42852364616, wt, MONO)
+        prompt = agent.call_args.kwargs["prompt"]
+        self.assertIn("Repo: sgl-project/sgl-amd-mono\n", prompt)
+        self.assertIn("Log URL: https://api.github.com/repos/sgl-project/sgl-amd-mono/actions/jobs/130044473817/logs", prompt)
+        self.assertIn("Artifact name prefix: mono-ci-\n", prompt)
+        self.assertIn(f"Artifact context: {Path('.ci-context/mono-ci-artifacts')}/MANIFEST.md", prompt)
+
+    def test_sglang_prompt_has_no_repo_line(self):
+        import utils
+        job = {"id": 1, "name": "j", "steps": []}
+        with patch.object(utils, "claude_code_analyze", return_value="report") as agent:
+            utils.analyze_job_with_agent(job, "https://github.com/sgl-project/sglang/actions/runs/2",
+                                         Path("/tmp/wt"), "pr-test-amd.yml")
+        self.assertNotIn("Repo:", agent.call_args.kwargs["prompt"])
+
+    def test_per_pr_workflow_reads_every_event_and_branch(self):
+        pr_test = "sgl-project/sgl-amd-mono/pr-test-amd.yml"
+        self.assertIsNone(monitor_ci.workflow_event_filter(pr_test))
+        self.assertIsNone(monitor_ci.workflow_branch_filter(pr_test, "main"))
+        self.assertNotIn(pr_test, monitor_ci.CROSS_RUN_SUMMARY_WORKFLOWS)
+        self.assertEqual(monitor_ci.workflow_event_filter(MONO), "schedule")
+        self.assertEqual(monitor_ci.workflow_branch_filter(MONO, "main"), "main")
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        completed = [
+            {"id": 1, "status": "completed", "conclusion": "skipped", "updated_at": now},
+            {"id": 2, "status": "completed", "conclusion": "failure", "updated_at": now},
+        ]
+        params = []
+
+        def fake_get(url, **kwargs):
+            params.append(kwargs["params"])
+            runs = completed if kwargs["params"]["status"] == "completed" else []
+            return Mock(status_code=200, json=Mock(return_value={"workflow_runs": runs}))
+
+        with patch("utils.requests.get", side_effect=fake_get):
+            runs = monitor_ci.get_workflow_runs("token", pr_test, branch=None, event=None)
+        self.assertEqual([r["id"] for r in runs], [2])  # a skipped run has no failed job
+        self.assertTrue(all("branch" not in p and "event" not in p for p in params))
+
+    def test_run_oneshot_gives_the_agents_the_workflow_repo(self):
+        mono_clone = Path("/workspace/sgl-project__sgl-amd-mono")
+        with (
+            patch.object(monitor_ci, "claude_code_available", return_value=True),
+            patch.object(monitor_ci, "ensure_sglang_repo", return_value=Path("/workspace/sglang")),
+            patch.object(monitor_ci, "ensure_source_repo", return_value=mono_clone) as ensure,
+            patch.object(monitor_ci, "load_state", return_value={"daily_comments": {}}),
+            patch.object(monitor_ci, "save_state"),
+            patch.object(monitor_ci, "monitor_workflow", return_value=([], [], [])) as monitor,
+        ):
+            monitor_ci.run_oneshot("token", None, "stdout", ["pr-test-amd.yml", MONO], 24, "main")
+        ensure.assert_called_once_with("sgl-project/sgl-amd-mono")
+        self.assertEqual(
+            [c.kwargs["agent_repo_path"] for c in monitor.call_args_list],
+            [Path("/workspace/sglang"), mono_clone],
+        )
 
 
 class LongRunJobWindowTests(unittest.TestCase):

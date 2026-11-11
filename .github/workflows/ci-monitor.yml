@@ -46,6 +46,8 @@ env:
     nightly-test-amd-miles-rocm10.yml
     nightly-test-amd-miles-rocm10-mi30x.yml
     amd-aiter-scout.yml
+    sgl-project/sgl-amd-mono/nightly-amd.yml
+    sgl-project/sgl-amd-mono/pr-test-amd.yml
 
 jobs:
   prepare:
