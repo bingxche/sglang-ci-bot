@@ -525,12 +525,12 @@ def render_unclustered_section(
             name = _table_cell(ja.get("job_name") or str(ja["job_id"]))
             url = _job_url(ja)
             job = f"[{name}]({url})" if url else name
-            if size + len(row) + len(" · ".join(jobs + [job])) + 3 > max_chars:
+            if size + len(row) + len("<br>".join(jobs + [job])) + 3 > max_chars:
                 break
             jobs.append(job)
         if not jobs:
             break
-        row += " · ".join(jobs) + " |"
+        row += "<br>".join(jobs) + " |"
         lines.append(row)
         size += len(row) + 1
         shown += len(jobs)
