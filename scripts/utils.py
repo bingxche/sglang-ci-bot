@@ -2254,12 +2254,18 @@ _source_repo_lock = threading.Lock()
 def ensure_source_repo(repo: str) -> Path:
     """The clone the agents read for a workflow of *repo*.
 
-    sglang's is ``ensure_sglang_repo()``. Another repo (see
+    sglang's is ``ensure_sglang_repo()``, radixark/miles' the one the Miles
+    workflows already use (``ensure_miles_repo()``). Another repo (see
     ``workflow_repo()``) gets a full clone at ``/workspace/<owner>__<name>``,
     fetched on every call, so a worktree can be made at any commit of a run.
     """
     if repo == REPO:
         return ensure_sglang_repo()
+    if repo == MILES_REPO:
+        path = ensure_miles_repo()
+        if path is None:
+            raise RuntimeError(f"Could not prepare the {MILES_REPO} clone")
+        return path
     path = AGENT_WORKSPACE / repo.replace("/", "__")
     with _source_repo_lock:
         if (path / ".git").exists():

@@ -380,6 +380,7 @@ class WorkflowConfigurationTests(unittest.TestCase):
             "amd-aiter-scout.yml",
             "sgl-project/sgl-amd-mono/nightly-amd.yml",
             "sgl-project/sgl-amd-mono/pr-test-amd.yml",
+            "radixark/miles/pr-test-rocm.yml",
         ]
         self.assertEqual(monitor_ci.MONITORED_WORKFLOWS, expected)
         self.assertEqual(matrix_defaults, expected)
@@ -1013,6 +1014,19 @@ class OtherRepoWorkflowTests(unittest.TestCase):
             runs = monitor_ci.get_workflow_runs("token", pr_test, branch=None, event=None)
         self.assertEqual([r["id"] for r in runs], [2])  # a skipped run has no failed job
         self.assertTrue(all("branch" not in p and "event" not in p for p in params))
+
+    def test_miles_pr_test_reads_the_miles_clone(self):
+        import utils
+        clone = Path("/workspace/miles")
+        with patch.object(utils, "ensure_miles_repo", return_value=clone):
+            self.assertEqual(utils.ensure_source_repo("radixark/miles"), clone)
+        with patch.object(utils, "ensure_miles_repo", return_value=None), \
+                self.assertRaises(RuntimeError):
+            utils.ensure_source_repo("radixark/miles")
+        # Not one of the sglang-side Miles workflows, whose context is the dashboard's.
+        self.assertFalse(utils.is_miles_workflow("radixark/miles/pr-test-rocm.yml"))
+        self.assertEqual(utils.workflow_repo("radixark/miles/pr-test-rocm.yml"),
+                         ("radixark/miles", "pr-test-rocm.yml"))
 
     def test_run_oneshot_gives_the_agents_the_workflow_repo(self):
         mono_clone = Path("/workspace/sgl-project__sgl-amd-mono")
