@@ -187,6 +187,9 @@ class AttachJobClusterMapTests(unittest.TestCase):
         uncapped = summary.render_unclustered_section(unclustered[:6])
         self.assertEqual(uncapped.count("| nightly-test-amd |"), 3)
         self.assertNotIn("more;", uncapped)
+        # Jobs sharing a row sit one per line, not joined with " · ".
+        self.assertIn(f"[nightly-0]({RUN}/job/100)<br>[nightly-3]({RUN}/job/103) |", uncapped)
+        self.assertNotIn(" · [", uncapped)
 
     def test_section_is_dropped_when_body_is_near_the_limit(self):
         big = REPORT + "\n" + "x" * (summary.ISSUE_BODY_SAFE_CHARS - len(REPORT))

@@ -64,19 +64,25 @@ For each problem (sorted: 🆕 new first, then ↩️ back again, then by total 
 - **In-flight fix**: ✅ [#<num>](url) (open since <date>) — <action> | ❌ none found
 - **Suggested triage**: <one or two concrete steps>
 
-| Workflow | Job | Test File | Test Function | Error (one line) | Log |
-|---|---|---|---|---|---|
-| pr-test-amd ([Nov 5 01:11, rocm10](run-url)) | [`stage-b-test-1-gpu-small-amd (rocm10, 2)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/rl/test_lora_load_from_tensor.py` | `TestLoRALoadFromTensor.setUpClass` | `Memory access fault → exit -6` | [link](url) |
-| nightly-test-amd ([Nov 4 16:07](run-url)) | `nightly-test-1-gpu-lora` [rocm10](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) · [rocm724](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/lora/test_lora_e2e.py` | `test_lora_full_pipeline` | same | [link](url) |
+| Workflow | Job | Test File | Test Function | Error (one line) |
+|---|---|---|---|---|
+| nightly-test-amd ([Nov 4 16:07](run-url)) | [`nightly-8-gpu-mi35x-qwen35 (rocm10)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)<br>`nightly-test-1-gpu-lora` [rocm10](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) · [rocm724](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | no test ran: `scripts/ci/amd/ensure_vram_clear.sh` | — | `VRAM cleanup unsuccessful after 3 attempts` |
+| nightly-test-amd ([Nov 4 16:07](run-url)) | [`nightly-8-gpu-mi35x-deepseek-r1-hicache (rocm10)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/amd/test_deepseek_r1_hicache_mi35x.py` | `setUpClass` | `memory capacity is unbalanced` |
+| pr-test-amd ([Nov 5 01:11, rocm10](run-url)) | [`stage-b-test-1-gpu-small-amd (rocm10, 2)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>)<br>[`stage-b-test-1-gpu-small-amd (rocm10, 5)`](https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>) | `test/registered/rl/test_lora_load_from_tensor.py` | `TestLoRALoadFromTensor.setUpClass` | `Memory access fault → exit -6` |
 
 Several small problems of one workflow may share a section. Then the heading's hidden comment lists every ID, the heading names the group in words, and each table row starts with its own problem's ID and name:
 
 ### <!-- R332 · R269 --> Nightly: failures continuing from earlier days — nightly-test-amd · ✅ fix open
-| Problem | Workflow | Job | Test File | Test Function | Log |
-|---|---|---|---|---|---|
-| <!-- R332 --> Qwen3.8-Flash-Next FP8 crashes on MI300 | … | … | … | … | … |
+| Problem | Workflow | Job | Test File | Test Function |
+|---|---|---|---|---|
+| <!-- R332 --> Qwen3.8-Flash-Next FP8 crashes on MI300 | … | … | … | … |
 
-(Test File + Test Function granularity is REQUIRED. Same problem across workflows lives in ONE table. The `Job` cell MUST be a clickable link to the actual sglang job page — `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>` — never an in-issue `#job-<id>` anchor. Name jobs per **Job names** in the Ground Rules: the backticked job label, or for several legs of one job the backticked job name followed by one link per leg labelled with its matrix values.)
+Rules for these problem tables:
+- **Test File + Test Function granularity is REQUIRED.** Same problem across workflows lives in ONE table.
+- **One row per (run, test file, test function, error).** Jobs of one run that fail the same way share a row; a different run or a different failure gets its own row, so every job in a row belongs to the run in its Workflow cell. A job that fails several different tests gets one row per test (repeat the job link); never join test files, test functions or problem names with ` · ` in one cell. Keep the rows of one run next to each other.
+- **One job per line.** In the Job cell, put each job on its own line, separated by `<br>`, never by ` · ` or `;`. Several legs of one job stay on that job's line (`` `nightly-test-1-gpu-lora` [rocm10](…) · [rocm724](…) ``).
+- **Every cell reads on its own.** Never write `same`, `same run`, `as above` or `〃`: repeat the run link and the short error instead.
+- **Job links, no Log column.** Each job MUST be a clickable link to the actual sglang job page — `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>` — never an in-issue `#job-<id>` anchor. Name jobs per **Job names** in the Ground Rules. The job links are the way to the logs, so the table has no separate Log column.
 
 After all new and active problems, render the problems with no failure today in a single collapsed `<details>` block:
 
