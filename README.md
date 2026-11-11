@@ -40,7 +40,7 @@ Three more things the picture does not show:
 
 | Feature | Trigger | Workflow → script | Agent tasks | Writes to |
 |---|---|---|---|---|
-| [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) | runner-1, hourly | [`ci-monitor.yml`](.github/workflows/ci-monitor.yml) → [`monitor_ci.py`](scripts/monitor_ci.py), [`daily_cross_workflow_summary.py`](scripts/daily_cross_workflow_summary.py), [`order_daily_comments.py`](scripts/order_daily_comments.py), [`runner_health.py`](scripts/runner_health.py) | Job Failure Analysis, Cross-Job Summary, Cross-Run Pattern Analysis, Daily Cross-Workflow Summary | Daily issue in this repo |
+| [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) | runner-1, hourly | [`ci-monitor.yml`](.github/workflows/ci-monitor.yml) → [`monitor_ci.py`](scripts/monitor_ci.py), [`daily_cross_workflow_summary.py`](scripts/daily_cross_workflow_summary.py), [`order_daily_comments.py`](scripts/order_daily_comments.py), [`runner_health.py`](scripts/runner_health.py), [`auto_rerun.py`](scripts/auto_rerun.py) | Job Failure Analysis, Cross-Job Summary, Cross-Run Pattern Analysis, Daily Cross-Workflow Summary | Daily issue in this repo |
 | [Suspect PR comments](#52-suspect-pr-comments) | `finalize` job of the CI monitor | [`suspect_pr_comments.py`](scripts/suspect_pr_comments.py) | — | Comments on merged sglang PRs; a log comment on the daily issue |
 | [Failure Trackers](#53-failure-trackers) | `finalize` job of the CI monitor | [`failure_tracker.py`](scripts/failure_tracker.py) | Failure Tracker Data | One issue per tracked workflow on sgl-project/sglang |
 | [PR commands](#54-pr-commands-the-comment-watcher) | `@amd-bot …` on a sglang PR | runner-1 daemon + [`comment-watcher.yml`](.github/workflows/comment-watcher.yml) → [`watch_comments.py`](scripts/watch_comments.py) | — | Dispatches the two workflows below; help replies |
@@ -84,9 +84,10 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 
 **Known gap:** `@amd-bot review` posts the review agent's text as it is, with no code check in between. Closing it (code checks plus verifier agents on every finding) is an open proposal.
 
-<a id="r3"></a>**R3. People decide.** The bot reports, attributes and suggests triage steps. It never approves, merges, prioritizes or reruns sglang work. Two automated writes go further:
+<a id="r3"></a>**R3. People decide.** The bot reports, attributes and suggests triage steps. It never approves, merges, prioritizes or reruns sglang work. Three automated writes go further:
 - the coverage audit merges, into ROCm/sglang-ci, exclusion entries that code validated and tested;
 - CI autofix opens **draft** PRs on sglang. It never marks them ready, merges them or asks anyone to review them, and the jobs it re-runs are on its own branches.
+- [auto-rerun](#auto-rerun) re-runs the failed jobs of a scheduled sglang run once, and only when code (log patterns, no agent) finds a transient network or infrastructure error. A run with any real failure among several transient ones is left alone.
 
 *Why:* priority and merging need context the bot does not have. *Kept by:* review only.
 
@@ -228,6 +229,7 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
       - **Which failed jobs count.** Only those that ended in the last 24 h. A long run's earlier failures were analysed by earlier ticks, while the run was still in view.
       - **Event filter.** Most workflows count scheduled runs only; AMD AITER Scout also counts manual runs ([`workflow_event_filter()`](scripts/monitor_ci.py)). A per-PR workflow (`PER_PR_WORKFLOWS`, sgl-amd-mono's PR test) has no scheduled runs, so it counts every event and branch ([`workflow_branch_filter()`](scripts/monitor_ci.py)) and gets no Cross-Run Pattern Analysis.
       - **Skipped.** Gate and finish jobs ([`is_gate_job()`](scripts/utils.py)), and jobs already in `processed_job_ids`.
+      - **Transient failures are re-run.** Before those filters, an sglang run's failed jobs go to [`consider_run()`](scripts/auto_rerun.py), which re-runs them once when their logs end in a network or infrastructure error. See [Auto-rerun](#auto-rerun).
    2. **Analyse each new failed job.** Each gets a Job Failure Analysis agent at the run's commit, 3 in parallel. Some workflows get extra context:
       - `nightly-amd-mi355x-disagg.yml` and sgl-amd-mono's nightly and PR test: the run's evidence artifacts are downloaded (`RUN_ARTIFACT_PREFIXES`, [`prepare_run_artifact_context()`](scripts/utils.py)).
       - Miles workflows: the worktree is moved to the image's sglang commit, radixark/miles is added, and dashboard evidence is written ([`prepare_miles_context()`](scripts/utils.py)).
@@ -256,6 +258,28 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 - **GitHub reads are retried.** A 5xx or connection error from the GitHub API is retried 3 times, after 5, 15 and 45 s ([`gh_get()`](scripts/utils.py)), so a transient 502 no longer fails a whole monitor job. Writes are not retried: a write that seemed to fail may have succeeded, and a retry would post a duplicate.
 - **Miles workflows** test radixark/miles images. They appear in the report and summary, but not in Notion staging or the Failure Trackers; their failures are radixark/miles' to triage. radixark/miles' own scheduled PR test, `radixark/miles/pr-test-rocm.yml`, is another repo's workflow (next point): its agents work in the radixark/miles clone the Miles workflows use, at the run's commit.
 - **Other repos' workflows** are named `owner/repo/<file>`, e.g. `sgl-project/sgl-amd-mono/nightly-amd.yml` or `radixark/miles/pr-test-rocm.yml` ([`workflow_repo()`](scripts/utils.py)); sglang's go by their file name alone. Their runs, jobs and logs are read from that repo, and their agents work in a full clone of it at the run's commit ([`ensure_source_repo()`](scripts/utils.py)), with a `Repo:` line in the prompt that the Ground Rules turn into that repo's links. Like Miles, they appear in the report, the summary and Runner health, but not in Notion staging, the Failure Trackers or Suspect PR comments.
+
+#### Auto-rerun
+
+Some failures are just the network: a Go module download cut off by `proxy.golang.org`, a git clone reset, a 503 from a mirror. For these `monitor_ci.py` re-runs the failed jobs instead of waiting for someone to press the button. It runs inside each `monitor` matrix job, for every failed run of an sglang workflow, before the window and dedup filters, and only with `--output daily-issue`. Other repos' workflows are not re-run: `AUTO_RERUN_TOKEN` only covers sglang.
+
+A run is looked at only if it is a `schedule` run, finished as `failure`, is on its first attempt (so it is re-run at most once), and finished less than 6 hours ago. For each failed non-gate job with conclusion `failure`, [`auto_rerun.py`](scripts/auto_rerun.py) reads the 400 log lines before the last `##[error]` line and calls the job transient when they match one of `TRANSIENT_PATTERNS` (HTTP/2 stream reset, connection reset, DNS failure, network timeout, git transfer error, 502/503/504, a download cut off with `unexpected EOF`) and contain no `AssertionError` or `FAILED (failures=`. Then:
+
+| Failed jobs | Action |
+|---|---|
+| All transient | `POST /actions/runs/{id}/rerun-failed-jobs` (the failed jobs and their dependents only) |
+| Exactly one transient, others not | `POST /actions/jobs/{id}/rerun` for that job |
+| None, or several transient mixed with real failures | Nothing |
+
+Each decision is kept in the monitor state under `auto_rerun`, keyed `<run_id>:<attempt>`, for 3 days, so a run's logs are read once. Re-runs (and dry-run or failed re-runs) appear in an **Auto-rerun** table at the top of the workflow's report in the daily issue, with the matching log line. The original failed job is still analysed as usual; its re-run is a new job that the next tick picks up if it fails again.
+
+| `AUTO_RERUN` | Behavior |
+|---|---|
+| `on` (default) | Re-runs with `AUTO_RERUN_TOKEN`. Acts as `dry-run` when the secret is not set |
+| `dry-run` | Nothing is re-run; the report shows what would be |
+| `off` | No checks |
+
+`AUTO_RERUN_TOKEN` needs Actions write access on `sgl-project/sglang` (amd-bot only has read access there). It is used for the re-run calls only; everything else keeps using `GH_PAT`.
 
 ### 5.2 Suspect PR comments
 
@@ -442,6 +466,7 @@ The switch is the repository variable `AUTOFIX_MODE`: unset or `off`, both jobs 
 | `BOT_PAT` given to `setup.sh` (`--bot-pat`, optional) | runner-1's comment watcher. Without it the watcher uses the `--pat` token, so its 🚀 claims come from that account (the current deployment) |
 | `secrets.AGENT_GH_TOKEN` (optional, read-only) | Handed to agents in place of `GH_PAT` |
 | `secrets.SGLANG_CI_TOKEN` (optional) | Coverage audit, in place of `GH_PAT` |
+| `secrets.AUTO_RERUN_TOKEN` (optional) | [Auto-rerun](#auto-rerun)'s re-run calls only; needs Actions write on sgl-project/sglang |
 | `secrets.RUNNER_STATUS_TOKEN` (optional) | Runner health: listing the monitored repos' runners, which amd-bot's read access cannot |
 | `GH_PAT` in the runner containers (bingxche's, from `setup.sh --pat`), or `secrets.AUTOFIX_TOKEN` if set | CI autofix's publish job: pushing `bingxche/autofix-*`, dispatching on it, opening draft PRs. Code refuses any other branch or account. Pushing a change under `.github/workflows/` needs the `workflow` scope |
 
@@ -458,11 +483,13 @@ Settings → Secrets and variables → Actions.
 | `SGLANG_CI_TOKEN` | Optional: another ROCm/sglang-ci admin's PAT for the coverage audit |
 | `RUNNER_STATUS_TOKEN` | Optional: a token that can list the monitored repos' self-hosted runners (e.g. `GET /repos/sgl-project/sglang/actions/runners`), for the runner health check. Read only; never given to an agent |
 | `AUTOFIX_TOKEN` | Optional: a token for CI autofix's writes in place of the runners' `GH_PAT` (see above) |
+| `AUTO_RERUN_TOKEN` | Optional: a token with Actions write access on `sgl-project/sglang`, used only to re-run failed jobs. Without it, auto-rerun is a dry run. See [Auto-rerun](#auto-rerun) |
 
 | Variable | Value |
 |---|---|
 | `USE_AGENT` | `true`: agent mode for review and CI status (API mode otherwise) |
 | `SUSPECT_PR_COMMENTS` | `dry-run` (default), `post`, `off` |
+| `AUTO_RERUN` | `on` (default when unset), `dry-run`, `off`. See [Auto-rerun](#auto-rerun) |
 | `AUTOFIX_MODE` | CI autofix's switch: `off` (default, also when unset), `live` |
 | `AUTOFIX_MAX_PER_HOUR` | Optional: problems CI autofix may start per hour (default 3) |
 | `COVERAGE_AUDIT_MODEL` | Optional `--model` for the coverage audit (default `opus`) |
@@ -594,6 +621,7 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 | `CROSS_JOB_TIMEOUT_SECS` / `CROSS_JOB_MAX_TURNS` | `utils.cross_job_analysis` | Cross-Job Summary budget (1200 s, 100 turns) |
 | `CROSS_RUN_TIMEOUT_SECS` | `monitor_ci.py` | Cross-Run Pattern Analysis timeout (600 s) |
 | `DAILY_SUMMARY_TIMEOUT_SECS` | `daily_cross_workflow_summary.py` | Summary agent timeout (1200 s) |
+| `AUTO_RERUN` / `AUTO_RERUN_TOKEN` | `monitor_ci.py` → `auto_rerun.py` | Mode (`on`, `dry-run`, `off`) and the token for the re-run calls |
 | `BUILD_DAILY_SUMMARY` | `monitor_ci.py` | `false` skips the summary refresh (legacy alias `BUILD_DAILY_BOARD`) |
 | `MILES_CAUSE_FIX_URL` | Miles analyses | The sglang-ci dashboard's Miles cause/fix payload (default `https://rocm.github.io/sglang-ci/api/miles/cause-fix.json`) |
 | `TRACKER_AGENT_TIMEOUT_SECS` / `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Tracker extraction budget (900 s, 80 turns) |
