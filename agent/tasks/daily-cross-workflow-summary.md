@@ -79,7 +79,7 @@ Several small problems of one workflow may share a section. Then the heading's h
 
 Rules for these problem tables:
 - **Test File + Test Function granularity is REQUIRED.** Same problem across workflows lives in ONE table.
-- **One row per (run, test file, test function, error).** Jobs of one run that fail the same way share a row; a different run or a different failure gets its own row, so every job in a row belongs to the run in its Workflow cell. Keep the rows of one run next to each other.
+- **One row per (run, test file, test function, error).** Jobs of one run that fail the same way share a row; a different run or a different failure gets its own row, so every job in a row belongs to the run in its Workflow cell. A job that fails several different tests gets one row per test (repeat the job link); never join test files, test functions or problem names with ` · ` in one cell. Keep the rows of one run next to each other.
 - **One job per line.** In the Job cell, put each job on its own line, separated by `<br>`, never by ` · ` or `;`. Several legs of one job stay on that job's line (`` `nightly-test-1-gpu-lora` [rocm10](…) · [rocm724](…) ``).
 - **Every cell reads on its own.** Never write `same`, `same run`, `as above` or `〃`: repeat the run link and the short error instead.
 - **Job links, no Log column.** Each job MUST be a clickable link to the actual sglang job page — `https://github.com/sgl-project/sglang/actions/runs/<run_id>/job/<job_id>` — never an in-issue `#job-<id>` anchor. Name jobs per **Job names** in the Ground Rules. The job links are the way to the logs, so the table has no separate Log column.
