@@ -63,6 +63,38 @@ prefill/decode/router failure signal at the artifact-log level. Do not mark a
 historical run "passed for this failure" merely because its GitHub job page log
 does not contain the server-side error.
 
+### sgl-amd-mono nightly (REQUIRED for `sgl-project/sgl-amd-mono/nightly-amd.yml`)
+
+This workflow runs in [sgl-project/sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono)
+(the prompt's `Repo:` line; see the Ground Rules): the current directory is
+sgl-amd-mono at the run's commit, tested inside an SGLang ROCm image
+(`rocm/sgl-dev:v*-rocm10-mi35x-YYYYMMDD`, the newest one unless the run was
+dispatched with another). One `nightly (<model>)` job per model (`weekly (...)`
+on Saturdays, every benchmark with monokernels on and off); `common` holds the
+unit and common kernel tests. A `report` job then judges every model's
+result, and is often the only failed job: its log has nothing but the exit code.
+
+Read `.ci-context/mono-ci-artifacts/MANIFEST.md` (the prompt's
+`Artifact context:`) first. Each `mono-ci-<model>` artifact holds:
+
+- `result.json` — the verdict input: `tests` (unit, kernels, e2e: passed /
+  failed / rc), `accuracy`, `perf`, `pinned`, plus `image`, `pr_sha` and
+  `sglang` (the image's SGLang commit, `<sha> <date> <title>`).
+- `job.log` and `logs/<step>.log` (`setup`, `install-pr`, `unit`, `kernels`,
+  `pinned-contract`, `e2e`, `server-*`, `eval-*`, `bench-*`), with JUnit
+  `*.xml` for the test steps. Name the failing tests from these.
+
+`pinned-contract` tests the sgl-amd-mono **pinned in the image** against the
+image's SGLang, before the run's own commit is installed. A failure there is a
+mismatch between the image's SGLang and its pinned sgl-amd-mono, not caused by
+the commit under test. For other failures, check both sides: sgl-amd-mono
+commits since the last passing run (`git log` here), and SGLang commits between
+the last passing and the failing run's image (`sglang` in `result.json`),
+through the sglang compare API. Look up in-flight fixes in both repos.
+
+Do not name the cluster node (`node` in `result.json`, hostnames in the logs);
+write "the CI node".
+
 ### Miles workflows (REQUIRED for `nightly-test-amd-miles-*.yml` and `release-docker-amd-miles-*.yml`)
 
 These workflows test [radixark/miles](https://github.com/radixark/miles), an RL
@@ -209,7 +241,7 @@ Never blame an sglang commit for a host outage.
 
 ### Commit info extraction (REQUIRED)
 
-Every analysis **must** begin with a `### Commit Info` section. The prompt will supply a `Commit SHA` — use it as the sglang commit (except for Miles workflows: see **Miles workflows** above).
+Every analysis **must** begin with a `### Commit Info` section. The prompt will supply a `Commit SHA` — use it as the sglang commit (except for Miles workflows: see **Miles workflows** above; and with a `Repo:` line it is that repo's commit: list it under the repo's name, plus the image's sglang commit when the log or artifacts give it).
 
 For the **aiter commit**, download the job log and search for `[CI-AITER-CHECK]` markers emitted by `amd_ci_install_dependency.sh`. Determine the actual aiter version that ran using this priority:
 

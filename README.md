@@ -229,7 +229,7 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
       - **Event filter.** Most workflows count scheduled runs only; AMD AITER Scout also counts manual runs ([`workflow_event_filter()`](scripts/monitor_ci.py)).
       - **Skipped.** Gate and finish jobs ([`is_gate_job()`](scripts/utils.py)), and jobs already in `processed_job_ids`.
    2. **Analyse each new failed job.** Each gets a Job Failure Analysis agent at the run's commit, 3 in parallel. Some workflows get extra context:
-      - `nightly-amd-mi355x-disagg.yml`: the run's server-log artifacts are downloaded ([`prepare_mi355x_artifact_context()`](scripts/utils.py)).
+      - `nightly-amd-mi355x-disagg.yml` and sgl-amd-mono's nightly: the run's evidence artifacts are downloaded (`RUN_ARTIFACT_PREFIXES`, [`prepare_run_artifact_context()`](scripts/utils.py)).
       - Miles workflows: the worktree is moved to the image's sglang commit, radixark/miles is added, and dashboard evidence is written ([`prepare_miles_context()`](scripts/utils.py)).
       - Jobs whose runner was lost: the facts are passed instead of a missing log ([`is_runner_lost()`](scripts/utils.py)).
       - A job already analysed on an earlier day is copied over, not analysed again.
@@ -241,20 +241,21 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
    2. **Runner health** ([`runner_health.py`](scripts/runner_health.py), code only). A workflow whose runners are offline has no failed jobs, so the reports above never mention it: its jobs sit queued, and each newer scheduled run is cancelled before it starts (`nightly-amd-mi355x-disagg.yml` went four days like that). For every monitored workflow this lists, at the top of the issue body:
       - jobs waiting for a runner for 24 h (`QUEUE_STALL_HOURS`), for 30 min (`OFFLINE_GRACE_MINUTES`) while every runner with their labels is offline, or for 2 h (`NO_PICKUP_HOURS`) while no job on their labels is running or was picked up after they queued ([`check_workflow()`](scripts/runner_health.py)); unfinished runs up to 14 days old are checked, past the reports' 72 h window;
       - runs cancelled in the last 24 h before any self-hosted job got a runner ([`never_started()`](scripts/runner_health.py));
-      - each label set's runners: online, busy, and the offline ones by name ([`runner_status()`](scripts/runner_health.py)). This needs a token that can list sglang's runners (`RUNNER_STATUS_TOKEN`); amd-bot's cannot. Without it, whether a label is picking up jobs at all is read from the jobs ([`label_activity()`](scripts/runner_health.py)): jobs running on it in any in-progress run of a monitored workflow, whatever its event, and its latest pickup. This is the same reading as the dashboard's Runner Health page, which calls a pool offline when it has queued jobs and nothing running. A job of an unmonitored workflow on the same labels is not seen, hence the 2 h wait.
+      - each label set's runners: online, busy, and the offline ones by name ([`runner_status()`](scripts/runner_health.py)). This needs a token that can list the workflow repo's runners (`RUNNER_STATUS_TOKEN`); amd-bot's cannot. Without it, whether a label is picking up jobs at all is read from the jobs ([`label_activity()`](scripts/runner_health.py)): jobs running on it in any in-progress run of a monitored workflow, whatever its event, and its latest pickup, per repo (the same labels in two repos are two pools). This is the same reading as the dashboard's Runner Health page, which calls a pool offline when it has queued jobs and nothing running. A job of an unmonitored workflow on the same labels is not seen, hence the 2 h wait.
 
       With nothing to report, the section is one ✅ line.
    3. [Suspect PR comments](#52-suspect-pr-comments).
    4. [Failure Trackers](#53-failure-trackers).
 
 **Things to know**
-- **Report order** follows [`MONITORED_WORKFLOWS`](scripts/monitor_ci.py): Docker builds, PR test, nightly, disagg, Miles, AITER Scout. Inside `pr-test-amd.yml`, jobs are grouped by ROCm version (`ROCM_REPORT_ORDER`), PRs' default first, then by stage (`JOB_REPORT_ORDER`).
+- **Report order** follows [`MONITORED_WORKFLOWS`](scripts/monitor_ci.py): Docker builds, PR test, nightly, disagg, Miles, AITER Scout, then other repos' workflows. Inside `pr-test-amd.yml`, jobs are grouped by ROCm version (`ROCM_REPORT_ORDER`), PRs' default first, then by stage (`JOB_REPORT_ORDER`).
 - **The summary is written in plain language.** It names each problem in words and each run by workflow, start time and ROCm version. The problem IDs (`R386`) that tie a problem to its jobs, to suspect PRs and to tomorrow's report sit only in hidden comments ([`job_clusters_from_markdown()`](scripts/daily_cross_workflow_summary.py) reads them there), and runs get no short labels. The rules are under **Plain language** in [`daily-cross-workflow-summary.md`](agent/tasks/daily-cross-workflow-summary.md); the run-name rule is in the Ground Rules.
 - **Every summary layer can fail independently.** If the summary agent fails, the last good summary stays up under a "not refreshed" note and the next tick retries it.
 - **The report date is pinned when a run starts**, so an agent that runs past midnight cannot write into the next day's issue.
 - **Analyses are kept for 4 days** (`STATE_DAYS_KEPT`), longer than the oldest run in view. A job of a long run that appears in a new day's report is therefore copied from the cache, not analysed again.
 - **GitHub reads are retried.** A 5xx or connection error from the GitHub API is retried 3 times, after 5, 15 and 45 s ([`gh_get()`](scripts/utils.py)), so a transient 502 no longer fails a whole monitor job. Writes are not retried: a write that seemed to fail may have succeeded, and a retry would post a duplicate.
 - **Miles workflows** test radixark/miles images. They appear in the report and summary, but not in Notion staging or the Failure Trackers; their failures are radixark/miles' to triage.
+- **Other repos' workflows** are named `owner/repo/<file>`, e.g. `sgl-project/sgl-amd-mono/nightly-amd.yml` ([`workflow_repo()`](scripts/utils.py)); sglang's go by their file name alone. Their runs, jobs and logs are read from that repo, and their agents work in a full clone of it at the run's commit ([`ensure_source_repo()`](scripts/utils.py)), with a `Repo:` line in the prompt that the Ground Rules turn into that repo's links. Like Miles, they appear in the report, the summary and Runner health, but not in Notion staging, the Failure Trackers or Suspect PR comments.
 
 ### 5.2 Suspect PR comments
 
@@ -264,7 +265,7 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 
 1. **Code checks** ([`check_suspect()`](scripts/suspect_pr_comments.py)), in order. A suspect is dropped at the first check it fails:
    - confidence is `FACT` or `HIGH`;
-   - the cluster has at least 2 failed jobs;
+   - the cluster has at least 2 failed jobs of sglang's own workflows (another repo's jobs, such as sgl-amd-mono's, do not count);
    - the last-passing and first-failing commits are given;
    - the PR was merged within 14 days, and the cited commit is the PR's;
    - the compare API puts the commit inside the window;
@@ -441,7 +442,7 @@ The switch is the repository variable `AUTOFIX_MODE`: unset or `off`, both jobs 
 | `BOT_PAT` given to `setup.sh` (`--bot-pat`, optional) | runner-1's comment watcher. Without it the watcher uses the `--pat` token, so its 🚀 claims come from that account (the current deployment) |
 | `secrets.AGENT_GH_TOKEN` (optional, read-only) | Handed to agents in place of `GH_PAT` |
 | `secrets.SGLANG_CI_TOKEN` (optional) | Coverage audit, in place of `GH_PAT` |
-| `secrets.RUNNER_STATUS_TOKEN` (optional) | Runner health: listing sglang's runners, which amd-bot's read access cannot |
+| `secrets.RUNNER_STATUS_TOKEN` (optional) | Runner health: listing the monitored repos' runners, which amd-bot's read access cannot |
 | `GH_PAT` in the runner containers (bingxche's, from `setup.sh --pat`), or `secrets.AUTOFIX_TOKEN` if set | CI autofix's publish job: pushing `bingxche/autofix-*`, dispatching on it, opening draft PRs. Code refuses any other branch or account. Pushing a change under `.github/workflows/` needs the `workflow` scope |
 
 ### Repository secrets and variables
@@ -455,7 +456,7 @@ Settings → Secrets and variables → Actions.
 | `AGENT_GH_TOKEN` | Recommended: a read-only token for the CI-status agents, which read content anyone can write |
 | `NOTION_TOKEN` | Notion connection with Read + Insert, no Update, shared only with the two databases |
 | `SGLANG_CI_TOKEN` | Optional: another ROCm/sglang-ci admin's PAT for the coverage audit |
-| `RUNNER_STATUS_TOKEN` | Optional: a token that can list sgl-project/sglang's self-hosted runners (`GET /repos/sgl-project/sglang/actions/runners`), for the runner health check. Read only; never given to an agent |
+| `RUNNER_STATUS_TOKEN` | Optional: a token that can list the monitored repos' self-hosted runners (e.g. `GET /repos/sgl-project/sglang/actions/runners`), for the runner health check. Read only; never given to an agent |
 | `AUTOFIX_TOKEN` | Optional: a token for CI autofix's writes in place of the runners' `GH_PAT` (see above) |
 
 | Variable | Value |
@@ -546,9 +547,10 @@ nightly-amd-mi355x-disagg.yml
 nightly-test-amd-miles-rocm10.yml
 nightly-test-amd-miles-rocm10-mi30x.yml
 amd-aiter-scout.yml
+sgl-project/sgl-amd-mono/nightly-amd.yml
 ```
 
-The same list is `DEFAULT_WORKFLOWS` in [`ci-monitor.yml`](.github/workflows/ci-monitor.yml). Upstream runs ROCm 10, 7.2.4 and 7.2 as matrix legs inside `pr-test-amd.yml` and `nightly-test-amd.yml`. `amd-ci-job-monitor.yml` (housekeeping) and the tag-only `release-docker-amd.yml` are not monitored.
+The same list is `DEFAULT_WORKFLOWS` in [`ci-monitor.yml`](.github/workflows/ci-monitor.yml). Upstream runs ROCm 10, 7.2.4 and 7.2 as matrix legs inside `pr-test-amd.yml` and `nightly-test-amd.yml`. `amd-ci-job-monitor.yml` (housekeeping) and the tag-only `release-docker-amd.yml` are not monitored. Of sgl-amd-mono, only the scheduled nightly is; its `pr-test-amd.yml` runs per PR, on a label.
 
 ### Command lines
 
@@ -577,7 +579,7 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 |---|---|---|
 | `GH_PAT` / `BOT_PAT` / `GITHUB_TOKEN` | all scripts | GitHub token, in that order of preference by most scripts |
 | `BOT_REPO` | `ensure_daily_issue.py`, `order_daily_comments.py`, `runner_health.py` | The bot repo hosting the daily issue |
-| `RUNNER_STATUS_TOKEN` | `runner_health.py` | Token for listing sglang's runners (default: the GitHub token; without access, pickups are read from the jobs) |
+| `RUNNER_STATUS_TOKEN` | `runner_health.py` | Token for listing the monitored repos' runners (default: the GitHub token; without access, pickups are read from the jobs) |
 | `LLM_GATEWAY_KEY` / `LLM_GATEWAY_URL` | API mode | AMD LLM Gateway key and endpoint |
 | `USE_AGENT` | all scripts | `false` / `0` / `no` selects API mode (default: agent mode) |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` / `ANTHROPIC_MODEL` | Claude Code | Gateway access and default model, from `claude.env` |

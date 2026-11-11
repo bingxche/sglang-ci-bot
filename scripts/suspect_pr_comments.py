@@ -9,7 +9,8 @@ run once per tick by the ``finalize`` job, reads that copy and decides in
 code whether each suspect is solid enough to tell the PR's author:
 
   - confidence is ``FACT`` or ``HIGH``
-  - the cluster has at least ``MIN_FAILED_JOBS`` failed jobs
+  - the cluster has at least ``MIN_FAILED_JOBS`` failed jobs of sglang's own
+    workflows (a job of another repo's, such as sgl-amd-mono's, does not count)
   - the PR is merged, within ``MAX_PR_AGE_DAYS``, and the cited commit is
     the PR's
   - the commit lies between the last passing and the first failing commit
@@ -245,10 +246,20 @@ def check_fix(fix_pr: int, author: str, gh: GitHub) -> tuple[dict | None, str]:
     return {"number": fix_pr, "title": pull.get("title", ""), "author": fix_author}, ""
 
 
+def _run_repo(run_url: str) -> str:
+    """The repo of a run URL, or "" when it is not one."""
+    m = re.match(r"https://github\.com/([^/]+/[^/]+)/actions/runs/", run_url or "")
+    return m.group(1) if m else ""
+
+
 def check_suspect(
     suspect: dict, jobs: list[int], gh: GitHub, now: datetime,
+    job_info: dict[int, dict] | None = None,
 ) -> Decision:
-    """Run every check on one suspect; the first failure is the reason."""
+    """Run every check on one suspect; the first failure is the reason.
+
+    *job_info* (job ID -> analysis) tells which jobs ran in another repo.
+    """
     d = Decision(suspect, jobs)
 
     def skip(reason: str) -> Decision:
@@ -258,8 +269,15 @@ def check_suspect(
     s = suspect
     if s["confidence"] not in POSTABLE_CONFIDENCE:
         return skip(f"confidence {s['confidence']} (needs FACT or HIGH)")
-    if len(jobs) < MIN_FAILED_JOBS:
-        return skip(f"{len(jobs)} failed job(s) in {s['cluster']} (needs {MIN_FAILED_JOBS})")
+    # A job not in job_info counts as sglang's, as before other repos were monitored.
+    repos = [_run_repo((job_info or {}).get(j, {}).get("run_url", "")) or REPO for j in jobs]
+    if repos.count(REPO) < MIN_FAILED_JOBS:
+        others = sorted(set(repos) - {REPO})
+        where = f"; the others are from {', '.join(others)}" if others else ""
+        return skip(
+            f"{repos.count(REPO)} failed sglang job(s) in {s['cluster']} "
+            f"(needs {MIN_FAILED_JOBS}){where}"
+        )
     if not s.get("last_pass_sha") or not s.get("first_fail_sha"):
         return skip("no last-passing / first-failing commit given")
 
@@ -468,7 +486,7 @@ def decide_all(
         seen.add(key)
         jobs = sorted(clusters.get(s["cluster"]) or [])
         try:
-            d = check_suspect(s, jobs, gh, now)
+            d = check_suspect(s, jobs, gh, now, job_info)
         except requests.RequestException as exc:
             d = Decision(s, jobs, result="skip", reason=f"GitHub API error ({exc.__class__.__name__})")
         if d.result == "post":

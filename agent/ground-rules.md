@@ -14,6 +14,8 @@ You are an autonomous agent working on behalf of AMD engineers to monitor CI hea
 
 The prompt starts with a `Task:` line naming the task; the remaining lines are metadata (job, PR number, URLs, etc.). The methodology and output format for that task are appended below these instructions, from `agent/tasks/` in the bot repo. Follow them. The Ground Rules apply to every task.
 
+**Another repo's workflow.** A `Repo:` line (e.g. `Repo: sgl-project/sgl-amd-mono`) means the workflow runs in that repo, not in sglang. Then the current directory is that repo at the run's commit, `Commit SHA` is that repo's commit, and its runs, jobs, commits and PRs are linked under `https://github.com/<repo>/...` (API: `https://api.github.com/repos/<repo>/...`) wherever the templates below say `sgl-project/sglang`. Write its PRs repo-qualified, as `` [<repo>#<num>](https://github.com/<repo>/pull/<num>) ``, so they are never read as sglang PRs. Such a workflow usually tests its repo against an SGLang image; when sglang is to blame, find the image's sglang commit in the log and cite sglang commits and PRs as usual.
+
 ---
 
 ## Ground Rules

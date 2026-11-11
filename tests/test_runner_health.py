@@ -124,7 +124,7 @@ class CheckWorkflowTests(unittest.TestCase):
             self.assertEqual(event, "schedule")
             return runs_by_status.get(status, [])
         with patch.object(rh, "get_runs", side_effect=get_runs), \
-             patch.object(rh, "get_run_jobs", side_effect=lambda t, run_id: jobs_by_run[run_id]):
+             patch.object(rh, "get_run_jobs", side_effect=lambda t, run_id, repo: jobs_by_run[run_id]):
             return rh.check_workflow("tok", DISAGG, runners, NOW)
 
     def test_offline_runners_and_superseded_runs_are_reported(self):
@@ -193,6 +193,43 @@ class CheckWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(result, {"workflow": DISAGG, "stalled": [], "cancelled": []})
 
+
+class OtherRepoTests(unittest.TestCase):
+    MONO = "sgl-project/sgl-amd-mono/nightly-amd.yml"
+
+    def test_runs_jobs_and_runners_are_read_from_the_workflow_repo(self):
+        urls = []
+
+        def fake_get(url, **kwargs):
+            urls.append(url)
+            body = {"workflow_runs": [], "runners": [], "jobs": []}
+            if url.endswith("/runs") and kwargs["params"]["status"] == "queued":
+                body["workflow_runs"] = [_run(1, NOW - timedelta(hours=3))]
+            return type("R", (), {"status_code": 200, "json": lambda self: body,
+                                  "raise_for_status": lambda self: None})()
+
+        with patch.object(rh, "gh_get", side_effect=fake_get), \
+                patch("utils.gh_get", side_effect=fake_get):
+            self.assertEqual(rh.list_runners("tok", "sgl-project/sgl-amd-mono"), [])
+            rh.check_workflow("tok", self.MONO, None, NOW)
+        self.assertTrue(all(u.startswith("https://api.github.com/repos/sgl-project/sgl-amd-mono/") for u in urls))
+        self.assertIn(
+            "https://api.github.com/repos/sgl-project/sgl-amd-mono/actions/workflows/nightly-amd.yml/runs", urls,
+        )
+        self.assertIn("https://api.github.com/repos/sgl-project/sgl-amd-mono/actions/runs/1/jobs", urls)
+
+    def test_label_activity_is_kept_per_repo(self):
+        # The same labels in two repos are two runner pools.
+        jobs = {
+            "sgl-project/sglang": [{**_job(["linux-mi35x-gpu-1"], "in_progress", "arc-1"),
+                                    "started_at": _iso(NOW - timedelta(hours=1))}],
+            "sgl-project/sgl-amd-mono": [],
+        }
+        with patch.object(rh, "get_runs", return_value=[_run(1, NOW, "in_progress")]), \
+                patch.object(rh, "get_run_jobs", side_effect=lambda t, run_id, repo: jobs[repo]):
+            activity = rh.label_activity("tok", ["pr-test-amd.yml", self.MONO], NOW)
+        self.assertEqual(activity["sgl-project/sglang"][("linux-mi35x-gpu-1",)]["running"], 1)
+        self.assertEqual(activity["sgl-project/sgl-amd-mono"], {})
 
 class RenderTests(unittest.TestCase):
     def test_healthy_section_is_one_line(self):

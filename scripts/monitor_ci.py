@@ -48,6 +48,7 @@ from utils import (
     cross_job_analysis,
     delete_comment,
     ensure_sglang_repo,
+    ensure_source_repo,
     get_failed_jobs,
     get_run_jobs,
     gh_get,
@@ -56,13 +57,15 @@ from utils import (
     post_comment,
     remove_agent_worktree,
     update_comment,
+    workflow_repo,
 )
 
 log = logging.getLogger("ci-monitor")
 
 # Listed in priority order, which is also the order the reports appear in the
 # daily issue (see order_workflow_comments): Docker image builds, PR test,
-# nightly, disagg, Miles, then AITER Scout.
+# nightly, disagg, Miles, AITER Scout, then other repos' workflows, named
+# ``owner/repo/<file>`` (see utils.workflow_repo).
 MONITORED_WORKFLOWS = [
     "release-docker-amd-rocm10.yml",
     "release-docker-amd-rocm720-nightly.yml",
@@ -77,6 +80,9 @@ MONITORED_WORKFLOWS = [
     "nightly-test-amd-miles-rocm10.yml",
     "nightly-test-amd-miles-rocm10-mi30x.yml",
     "amd-aiter-scout.yml",
+    # sgl-amd-mono's nightly: the repo at the run's commit, tested on the
+    # newest SGLang ROCm image.
+    "sgl-project/sgl-amd-mono/nightly-amd.yml",
 ]
 
 # Order of the jobs within a workflow's report: first by the ROCm version in
@@ -248,7 +254,8 @@ def get_workflow_runs(
     now = datetime.now(timezone.utc)
     finished_since = now - timedelta(hours=hours_back)
     created_since = now - timedelta(hours=max(hours_back, MAX_RUN_AGE_HOURS))
-    url = f"https://api.github.com/repos/{REPO}/actions/workflows/{workflow_file}/runs"
+    repo, file = workflow_repo(workflow_file)
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{file}/runs"
     base_params = {
         "branch": branch,
         "per_page": 100,
@@ -293,9 +300,9 @@ def _finished_since(job: dict, since: datetime) -> bool:
 
 
 
-def get_pending_job_info(token: str, run_id: int) -> dict:
+def get_pending_job_info(token: str, run_id: int, repo: str = REPO) -> dict:
     """Count still-running jobs in a workflow run."""
-    jobs = get_run_jobs(token, run_id)
+    jobs = get_run_jobs(token, run_id, repo)
     running = [j for j in jobs if j.get("status") != "completed"]
     return {"count": len(running), "run_id": run_id}
 
@@ -775,6 +782,7 @@ def render_workflow_comment_parts(
         for ja in job_analyses
     )
 
+    repo, _ = workflow_repo(workflow_file)
     unique_shas = dict.fromkeys(
         ja.get("head_sha", "") for ja in job_analyses
     )
@@ -783,10 +791,11 @@ def render_workflow_comment_parts(
         if sha:
             short = sha[:7]
             commit_parts.append(
-                f"[`{short}`](https://github.com/{REPO}/commit/{sha})"
+                f"[`{short}`](https://github.com/{repo}/commit/{sha})"
             )
+    repo_label = "sglang" if repo == REPO else repo
     commits_line = (
-        f"**Commits**: sglang {', '.join(commit_parts)}\n\n"
+        f"**Commits**: {repo_label} {', '.join(commit_parts)}\n\n"
         if commit_parts else ""
     )
 
@@ -797,7 +806,7 @@ def render_workflow_comment_parts(
     pending_block = ""
     if total_pending > 0:
         run_links = ", ".join(
-            f"[run](https://github.com/{REPO}/actions/runs/{p['run_id']})"
+            f"[run](https://github.com/{repo}/actions/runs/{p['run_id']})"
             for p in pending_info if p["count"] > 0
         )
         pending_block = (
@@ -1092,9 +1101,12 @@ def _build_cross_run_prompt(
         "Flaky / intermittent", patterns["flaky"],
     )
 
+    repo, _ = workflow_repo(workflow_file)
+    repo_line = f"Repo: {repo}\n" if repo != REPO else ""
     return (
         f"Task: Cross-Run Pattern Analysis\n"
         f"Workflow: {workflow_file}\n"
+        f"{repo_line}"
         f"Runs in window: {patterns['n_runs']}\n\n"
         f"Per-run summary:\n" + "\n".join(runs_lines) + "\n\n"
         f"Failure buckets (computed):\n"
@@ -1221,6 +1233,7 @@ def monitor_workflow(
     current GitHub lookup contains the exact same job ID.
     """
     log.info("Monitoring: %s (branch: %s, event: %s)", workflow_file, branch, event or "all")
+    repo, _ = workflow_repo(workflow_file)
     recent_since = datetime.now(timezone.utc) - timedelta(hours=hours_back)
 
     runs = get_workflow_runs(token, workflow_file, hours_back=hours_back, branch=branch, event=event)
@@ -1251,7 +1264,7 @@ def monitor_workflow(
         run_conclusion = run.get("conclusion") or "in_progress"
         log.info("  Run %d [%s/%s]: %s", run_id, run_status, run_conclusion, run_url)
 
-        failed_jobs = get_failed_jobs(token, run_id)
+        failed_jobs = get_failed_jobs(token, run_id, repo)
         run_failed_jobs[run_url] = failed_jobs
         # Failures from the lookback window only. A long run's earlier failures
         # were analysed by earlier ticks, while it was unfinished and in view,
@@ -1303,7 +1316,7 @@ def monitor_workflow(
             )
 
         if run_status != "completed":
-            pi = get_pending_job_info(token, run_id)
+            pi = get_pending_job_info(token, run_id, repo)
             if pi["count"] > 0:
                 pending_info.append(pi)
 
@@ -1323,7 +1336,7 @@ def monitor_workflow(
             worktrees: dict[int, Path] = {}
             try:
                 for job, _, sha in jobs_to_analyze:
-                    wt = create_agent_worktree(job["id"], head_sha=sha)
+                    wt = create_agent_worktree(job["id"], head_sha=sha, source=agent_repo_path)
                     worktrees[job["id"]] = wt
 
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1351,7 +1364,7 @@ def monitor_workflow(
             finally:
                 for wt in worktrees.values():
                     try:
-                        remove_agent_worktree(wt)
+                        remove_agent_worktree(wt, agent_repo_path)
                     except Exception:
                         log.warning("Failed to clean up worktree %s", wt)
         else:
@@ -1706,6 +1719,11 @@ def run_oneshot(
 
     for wf in workflows:
         try:
+            # The agents read the workflow's own repo: sglang's clone, or
+            # another repo's (utils.workflow_repo).
+            source_path = agent_repo_path
+            if agent_repo_path is not None and workflow_repo(wf)[0] != REPO:
+                source_path = ensure_source_repo(workflow_repo(wf)[0])
             wf_state = get_workflow_state(daily, wf)
             local_ids = {ja["job_id"] for ja in wf_state.get("job_analyses", [])}
             gh_ids = extract_processed_ids_from_comments(gh_comments, wf) if gh_comments else set()
@@ -1722,7 +1740,7 @@ def run_oneshot(
                 job_name_filter=job_name_filter,
                 branch=branch,
                 use_agent=use_agent,
-                agent_repo_path=agent_repo_path,
+                agent_repo_path=source_path,
                 event=workflow_event_filter(wf),
             )
 
@@ -1744,7 +1762,7 @@ def run_oneshot(
                     try:
                         cross = cross_job_analysis(
                             None, wf, new_analyses,
-                            use_agent=use_agent, repo_path=agent_repo_path,
+                            use_agent=use_agent, repo_path=source_path,
                         )
                     except Exception as exc:
                         log.warning("Cross-job analysis failed for %s: %s", wf, exc)
@@ -1760,7 +1778,7 @@ def run_oneshot(
                     token, bot_repo, wf, new_analyses, pending, state,
                     gh_comments=gh_comments,
                     use_agent=use_agent,
-                    agent_repo_path=agent_repo_path,
+                    agent_repo_path=source_path,
                     date_str=date_str,
                 )
 

@@ -17,9 +17,10 @@ For each monitored workflow this finds:
 and writes a "Runner health" section at the top of today's daily issue body,
 between ``RUNNER_HEALTH_START`` / ``RUNNER_HEALTH_END``. Code only, no agent.
 
-Runner online/offline status needs a token that can list sgl-project/sglang's
+Runner online/offline status needs a token that can list the workflow repo's
 runners (``RUNNER_STATUS_TOKEN``). Without one, whether a label is picking up
-jobs at all is read from the jobs themselves (``label_activity``).
+jobs at all is read from the jobs themselves (``label_activity``), per repo:
+the same labels in two repos are two runner pools.
 
 Env:
   GH_PAT               - GitHub token (fallback: BOT_PAT, GITHUB_TOKEN)
@@ -43,7 +44,15 @@ from monitor_ci import (
     find_daily_issue,
     workflow_event_filter,
 )
-from utils import REPO, get_issue, get_run_jobs, gh_get, gh_headers, update_issue_body
+from utils import (
+    REPO,
+    get_issue,
+    get_run_jobs,
+    gh_get,
+    gh_headers,
+    update_issue_body,
+    workflow_repo,
+)
 
 log = logging.getLogger("runner-health")
 
@@ -75,16 +84,16 @@ _HOSTED_LABEL_RE = re.compile(r"^(ubuntu|windows|macos)-", re.IGNORECASE)
 # GitHub reads
 # ---------------------------------------------------------------------------
 
-def list_runners(token: str) -> list[dict] | None:
-    """Every repo-level runner of sglang, or None when the token cannot list them."""
-    url = f"https://api.github.com/repos/{REPO}/actions/runners"
+def list_runners(token: str, repo: str = REPO) -> list[dict] | None:
+    """Every repo-level runner of *repo*, or None when the token cannot list them."""
+    url = f"https://api.github.com/repos/{repo}/actions/runners"
     runners: list[dict] = []
     page = 1
     while True:
         resp = gh_get(url, headers=gh_headers(token), params={"per_page": 100, "page": page})
         if resp.status_code in (401, 403, 404):
             log.warning("Cannot list %s runners (HTTP %d); reading pickups from the jobs instead",
-                        REPO, resp.status_code)
+                        repo, resp.status_code)
             return None
         resp.raise_for_status()
         batch = resp.json().get("runners", [])
@@ -96,7 +105,8 @@ def list_runners(token: str) -> list[dict] | None:
 
 def get_runs(token: str, workflow_file: str, status: str, created_since: datetime,
              event: str | None = None) -> list[dict]:
-    url = f"https://api.github.com/repos/{REPO}/actions/workflows/{workflow_file}/runs"
+    repo, file = workflow_repo(workflow_file)
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{file}/runs"
     params = {
         "status": status,
         "per_page": 100,
@@ -218,18 +228,19 @@ def never_started(jobs: list[dict]) -> bool:
 # Per-workflow check
 # ---------------------------------------------------------------------------
 
-def label_activity(token: str, workflows: list[str], now: datetime) -> dict:
-    """Jobs running and the latest pickup per label set, across *workflows*.
+def label_activity(token: str, workflows: list[str], now: datetime) -> dict[str, dict]:
+    """Per repo, jobs running and the latest pickup per label set, across *workflows*.
 
     Read from every in-progress run, whatever its event: a PR run holding the
     MI35x runners is what keeps a scheduled job waiting, and is not a sign of
     a dead pool.
     """
-    activity: dict = {}
+    activity: dict[str, dict] = {}
     since = now - timedelta(days=LOOKBACK_DAYS)
     for wf in workflows:
+        repo, _ = workflow_repo(wf)
         for run in get_runs(token, wf, "in_progress", since):
-            note_activity(activity, get_run_jobs(token, run["id"]))
+            note_activity(activity.setdefault(repo, {}), get_run_jobs(token, run["id"], repo))
     return activity
 
 
@@ -242,9 +253,11 @@ def check_workflow(token: str, workflow_file: str, runners: list[dict] | None,
     (``workflow_event_filter``): PR runs of pr-test-amd.yml queue for
     reasons of their own, and a stuck manual run that blocks the scheduled
     ones still shows, as scheduled runs cancelled before they started.
-    *activity* (``label_activity``) is updated with these runs' own jobs.
+    *runners* and *activity* are the workflow repo's (``list_runners``,
+    ``label_activity``); *activity* is updated with these runs' own jobs.
     """
     activity = {} if activity is None else activity
+    repo, _ = workflow_repo(workflow_file)
     created_since = now - timedelta(days=LOOKBACK_DAYS)
     event = workflow_event_filter(workflow_file)
     unfinished: dict[int, dict] = {}
@@ -254,7 +267,7 @@ def check_workflow(token: str, workflow_file: str, runners: list[dict] | None,
                 unfinished[run["id"]] = run
 
     run_jobs = [
-        (run, get_run_jobs(token, run["id"]))
+        (run, get_run_jobs(token, run["id"], repo))
         for run in sorted(unfinished.values(), key=lambda r: r.get("created_at") or "")
     ]
     for _, jobs in run_jobs:
@@ -295,7 +308,7 @@ def check_workflow(token: str, workflow_file: str, runners: list[dict] | None,
         updated = _parse_time(run.get("updated_at"))
         if updated is None or updated < finished_since:
             continue
-        if never_started(get_run_jobs(token, run["id"])):
+        if never_started(get_run_jobs(token, run["id"], repo)):
             cancelled.append({"url": run["html_url"], "created_at": run.get("created_at", "")})
 
     return {
@@ -390,11 +403,11 @@ def render_section(results: list[dict], now: datetime, runners_known: bool,
             lines.append(f"- `{wf}`: {', '.join(_run_link(r) for r in runs)}")
         lines.append("")
     status_note = (
-        "Runner status is from sglang's runner list."
+        "Runner status is from each repo's runner list."
         if runners_known else
-        "Runner status is not readable with the bot's token (set `RUNNER_STATUS_TOKEN`), "
-        "so it is read from the jobs: whether any job on the labels is running or was "
-        "picked up after the waiting ones queued."
+        "Where a repo's runner list is not readable with the bot's token (set "
+        "`RUNNER_STATUS_TOKEN`), runner status is read from the jobs: whether any job "
+        "on the labels is running or was picked up after the waiting ones queued."
     )
     lines.append(
         f"<sub>Checked {checked} by code. A job is listed after waiting "
@@ -442,12 +455,14 @@ def main() -> int:
         return 1
 
     now = datetime.now(timezone.utc)
-    runners = list_runners(os.environ.get("RUNNER_STATUS_TOKEN") or token)
+    repos = sorted({workflow_repo(wf)[0] for wf in args.workflows})
+    runners = {r: list_runners(os.environ.get("RUNNER_STATUS_TOKEN") or token, r) for r in repos}
     activity = label_activity(token, args.workflows, now)
     results = []
     for wf in args.workflows:
-        result = check_workflow(token, wf, runners, now, hours_back=args.hours_back,
-                                activity=activity)
+        repo, _ = workflow_repo(wf)
+        result = check_workflow(token, wf, runners[repo], now, hours_back=args.hours_back,
+                                activity=activity.setdefault(repo, {}))
         for g in result["stalled"]:
             log.warning("%s: %d job(s) on %s waiting since %s", wf, g["jobs"],
                         ",".join(g["labels"]), g["queued_since"].isoformat())
@@ -455,7 +470,8 @@ def main() -> int:
             log.warning("%s: %d run(s) cancelled before starting", wf, len(result["cancelled"]))
         results.append(result)
 
-    section = render_section(results, now, runners is not None, hours_back=args.hours_back)
+    section = render_section(results, now, None not in runners.values(),
+                             hours_back=args.hours_back)
     if args.output == "stdout":
         print(section)
         return 0

@@ -35,6 +35,23 @@ REPO_OWNER = "sgl-project"
 REPO_NAME = "sglang"
 REPO = f"{REPO_OWNER}/{REPO_NAME}"
 
+
+def workflow_repo(workflow: str) -> tuple[str, str]:
+    """``(repo, workflow file)`` of a monitored workflow.
+
+    sglang's workflows are named by their file alone (``pr-test-amd.yml``);
+    another repo's carry it in front (``sgl-project/sgl-amd-mono/nightly-amd.yml``),
+    so the name says where the runs are and cannot clash with an sglang file.
+    """
+    repo, _, file = workflow.rpartition("/")
+    return repo or REPO, file
+
+
+def job_repo(job: dict) -> str:
+    """The repo a job from the Actions API belongs to (its ``url``)."""
+    m = re.match(r"https://api\.github\.com/repos/([^/]+/[^/]+)/", job.get("url") or "")
+    return m.group(1) if m else REPO
+
 CLAUDE_MODEL = "claude-opus-5-5"
 
 STEP_LOG_PREFILTER_THRESHOLD = 150_000
@@ -42,6 +59,20 @@ STEP_LOG_PREFILTER_THRESHOLD = 150_000
 MI355X_DISAGG_WORKFLOW = "nightly-amd-mi355x-disagg.yml"
 MI355X_ARTIFACT_PREFIX = "mi355x-"
 MI355X_ARTIFACT_CONTEXT_MAX_CHARS = 120_000
+
+MONO_NIGHTLY_WORKFLOW = "sgl-project/sgl-amd-mono/nightly-amd.yml"
+
+# Workflows whose evidence is in run artifacts rather than the job log, and
+# the prefix of those artifacts' names. They are downloaded for the agent
+# into ``.ci-context/<prefix>artifacts`` (``prepare_run_artifact_context``).
+RUN_ARTIFACT_PREFIXES = {
+    # The prefill / decode / router server logs of the multi-node benchmark.
+    MI355X_DISAGG_WORKFLOW: MI355X_ARTIFACT_PREFIX,
+    # Per model: result.json and the logs of every step (unit, kernels,
+    # pinned contract, server, evals, benchmarks). The failing job is often
+    # ``report``, whose own log only has the exit code.
+    MONO_NIGHTLY_WORKFLOW: "mono-ci-",
+}
 
 # Miles (radixark/miles) RL-training workflows. Their runs are on sglang main,
 # but what they test is /root/miles inside a dated image that the build
@@ -158,9 +189,9 @@ def is_runner_lost(job: dict) -> bool:
     return not any(s.get("conclusion") in _STEP_FAILED for s in job.get("steps") or [])
 
 
-def get_job_annotations(token: str, job_id: int) -> list[dict] | None:
+def get_job_annotations(token: str, job_id: int, repo: str = REPO) -> list[dict] | None:
     """The check-run annotations of a job, or None when they could not be read."""
-    url = f"https://api.github.com/repos/{REPO}/check-runs/{job_id}/annotations"
+    url = f"https://api.github.com/repos/{repo}/check-runs/{job_id}/annotations"
     try:
         resp = gh_get(url, headers=gh_headers(token), timeout=30)
     except requests.RequestException:
@@ -194,7 +225,7 @@ def runner_lost_evidence(
         f"- Started {job.get('started_at')}, marked failed {job.get('completed_at')}",
         f"- Lost during: {_lost_at_step(job)}",
     ]
-    anns = get_job_annotations(token, job["id"]) if token else None
+    anns = get_job_annotations(token, job["id"], job_repo(job)) if token else None
     msg = next((a.get("message", "") for a in anns or []
                 if RUNNER_LOST_ANNOTATION in a.get("message", "")), None)
     if msg:
@@ -215,13 +246,13 @@ def runner_lost_evidence(
     return "\n".join(lines)
 
 
-def get_failed_jobs(token: str, run_id: int) -> list[dict]:
+def get_failed_jobs(token: str, run_id: int, repo: str = REPO) -> list[dict]:
     """Get completed non-success, non-skipped jobs for a workflow run.
 
     Only returns jobs whose status is 'completed' so that still-running
     jobs in an in-progress workflow are not picked up prematurely.
     """
-    jobs = get_run_jobs(token, run_id)
+    jobs = get_run_jobs(token, run_id, repo)
     return [
         j for j in jobs
         if j.get("status") == "completed"
@@ -294,9 +325,9 @@ def gh_get(url: str, headers: dict, **kwargs) -> requests.Response:
     raise AssertionError("unreachable")
 
 
-def download_job_logs(token: str, job_id: int) -> str:
+def download_job_logs(token: str, job_id: int, repo: str = REPO) -> str:
     """Download full logs for a GitHub Actions job."""
-    url = f"https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs"
+    url = f"https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs"
     resp = gh_get(url, headers=gh_headers(token), allow_redirects=True)
     if resp.status_code == 200:
         # The log response has no charset, so requests would decode it as
@@ -369,8 +400,8 @@ def _extract_tar_safely(tar_path: Path, dest_dir: Path) -> list[Path]:
     return extracted
 
 
-def _list_run_artifacts(token: str, run_id: int) -> list[dict]:
-    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/artifacts"
+def _list_run_artifacts(token: str, run_id: int, repo: str = REPO) -> list[dict]:
+    url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts"
     artifacts: list[dict] = []
     page = 1
     while True:
@@ -407,52 +438,56 @@ def _download_artifact_archive(token: str, artifact: dict, target: Path) -> None
                     f.write(chunk)
 
 
-def prepare_mi355x_artifact_context(
+def prepare_run_artifact_context(
     token: str | None,
     run_id: int,
     work_dir: Path,
+    workflow_file: str = MI355X_DISAGG_WORKFLOW,
 ) -> Path | None:
-    """Download and unpack MI355X disagg workflow artifacts for an agent.
+    """Download and unpack a run's evidence artifacts for an agent.
 
-    The nightly MI355X disagg workflow uploads the useful server-side evidence
+    Some workflows (``RUN_ARTIFACT_PREFIXES``) upload their useful evidence
     as run artifacts, not only as GitHub job logs.  This helper materializes
-    those artifacts under ``.ci-context/mi355x-artifacts`` and writes a manifest
-    that the agent can read before diagnosing the failure.
+    the artifacts with the workflow's prefix under
+    ``.ci-context/<prefix>artifacts`` and writes a manifest that the agent can
+    read before diagnosing the failure.
     """
     _log = logging.getLogger("ci-monitor")
+    prefix = RUN_ARTIFACT_PREFIXES[workflow_file]
+    repo, _ = workflow_repo(workflow_file)
     if not token:
-        _log.warning("No GitHub token available; cannot pre-download MI355X artifacts")
+        _log.warning("No GitHub token available; cannot pre-download %s* artifacts", prefix)
         return None
 
     context_dir = work_dir / ".ci-context"
-    artifact_root = context_dir / "mi355x-artifacts"
+    artifact_root = context_dir / f"{prefix}artifacts"
     if artifact_root.exists():
         shutil.rmtree(artifact_root)
     artifact_root.mkdir(parents=True, exist_ok=True)
 
     try:
-        run_artifacts = _list_run_artifacts(token, run_id)
+        run_artifacts = _list_run_artifacts(token, run_id, repo)
     except Exception as exc:
-        _log.warning("Failed to list MI355X artifacts for run %s: %s", run_id, exc)
+        _log.warning("Failed to list %s* artifacts for run %s: %s", prefix, run_id, exc)
         shutil.rmtree(artifact_root, ignore_errors=True)
         return None
 
     artifacts = [
         a for a in run_artifacts
-        if not a.get("expired") and a.get("name", "").startswith(MI355X_ARTIFACT_PREFIX)
+        if not a.get("expired") and a.get("name", "").startswith(prefix)
     ]
     if not artifacts:
-        _log.warning("No MI355X artifacts found for run %s", run_id)
+        _log.warning("No %s* artifacts found for run %s", prefix, run_id)
         shutil.rmtree(artifact_root, ignore_errors=True)
         return None
 
     manifest: list[str] = [
-        "# MI355X Disagg Artifact Context",
+        f"# Artifact Context: {workflow_file}",
         "",
-        f"Workflow run: https://github.com/{REPO}/actions/runs/{run_id}",
+        f"Workflow run: https://github.com/{repo}/actions/runs/{run_id}",
         "",
         "These files were downloaded from run artifacts before analysis. "
-        "For this workflow, prefill/decode/router evidence usually lives here.",
+        "For this workflow, the failure's evidence usually lives here.",
         "",
         "## Downloaded Artifacts",
         "",
@@ -509,8 +544,8 @@ def prepare_mi355x_artifact_context(
     manifest_path = artifact_root / "MANIFEST.md"
     manifest_path.write_text("\n".join(manifest) + "\n")
     _log.info(
-        "Prepared MI355X artifact context for run %s: %d artifact(s), %d extracted file(s)",
-        run_id, len(artifacts), len(important_files),
+        "Prepared %s* artifact context for run %s: %d artifact(s), %d extracted file(s)",
+        prefix, run_id, len(artifacts), len(important_files),
     )
     return artifact_root
 
@@ -1139,9 +1174,9 @@ def get_workflow_runs_for_sha(token: str, head_sha: str) -> list[dict]:
     return all_runs
 
 
-def get_run_jobs(token: str, run_id: int) -> list[dict]:
+def get_run_jobs(token: str, run_id: int, repo: str = REPO) -> list[dict]:
     """Get every latest-attempt job for a workflow run across all API pages."""
-    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
+    url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
     all_jobs: list[dict] = []
     seen_job_ids: set[int] = set()
     page = 1
@@ -1219,6 +1254,7 @@ def extract_error_lines(
     job_id: int,
     failed_step_names: set[str] | None = None,
     max_errors_per_step: int = 10,
+    repo: str = REPO,
 ) -> list[dict]:
     """Extract errors from failed steps using structural signals.
 
@@ -1272,7 +1308,7 @@ def extract_error_lines(
                 step_errors.append({
                     "step_name": step_name,
                     "preview": msg[:200],
-                    "url": _step_url(run_id, job_id, step_num, line_idx),
+                    "url": _step_url(run_id, job_id, step_num, line_idx, repo),
                     "line_number": line_idx + 1,
                     "source": "annotation",
                 })
@@ -1282,7 +1318,7 @@ def extract_error_lines(
                 step_errors.append({
                     "step_name": step_name,
                     "preview": clean[:200],
-                    "url": _step_url(run_id, job_id, step_num, line_idx),
+                    "url": _step_url(run_id, job_id, step_num, line_idx, repo),
                     "line_number": line_idx + 1,
                     "source": "exception",
                 })
@@ -1294,7 +1330,7 @@ def extract_error_lines(
                     step_errors.append({
                         "step_name": step_name,
                         "preview": clean[:200],
-                        "url": _step_url(run_id, job_id, step_num, line_idx),
+                        "url": _step_url(run_id, job_id, step_num, line_idx, repo),
                         "line_number": line_idx + 1,
                         "source": "tail",
                     })
@@ -1306,9 +1342,9 @@ def extract_error_lines(
 
 
 def _step_url(
-    run_id: int, job_id: int, step_num: int | None, line_idx: int,
+    run_id: int, job_id: int, step_num: int | None, line_idx: int, repo: str = REPO,
 ) -> str:
-    base = f"https://github.com/{REPO}/actions/runs/{run_id}/job/{job_id}"
+    base = f"https://github.com/{repo}/actions/runs/{run_id}/job/{job_id}"
     if step_num is not None:
         return f"{base}#step:{step_num}:{line_idx + 1}"
     return base
@@ -1676,8 +1712,9 @@ def analyze_job_with_agent(
         if s.get("conclusion") not in ("success", "skipped", None)
     }
 
+    repo, _ = workflow_repo(workflow_file)
     artifact_lines = ""
-    if _is_mi355x_disagg_workflow(workflow_file):
+    if workflow_file in RUN_ARTIFACT_PREFIXES:
         run_id = _run_id_from_url(run_url)
         if run_id is not None:
             artifact_token = (
@@ -1686,16 +1723,16 @@ def analyze_job_with_agent(
                 or os.environ.get("BOT_PAT")
                 or os.environ.get("GITHUB_TOKEN")
             )
-            artifact_root = prepare_mi355x_artifact_context(
-                artifact_token, run_id, repo_path,
+            artifact_root = prepare_run_artifact_context(
+                artifact_token, run_id, repo_path, workflow_file,
             )
             manifest = (
                 f"{artifact_root.relative_to(repo_path)}/MANIFEST.md"
                 if artifact_root is not None else "unavailable"
             )
             artifact_lines = (
-                f"Artifact API URL: https://api.github.com/repos/{REPO}/actions/runs/{run_id}/artifacts\n"
-                f"Artifact name prefix: {MI355X_ARTIFACT_PREFIX}\n"
+                f"Artifact API URL: https://api.github.com/repos/{repo}/actions/runs/{run_id}/artifacts\n"
+                f"Artifact name prefix: {RUN_ARTIFACT_PREFIXES[workflow_file]}\n"
                 f"Artifact context: {manifest}\n"
             )
     elif is_miles_workflow(workflow_file):
@@ -1728,6 +1765,7 @@ def analyze_job_with_agent(
             f"sglang source: {sglang_src}\n"
         )
 
+    repo_line = f"Repo: {repo}\n" if repo != REPO else ""
     event_line = f"Event filter: {event_filter}\n" if event_filter else ""
     runner_lost_lines = ""
     if is_runner_lost(job):
@@ -1743,8 +1781,9 @@ def analyze_job_with_agent(
         f"Job ID: {job_id}\n"
         f"Commit SHA: {head_sha}\n"
         f"Workflow file: {workflow_file}\n"
+        f"{repo_line}"
         f"{event_line}"
-        f"Log URL: https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs\n"
+        f"Log URL: https://api.github.com/repos/{repo}/actions/jobs/{job_id}/logs\n"
         f"{runner_lost_lines}"
         f"{artifact_lines}"
         f"Source: current directory\n"
@@ -1793,12 +1832,13 @@ def analyze_job_api(
         if s.get("conclusion") not in ("success", "skipped", None)
     }
 
+    repo, _ = workflow_repo(workflow_file)
     _log.info("  [%s] Downloading logs...", job_name)
-    raw_log = download_job_logs(token, job_id)
+    raw_log = download_job_logs(token, job_id, repo)
     _log.info("  [%s] Log: %s chars", job_name, f"{len(raw_log):,}")
 
     all_errors = extract_error_lines(
-        raw_log, job.get("steps", []), run_id, job_id,
+        raw_log, job.get("steps", []), run_id, job_id, repo=repo,
     )
     error_lines = [e for e in all_errors if e["source"] != "tail"]
     _log.info("  [%s] Extracted %d error signal(s)", job_name, len(error_lines))
@@ -1819,7 +1859,7 @@ def analyze_job_api(
     if _is_mi355x_disagg_workflow(workflow_file):
         _log.info("  [%s] Downloading MI355X run artifacts...", job_name)
         with tempfile.TemporaryDirectory(prefix="mi355x-artifacts-") as tmp:
-            artifact_root = prepare_mi355x_artifact_context(token, run_id, Path(tmp))
+            artifact_root = prepare_run_artifact_context(token, run_id, Path(tmp))
             if artifact_root is not None:
                 artifact_excerpt = build_artifact_context_excerpt(artifact_root)
                 if artifact_excerpt:
@@ -1943,9 +1983,12 @@ def cross_job_analysis(
         if not work_dir.exists():
             raise FileNotFoundError(f"Repo not found at {work_dir}")
 
+        repo, _ = workflow_repo(workflow_name)
+        repo_line = f"Repo: {repo}\n" if repo != REPO else ""
         prompt = (
             f"Task: Cross-Job Summary\n"
             f"Workflow: {workflow_name}\n"
+            f"{repo_line}"
             f"Number of failed jobs: {len(job_analyses)}\n"
             f"Per-job analyses: .ci-context/per-job-analyses.md\n"
             f"Source: current directory\n"
@@ -2023,13 +2066,13 @@ def agent_failure_notice(what: str, reason: object) -> str:
     )
 
 
-def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
+def create_agent_worktree(tag: str, head_sha: str = "", source: Path | None = None) -> Path:
     """Create an isolated git worktree for a parallel agent.
 
-    Requires the main repo at ``SGLANG_REPO_PATH`` to exist (call
-    ``ensure_sglang_repo()`` first).  Each worktree lives at
-    ``/workspace/sglang-wt-{tag}`` and is a cheap copy that shares
-    the git object store with the main repo.
+    Requires the main repo at *source* (default ``SGLANG_REPO_PATH``) to
+    exist (call ``ensure_sglang_repo()`` or ``ensure_source_repo()`` first).
+    Each worktree lives at ``/workspace/<source name>-wt-{tag}`` and is a
+    cheap copy that shares the git object store with the main repo.
 
     If *head_sha* is provided, the worktree is checked out to that
     commit so the agent sees the exact code that was tested in CI.
@@ -2037,29 +2080,30 @@ def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
     Returns the worktree path.  Call ``remove_agent_worktree()`` to
     clean up when done.
     """
+    source = source or SGLANG_REPO_PATH
     safe_tag = re.sub(r"[^\w\-]", "_", str(tag))
-    wt_path = AGENT_WORKSPACE / f"sglang-wt-{safe_tag}"
+    wt_path = AGENT_WORKSPACE / f"{source.name}-wt-{safe_tag}"
     branch_name = f"wt-{safe_tag}"
 
     if wt_path.exists():
         _agent_log.info("Removing stale worktree %s", wt_path)
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(wt_path)],
-            cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
+            cwd=source, capture_output=True, timeout=30,
         )
         if wt_path.exists():
             shutil.rmtree(wt_path)
 
     subprocess.run(
         ["git", "branch", "-D", branch_name],
-        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=10,
+        cwd=source, capture_output=True, timeout=10,
     )
 
     start_point = head_sha if head_sha else "HEAD"
     _agent_log.info("Creating worktree %s (at %s)", wt_path, start_point[:12])
     result = subprocess.run(
         ["git", "worktree", "add", "-b", branch_name, str(wt_path), start_point],
-        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=60,
+        cwd=source, capture_output=True, timeout=60,
     )
     if result.returncode != 0:
         if head_sha:
@@ -2068,7 +2112,7 @@ def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
             )
             result = subprocess.run(
                 ["git", "worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
-                cwd=SGLANG_REPO_PATH, capture_output=True, timeout=60,
+                cwd=source, capture_output=True, timeout=60,
             )
         if result.returncode != 0:
             raise RuntimeError(
@@ -2080,14 +2124,15 @@ def create_agent_worktree(tag: str, head_sha: str = "") -> Path:
     return wt_path
 
 
-def remove_agent_worktree(wt_path: Path):
-    """Remove a worktree created by ``create_agent_worktree()``."""
+def remove_agent_worktree(wt_path: Path, source: Path | None = None):
+    """Remove a worktree created by ``create_agent_worktree()`` from *source*."""
     if not wt_path.exists():
         return
+    source = source or SGLANG_REPO_PATH
     _agent_log.info("Removing worktree %s", wt_path)
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(wt_path)],
-        cwd=SGLANG_REPO_PATH, capture_output=True, timeout=30,
+        cwd=source, capture_output=True, timeout=30,
     )
     if wt_path.exists():
         shutil.rmtree(wt_path, ignore_errors=True)
@@ -2199,6 +2244,34 @@ def ensure_sglang_repo(ref: str = "main") -> Path:
     _remove_deployed_claude_md()
     _agent_log.info("sglang repo ready at %s", SGLANG_REPO_PATH)
     return SGLANG_REPO_PATH
+
+
+_source_repo_lock = threading.Lock()
+
+
+def ensure_source_repo(repo: str) -> Path:
+    """The clone the agents read for a workflow of *repo*.
+
+    sglang's is ``ensure_sglang_repo()``. Another repo (see
+    ``workflow_repo()``) gets a full clone at ``/workspace/<owner>__<name>``,
+    fetched on every call, so a worktree can be made at any commit of a run.
+    """
+    if repo == REPO:
+        return ensure_sglang_repo()
+    path = AGENT_WORKSPACE / repo.replace("/", "__")
+    with _source_repo_lock:
+        if (path / ".git").exists():
+            subprocess.run(["git", "worktree", "prune"], cwd=path, capture_output=True, timeout=30)
+            subprocess.run(["git", "fetch", "origin", "--prune"], cwd=path,
+                           capture_output=True, timeout=300)
+        else:
+            if path.exists():
+                shutil.rmtree(path)
+            AGENT_WORKSPACE.mkdir(parents=True, exist_ok=True)
+            _agent_log.info("Cloning %s to %s...", repo, path)
+            subprocess.run(["git", "clone", f"https://github.com/{repo}.git", str(path)],
+                           capture_output=True, timeout=600, check=True)
+    return path
 
 
 def _remove_deployed_claude_md(target_dir: Path | None = None):
