@@ -84,9 +84,10 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 
 **Known gap:** `@amd-bot review` posts the review agent's text as it is, with no code check in between. Closing it (code checks plus verifier agents on every finding) is an open proposal.
 
-<a id="r3"></a>**R3. People decide.** The bot reports, attributes and suggests triage steps. It never approves, merges, prioritizes or reruns sglang work. Two automated writes go further:
+<a id="r3"></a>**R3. People decide.** The bot reports, attributes and suggests triage steps. It never approves, merges, prioritizes or reruns sglang work. Three automated writes go further:
 - the coverage audit merges, into ROCm/sglang-ci, exclusion entries that code validated and tested;
 - CI autofix opens **draft** PRs on sglang. It never marks them ready, merges them or asks anyone to review them, and the jobs it re-runs are on its own branches.
+- [auto-rerun](#auto-rerun) re-runs the failed jobs of a scheduled sglang run once, and only when code (log patterns, no agent) finds a transient network or infrastructure error. A run with any real failure among several transient ones is left alone.
 
 *Why:* priority and merging need context the bot does not have. *Kept by:* review only.
 
