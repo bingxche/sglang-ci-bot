@@ -152,7 +152,7 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 | `<!-- ci-monitor-cross-run-summary: <wf> -->` | daily issue | a workflow's cross-run comment |
 | `<!-- ci-monitor-suspect-pr-log -->` | daily issue | every suspect decision this tick, and why |
 | `<!-- amd-bot-suspect-pr:<cluster> -->`, `<!-- amd-bot-suspect-fix:<pr> -->` | sglang PRs | a suspect comment / a fix-review request was posted |
-| `<!-- ci-failure-tracker-state: … -->` | Failure Tracker issue body | every failure's `first_seen` / `last_seen` |
+| `<!-- ci-failure-tracker-state: … -->` | Failure Tracker issue body | `first_seen` / `last_seen` of every failure seen in the last 30 days |
 | 🚀 reaction by amd-bot | the `@amd-bot` comment | the command was claimed; no other watcher dispatches it |
 | `<!-- ci-autofix-log -->` with `<!-- ci-autofix-state:v1 … -->` | daily issue | CI autofix's log and state: per problem its attempts, branch, dispatched run and PR; the problems started each hour; who was notified. Carried over from the latest earlier day |
 | `<!-- ci-autofix-queue-notice -->` | daily issue | a notice that @-mentions the owner when problems first wait for their hour |
@@ -304,17 +304,21 @@ Each decision is kept in the monitor state under `auto_rerun`, keyed `<run_id>:<
 
 ### 5.3 Failure Trackers
 
-**Purpose.** One long-lived issue on sgl-project/sglang per tracked workflow, `[Failure Tracker] <name>`. It lists every test failure that workflow has shown and how long it has been red, beyond the daily report's 24 h window and GitHub's log retention.
+**Purpose.** One long-lived issue on sgl-project/sglang per tracked workflow, `[Failure Tracker] <name>`. It lists the test failures that workflow has shown recently and how long each has been red, beyond the daily report's 24 h window and GitHub's log retention. Like the daily report, it covers only the scheduled runs on `main`, so it answers "was this already red on main?". sglang contributors link it in their PRs for that.
 
 **Flow** ([`update_trackers()`](scripts/failure_tracker.py), once per tick in `finalize`):
-1. **Content.** A small, JSON-only agent task (Failure Tracker Data) reads the same per-job analyses as the daily report. If the agent fails, [`deterministic_rows()`](scripts/failure_tracker.py) parses each analysis's `Failed Tests` table instead.
-2. **State.** [`merge_state()`](scripts/failure_tracker.py) keeps each failure, keyed by test file and function, in a hidden JSON blob in the issue body:
-   - an existing failure keeps its `first_seen` and only updates `last_seen`;
+1. **Find the issue** ([`find_tracker_issue()`](scripts/failure_tracker.py)). It lists the open issues labelled `ci-failure-tracker` and falls back to search only when none matches. Search alone once missed the existing tracker on two ticks in a row (2026-10-22) and created two duplicates. If several open issues match, the most recently updated one is used and a warning names the others.
+2. **Content.** A small, JSON-only agent task (Failure Tracker Data) reads the same per-job analyses as the daily report. If the agent fails, [`deterministic_rows()`](scripts/failure_tracker.py) parses each analysis's `Failed Tests` table instead.
+3. **State.** [`merge_state()`](scripts/failure_tracker.py) keeps each failure, keyed by test file and function, in a hidden JSON blob in the issue body:
+   - an existing failure keeps its `first_seen` and only updates `last_seen`, so a test that stays red keeps its original "Broken since" date;
    - a new failure is dated today;
-   - nothing is ever deleted or re-dated.
+   - [`prune_state()`](scripts/failure_tracker.py) drops a failure that has not been seen for [`RETENTION_DAYS`](scripts/failure_tracker.py) (30). If it comes back later, it starts again as new.
 
    The LLM is never asked to remember dates.
-3. **Render** the table, linking each row back to its analysis in that day's daily issue.
+4. **Render** the table, linking each row back to its analysis in that day's daily issue. [`render_bounded_body()`](scripts/failure_tracker.py) keeps the body within [`MAX_BODY_BYTES`](scripts/failure_tracker.py) by dropping the oldest quiet failures first.
+5. **Write and check.** After the PATCH, the body is read back. If it is not what was sent, the step fails.
+
+**Why the size bound and the read-back.** GitHub saves at most 262,144 UTF-8 bytes of issue body ([`GITHUB_ISSUE_BODY_MAX_BYTES`](scripts/utils.py)). A larger PATCH still gets `200 OK` with the new body echoed back, but the old body stays. The tracker used to grow without bound, so it froze without any error: #37451 from 2026-09-03 and #45847 from 2026-10-25 until 2026-11-12. [`update_issue_body()`](scripts/utils.py) now refuses an oversized body for every caller, and the tracker step exits non-zero whenever a tracker could not be updated.
 
 Tracked workflows are configured in [`TRACKED_WORKFLOWS`](scripts/failure_tracker.py), currently `pr-test-amd.yml`. Adding an entry is all it takes to get a new tracker.
 
@@ -379,6 +383,12 @@ Paste a run or job URL into **Actions → Analyze CI**. [`run_analysis()`](scrip
    - verifies the rows it created, and that the official table is unchanged.
 
 The agent never receives the Notion token. Manual runs default to `dry-run`.
+
+**Status: paused since 2026-11-12.** `notion-staging.yml` is disabled in the Actions settings, so neither the schedule nor the button runs it. To resume, enable it there. It was paused for two reasons:
+- **Nobody owns the staging table.** The official table stayed at 44 rows while staging grew past 660.
+- **The duplicate check does not hold across days.** Each daily run re-reads 7 days of reports, so the same stable failure is proposed again every day. [`is_duplicate()`](scripts/stage_notion.py) matches on the agent's wording, which changes from day to day. From 2026-11-03 to 2026-11-11 the check caught only 0–7 candidates per day, and 8–16 new rows were written each day.
+
+Before resuming, someone needs to own the review, the duplicate check needs a key that does not depend on wording (test file, test function, error class), and the duplicate rows need to be cleaned up.
 
 ### 5.9 Coverage exclusion audit
 

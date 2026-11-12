@@ -1111,6 +1111,11 @@ def get_issue(token: str, repo: str, issue_number: int) -> dict:
     return resp.json()
 
 
+# An issue body over this many UTF-8 bytes gets a 200 from PATCH but is not
+# saved (measured 2026-11-12).
+GITHUB_ISSUE_BODY_MAX_BYTES = 262_144
+
+
 def update_issue_body(
     token: str, repo: str, issue_number: int, body: str,
 ) -> dict:
@@ -1121,6 +1126,13 @@ def update_issue_body(
     issue), instead of posting a separate comment that would land
     below the per-workflow comments.
     """
+    size = len(body.encode("utf-8"))
+    if size > GITHUB_ISSUE_BODY_MAX_BYTES:
+        # GitHub would answer 200 and silently keep the old body.
+        raise ValueError(
+            f"issue #{issue_number} body is {size} bytes; GitHub keeps at most "
+            f"{GITHUB_ISSUE_BODY_MAX_BYTES}"
+        )
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
     resp = requests.patch(url, headers=gh_headers(token), json={"body": body})
     resp.raise_for_status()

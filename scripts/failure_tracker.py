@@ -97,6 +97,16 @@ TRACKED_WORKFLOWS: dict[str, dict] = {
 
 TRACKER_LABEL = "ci-failure-tracker"
 
+# A failure not seen for this many days is dropped from the tracker. One still
+# failing keeps its first_seen however old it is; only quiet ones expire.
+RETENTION_DAYS = 30
+
+# Body budget, kept below GitHub's 262,144-byte cap (GITHUB_ISSUE_BODY_MAX_BYTES):
+# over the cap GitHub answers 200 but keeps the old body, which froze #45847
+# from 2026-10-25 and #37451 from 2026-09-03. Past it, the oldest quiet
+# entries are dropped first.
+MAX_BODY_BYTES = 250_000
+
 # Body markers (generic, shared across all per-workflow tracker issues — they
 # are scoped inside each issue's own body). We always rewrite the FULL body,
 # so these markers exist only for recovering the persisted state blob.
@@ -282,6 +292,20 @@ def merge_state(state: dict, rows: list[dict], today: str, detail_base: str) -> 
     return state
 
 
+def prune_state(state: dict, today: str, retention_days: int = RETENTION_DAYS) -> int:
+    """Drop entries not seen for more than ``retention_days``; return how many.
+
+    Entries with an unparseable ``last_seen`` are kept.
+    """
+    expired = [
+        key for key, e in state.items()
+        if _days_between(e.get("last_seen", ""), today) > retention_days
+    ]
+    for key in expired:
+        del state[key]
+    return len(expired)
+
+
 # ---------------------------------------------------------------------------
 # 4. Rendering
 # ---------------------------------------------------------------------------
@@ -403,22 +427,84 @@ def render_body(
     return "\n".join(lines)
 
 
+def render_bounded_body(
+    workflow: str,
+    display: str,
+    state: dict,
+    snapshot_utc: str,
+    bot_daily_url: str,
+    max_bytes: int = MAX_BODY_BYTES,
+) -> tuple[str, int]:
+    """Render the body within ``max_bytes``, dropping the oldest quiet entries.
+
+    Mutates ``state`` (dropped entries leave it) and returns the body and how
+    many entries were dropped. Raises ``ValueError`` if the entries failing
+    today alone do not fit.
+    """
+    today = snapshot_utc.split(" ")[0]
+    quiet = sorted(
+        (k for k, e in state.items() if e.get("last_seen") != today),
+        key=lambda k: (state[k].get("last_seen", ""), state[k].get("first_seen", "")),
+    )
+    dropped = 0
+    while True:
+        body = render_body(workflow, display, state, snapshot_utc, bot_daily_url)
+        size = len(body.encode("utf-8"))
+        if size <= max_bytes:
+            return body, dropped
+        if not quiet:
+            raise ValueError(
+                f"tracker body is {size} bytes with only today's failures "
+                f"(budget {max_bytes})"
+            )
+        del state[quiet.pop(0)]
+        dropped += 1
+
+
 # ---------------------------------------------------------------------------
 # 5. Upstream issue find / create / update (per workflow)
 # ---------------------------------------------------------------------------
 
 def find_tracker_issue(token: str, title: str) -> int | None:
-    """Find an open issue with EXACTLY this title on the upstream repo."""
-    q = f'repo:{REPO} is:issue is:open in:title "{title}"'
+    """Find an open issue with EXACTLY this title on the upstream repo.
+
+    Lists the labelled issues first: the search index can lag or miss, and on
+    2026-10-22 two ticks in a row found nothing and created duplicates. Search
+    stays as a fallback for an issue that lost its label (or a legacy title).
+    If several match, the most recently updated one wins.
+    """
+    found: dict[int, dict] = {}
     resp = gh_get(
-        "https://api.github.com/search/issues",
-        headers=gh_headers(token), params={"q": q, "per_page": 20},
+        f"https://api.github.com/repos/{REPO}/issues",
+        headers=gh_headers(token),
+        params={"labels": TRACKER_LABEL, "state": "open", "per_page": 100},
     )
     resp.raise_for_status()
-    for item in resp.json().get("items", []):
-        if item.get("title") == title:
-            return item["number"]
-    return None
+    for item in resp.json():
+        if "pull_request" not in item:
+            found[item["number"]] = item
+    if not any(i.get("title") == title for i in found.values()):
+        q = f'repo:{REPO} is:issue is:open in:title "{title}"'
+        resp = gh_get(
+            "https://api.github.com/search/issues",
+            headers=gh_headers(token), params={"q": q, "per_page": 20},
+        )
+        resp.raise_for_status()
+        for item in resp.json().get("items", []):
+            found[item["number"]] = item
+    matches = [
+        i for i in found.values()
+        if i.get("title") == title and i.get("state", "open") == "open"
+    ]
+    if not matches:
+        return None
+    matches.sort(key=lambda i: (i.get("updated_at") or "", i["number"]), reverse=True)
+    if len(matches) > 1:
+        log.warning(
+            "Several open issues titled %r: %s; using #%d",
+            title, ", ".join(f"#{i['number']}" for i in matches), matches[0]["number"],
+        )
+    return matches[0]["number"]
 
 
 def _rename_issue(token: str, issue_num: int, title: str) -> None:
@@ -476,14 +562,27 @@ def update_one_workflow(
     issue = get_issue(token, REPO, issue_num)
     state = load_state(issue.get("body", ""))
     state = merge_state(state, rows, today, detail_base)
+    expired = prune_state(state, today)
 
-    new_body = render_body(
+    new_body, dropped = render_bounded_body(
         workflow, cfg["display"], state, snapshot_utc, bot_daily_url,
     )
+    if expired or dropped:
+        log.info(
+            "[%s] dropped %d entries quiet over %d days and %d more to fit %d bytes",
+            workflow, expired, RETENTION_DAYS, dropped, MAX_BODY_BYTES,
+        )
     if new_body.strip() == (issue.get("body") or "").strip():
         log.info("[%s] tracker #%d unchanged; skipping PATCH", workflow, issue_num)
         return issue_num
     update_issue_body(token, REPO, issue_num, new_body)
+    # A 2xx PATCH is not proof the body was saved (see MAX_BODY_BYTES).
+    saved = (get_issue(token, REPO, issue_num).get("body") or "").strip()
+    if saved != new_body.strip():
+        raise RuntimeError(
+            f"tracker #{issue_num} body was not saved "
+            f"({len(new_body.encode('utf-8'))} bytes sent, {len(saved.encode('utf-8'))} read back)"
+        )
     log.info(
         "[%s] updated tracker #%d (%d tracked, %d failing this scan)",
         workflow, issue_num, len(state), len(rows),
@@ -624,7 +723,7 @@ def update_trackers(
                 token, wf, cfg, bot_repo, issue_num, by_wf[wf], snapshot_utc,
             )
         except Exception as exc:
-            log.warning("[%s] tracker update failed (%s)", wf, exc)
+            log.error("[%s] tracker update failed (%s)", wf, exc)
             results[wf] = None
     return results
 
@@ -665,8 +764,9 @@ def main() -> int:
         date_str=args.date, use_agent=args.use_agent,
     )
     for wf, num in results.items():
-        log.info("%s → issue %s", wf, f"#{num}" if num else "(skipped)")
-    return 0
+        log.info("%s → issue %s", wf, f"#{num}" if num else "(failed)")
+    # Fail the step so a tracker that stops updating shows up as a red run.
+    return 1 if any(num is None for num in results.values()) else 0
 
 
 if __name__ == "__main__":
