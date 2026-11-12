@@ -233,12 +233,12 @@ def check_dispatched(pid: str, entry: dict, gh: GitHub, state: dict, now: dateti
     if result == "verified":
         if not gh.pr_for_branch(rec["branch"], rec["head_sha"]):
             since = (plan.get("first_fail") or {}).get("at") or rec["dispatched_at"]
-            # A fix PR opened since the test last passed comes first, however long the attempt took.
-            other, stalled = find_fix_pr(gh, [tuple(t) for t in plan["tests"]], since, now,
-                                         (plan.get("last_pass") or {}).get("at"),
-                                         exclude={(plan.get("suspect") or {}).get("pr")})
+            other = find_fix_pr(gh, [tuple(t) for t in plan["tests"]], since,
+                                exclude={(plan.get("suspect") or {}).get("pr")})
             # The stalled PRs autofix went ahead of: one may have merged since, or closed.
-            current = {n: gh.pull(n) or {} for n in dict.fromkeys((plan.get("stalled_fix_prs") or []) + stalled)}
+            current = {n: gh.pull(n) for n in plan.get("stalled_fix_prs") or []}
+            if any(pr is None for pr in current.values()):
+                return  # whether it merged cannot be read now: ask again next tick
             other = other or next((n for n, pr in current.items() if pr.get("merged_at")), None)
             if other is not None:
                 give_up(state, pid, entry, now, "fix passed, but another fix PR came first", f"#{other} came first")

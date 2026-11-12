@@ -221,8 +221,8 @@ def render_pr_body(template: str, plan: dict, fix: dict, verification: dict, che
     if stalled:
         links = ", ".join(f"#{n}" for n in stalled)
         many = len(stalled) > 1
-        motivation += (f"\n\n{links} also {'change' if many else 'changes'} this test, but {'were' if many else 'was'} "
-                       f"opened before it broke and {'have' if many else 'has'} not merged in over "
+        motivation += (f"\n\nThe CI report lists {links} as a fix for this failure, but {'they were' if many else 'it was'} "
+                       f"opened before the test broke and {'have' if many else 'has'} not merged in over "
                        f"{FIX_PR_STALE_HOURS} hours.")
     modifications = pr["modifications"].strip()
     if fix["fix_kind"] == "workaround":

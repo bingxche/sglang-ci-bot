@@ -56,12 +56,28 @@ def job_family(name: str) -> str:
     return f"{j.base}|{j.rocm}"
 
 
+_RUNNER_LABEL_RE = re.compile(r"linux-[\w.-]+")
+
+
+def _runner_gpu(label: str) -> tuple[str, str | None]:
+    """``linux-mi35x-gpu-1`` → (``mi35x``, ``1``); a label naming no GPU count gives None for it."""
+    arch = re.search(r"mi\d+x?", label)
+    count = re.search(r"(\d+)-?gpu|gpu-(\d+)", label)
+    return (arch.group() if arch else label), (next(g for g in count.groups() if g) if count else None)
+
+
 def same_job(a: str, b: str) -> bool:
     """Two names of one job that may have run on different pools of one GPU: ``x (rocm10, linux-mi35x-gpu-1)``
-    is ``x (rocm10, linux-sglang-mi35x-spur)``. GPUs, partitions, parts and ROCm versions still differ."""
-    def key(name: str) -> str:
-        return re.sub(r"linux-[\w.-]+", lambda m: (re.search(r"mi\d+x?", m.group()) or m).group(), name or "")
-    return key(a) == key(b)
+    is ``x (rocm10, linux-sglang-mi35x-spur)``. GPUs, GPU counts (when both labels name one),
+    partitions, parts and ROCm versions still differ."""
+    ra, rb = _RUNNER_LABEL_RE.findall(a or ""), _RUNNER_LABEL_RE.findall(b or "")
+    if _RUNNER_LABEL_RE.sub("", a or "") != _RUNNER_LABEL_RE.sub("", b or "") or len(ra) != len(rb):
+        return False
+    for x, y in zip(ra, rb):
+        (gx, cx), (gy, cy) = _runner_gpu(x), _runner_gpu(y)
+        if gx != gy or (cx and cy and cx != cy):
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -146,6 +162,7 @@ def dispatch_inputs(recipes: list[Recipe]) -> dict:
     return inputs
 
 
+GPU_MEMORY = "GPU memory taken before the job"
 # (kind, pattern): errors that are infrastructure, for people to handle.
 INFRA_PATTERNS = (
     ("runner lost", r"lost communication with the server|runner has received a shutdown signal"),
@@ -164,8 +181,9 @@ INFRA_PATTERNS = (
      r"failed to (?:pull|resolve) image|manifest unknown|toomanyrequests|pull access denied"
      r"|Error response from daemon|ERROR: failed to solve"),
     # sglang's startup check: other processes already hold most of a GPU's memory (R422, R425).
-    # A server an earlier test leaked would also trip it; that is rare next to busy runners.
-    ("GPU memory taken before the job", r"memory capacity is unbalanced"),
+    # A server an earlier test of the job leaked trips it too: build_plan() counts it only
+    # when the failing file was the job's first (``ran_first()``).
+    (GPU_MEMORY, r"memory capacity is unbalanced"),
     # A system binary loads a library the image shadows, e.g. ffmpeg picking up torch's
     # libtinfo (R207); the fix is in docker/, which autofix may not change. The analyses
     # retype quotes, so the GLIBC one allows any.
@@ -378,6 +396,13 @@ def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
         return Outcome("unknown", retried, note="file passed with skipped tests; this one may be among them",
                        ran_file=ran)
     return Outcome("unknown", retried, note=f"no result for {test_func} in the log", ran_file=ran)
+
+
+def ran_first(raw_log: str, files) -> bool:
+    """Whether the job's first test file is one of *files*, so no earlier test of the job could have
+    left a server holding the GPUs. A log with no run_suite files (one test, or none read) counts."""
+    segments = [s for s in file_segments(clean_log(raw_log)) if s.file]
+    return not segments or any(same_file(segments[0].file, f) for f in files)
 
 
 def unrelated_failures(raw_log: str, tests: list[tuple[str, str]]) -> list[str]:
