@@ -4,8 +4,9 @@
   "head_sha": "0448768b255b2c34f312f37541bdfbcc16c03186",
   "as_of": "2026-10-02T18:50:00Z",
   "kind": "broke-after-merge",
-  "status": "proposed",
+  "status": "confirmed",
   "source": "https://github.com/sgl-project/sglang/pull/42541 (revert)",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
   "platforms": {
     "nv": {
       "extra_needed": false,

@@ -4,8 +4,9 @@
   "head_sha": "6a1cfe24224e4b07de2d47aab576e9e31ad38e4f",
   "as_of": "2026-11-02T13:30:00Z",
   "kind": "feature",
-  "status": "proposed",
+  "status": "confirmed",
   "source": "https://github.com/sgl-project/sglang/pull/47928 comments 13:30-13:31Z",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
   "platforms": {
     "nv": {
       "extra_needed": true,
