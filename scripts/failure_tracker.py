@@ -21,10 +21,11 @@ Design — content (agent) vs state (code), and why they are decoupled
   "append to the summary output" approach was observed to silently omit the
   block under output pressure).
 
-- **State (first_seen / duration / dedup)** is owned by deterministic code
-  here. Per ``(test_file, test_function)`` within each workflow's issue we
-  keep ``first_seen`` verbatim in a hidden JSON blob in the issue body and
-  NEVER recompute it. An LLM is never asked to remember dates across days.
+- **State (first_seen / days seen / dedup)** is owned by deterministic code
+  here. Per normalized ``(test_file, test_function)`` within each workflow's
+  issue we keep ``first_seen`` verbatim in a hidden JSON blob in the issue
+  body for as long as the failure keeps recurring; one quiet for 30 days
+  moves to a one-line archive. An LLM is never asked to remember dates.
 
 Decoupling from the daily report
 ---------------------------------
@@ -47,6 +48,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -96,6 +98,25 @@ TRACKED_WORKFLOWS: dict[str, dict] = {
 }
 
 TRACKER_LABEL = "ci-failure-tracker"
+
+# A failure not seen for this many days moves to the one-line Archived list.
+# One still failing keeps its first_seen however old it is.
+RETENTION_DAYS = 30
+# An archived failure is dropped after this many days without being seen.
+ARCHIVE_KEEP_DAYS = 180
+
+# Body budget, kept below GitHub's 262,144-byte cap (GITHUB_ISSUE_BODY_MAX_BYTES):
+# over the cap GitHub answers 200 but keeps the old body, which froze
+# sgl-project/sglang#45847 from 2026-10-25 and #37451 from 2026-09-03. Past
+# it, the oldest archived entries go first, then the oldest quiet ones.
+MAX_BODY_BYTES = 250_000
+READ_BACK_DELAY_SECS = 5
+
+# State blob layout. Version 1 was a flat {key: entry} dict; it is upgraded
+# on load by upgrade_state().
+STATE_VERSION = 2
+# Row IDs (A1, A2, ...) are never reused, so a PR can cite "AMD tracker A12".
+ID_PREFIX = "A"
 
 # Body markers (generic, shared across all per-workflow tracker issues — they
 # are scoped inside each issue's own body). We always rewrite the FULL body,
@@ -228,13 +249,44 @@ def deterministic_rows(workflow: str, analyses: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # 3. State persistence (the part the agent must NOT own)
 # ---------------------------------------------------------------------------
+#
+# State (version 2):
+#   {"version": 2, "next_id": 13,
+#    "active":  {"<test_file>::<test_function>": {id, test_file, test_function,
+#                cluster, error, job_url, job_id, detail_url, fix_pr,
+#                first_seen, last_seen, seen_days, streak_start, back_from}},
+#    "archive": [[id, key, first_seen, last_seen, seen_days, error], ...]}
+#
+# ``seen_days`` counts the days the failure was seen; ``streak_start`` is the
+# first day of the current run of consecutive days. ``back_from`` is the old
+# last_seen of a failure that returned from the archive.
 
-def _row_key(r: dict) -> str:
-    return f"{(r.get('test_file') or '').strip()}::{(r.get('test_function') or '').strip()}"
+# "N/A", "unknown (likely test_x[17])", ... name no function.
+_PLACEHOLDER_FN_RE = re.compile(
+    r"^(?:n/?a|none|unknown|unidentified|unconfirmed|—|-|\?)(?=\s|\(|$)", re.IGNORECASE,
+)
+# A trailing " (...)" note the agent appends, e.g. "test_x[17] (most likely; ...)".
+_ANNOTATION_RE = re.compile(r"\s+\(.*\)\s*$")
 
 
-def load_state(body: str) -> dict:
-    """Recover the persisted tracker state, with legacy-marker read-compat."""
+def canonical_test(test_file: str, test_function: str) -> tuple[str, str]:
+    """Normalize the agent's test names so one failure keeps one key.
+
+    The agent writes the same test as ``Class::fn`` one day and ``Class.fn``
+    the next, and adds notes like ``(most likely ...)``; each variant used to
+    start a new row with a new "Broken since".
+    """
+    # Test names never contain backticks; the agent's Markdown leaves stray ones.
+    tf = (test_file or "").replace("`", "").strip()
+    if tf.startswith("./"):
+        tf = tf[2:]
+    fn = _ANNOTATION_RE.sub("", (test_function or "").replace("`", "").strip())
+    if _PLACEHOLDER_FN_RE.match(fn):
+        fn = ""
+    return tf, fn.replace("::", ".")
+
+
+def _load_raw_state(body: str) -> dict:
     for prefix in (STATE_PREFIX, _LEGACY_STATE_PREFIX):
         m = _state_re(prefix).search(body or "")
         if not m:
@@ -248,38 +300,179 @@ def load_state(body: str) -> dict:
     return {}
 
 
-def merge_state(state: dict, rows: list[dict], today: str, detail_base: str) -> dict:
-    """Merge today's failures into the tracker; first_seen is preserved forever.
+def _id_number(entry_id: str) -> int:
+    try:
+        return int(entry_id[len(ID_PREFIX):])
+    except (TypeError, ValueError):
+        return 10**9
 
-    - Existing key → keep ``first_seen``, bump ``last_seen`` to today, refresh
-      latest-known fields.
-    - New key → ``first_seen = last_seen = today``.
-    - Absent key → untouched (never deleted, never re-dated) → renders "quiet".
+
+def _absorb(active: dict, entry: dict) -> None:
+    """Add ``entry`` under its canonical key, merging with an existing one."""
+    tf, fn = canonical_test(entry.get("test_file") or "", entry.get("test_function") or "")
+    if not tf and not fn:
+        return
+    entry = {**entry, "test_file": tf, "test_function": fn}
+    key = f"{tf}::{fn}"
+    old = active.get(key)
+    if old is None:
+        active[key] = entry
+        return
+    if entry.get("last_seen", "") >= old.get("last_seen", ""):
+        newer, older = entry, old
+    else:
+        newer, older = old, entry
+    merged = {**older, **newer}
+    firsts = [d for d in (old.get("first_seen"), entry.get("first_seen")) if d]
+    if firsts:
+        merged["first_seen"] = min(firsts)
+    merged["seen_days"] = max(old.get("seen_days", 1), entry.get("seen_days", 1))
+    ids = [i for i in (old.get("id"), entry.get("id")) if i]
+    if ids:
+        merged["id"] = min(ids, key=_id_number)
+    active[key] = merged
+
+
+def upgrade_state(raw: dict) -> dict:
+    """Return a version-2 state from any stored layout, keys re-normalized."""
+    if raw.get("version") == STATE_VERSION:
+        old_active = [e for e in (raw.get("active") or {}).values() if isinstance(e, dict)]
+        archive = [a for a in raw.get("archive") or [] if isinstance(a, list) and len(a) >= 6]
+        next_id = int(raw.get("next_id") or 1)
+    else:
+        # Version 1 kept only first/last seen: assume one day seen, or two if
+        # they differ, and no streak.
+        old_active = []
+        for e in raw.values():
+            if not isinstance(e, dict):
+                continue
+            first, last = e.get("first_seen", ""), e.get("last_seen", "")
+            e = {k: v for k, v in e.items() if k not in ("status", "run_started_at")}
+            e["seen_days"] = 1 if first == last else 2
+            e["streak_start"] = last
+            old_active.append(e)
+        archive, next_id = [], 1
+    active: dict = {}
+    for e in old_active:
+        _absorb(active, e)
+    state = {"version": STATE_VERSION, "next_id": next_id, "active": active, "archive": archive}
+    for e in sorted(active.values(), key=lambda e: (e.get("first_seen", ""), e.get("test_file", ""))):
+        if not e.get("id"):
+            e["id"] = _next_id(state)
+    return state
+
+
+def load_state(body: str) -> dict:
+    """Recover the persisted tracker state (any version, legacy marker too)."""
+    return upgrade_state(_load_raw_state(body))
+
+
+def _next_id(state: dict) -> str:
+    n = state["next_id"]
+    state["next_id"] = n + 1
+    return f"{ID_PREFIX}{n}"
+
+
+def merge_state(state: dict, rows: list[dict], today: str, detail_base: str) -> dict:
+    """Merge today's failures into the tracker; first_seen is kept while it fails.
+
+    - Active key → keep ``first_seen``; on a new day add one to ``seen_days``
+      and restart the streak unless it was also seen yesterday.
+    - Archived key → back to active with its old ID, dated today, with
+      ``back_from`` set to the day it was last seen before.
+    - New key → new ID, ``first_seen = last_seen = today``.
+    - Absent key → untouched → renders "quiet".
     """
+    active, archive = state["active"], state["archive"]
     for r in rows:
-        key = _row_key(r)
-        if key == "::":
+        tf, fn = canonical_test(r.get("test_file") or "", r.get("test_function") or "")
+        if not tf and not fn:
             continue
+        key = f"{tf}::{fn}"
         job_id = r.get("job_id")
-        detail_url = f"{detail_base}{job_id}" if detail_base and job_id else ""
         latest = {
-            "test_file": (r.get("test_file") or "").strip(),
-            "test_function": (r.get("test_function") or "").strip(),
+            "test_file": tf,
+            "test_function": fn,
             "cluster": (r.get("cluster") or "").strip(),
             "error": _one_line(r.get("error") or ""),
-            "status": (r.get("status") or "").strip(),
             "job_url": (r.get("job_url") or "").strip(),
             "job_id": job_id,
-            "detail_url": detail_url,
-            "run_started_at": (r.get("run_started_at") or "").strip(),
-            "last_seen": today,
+            "detail_url": f"{detail_base}{job_id}" if detail_base and job_id else "",
         }
-        if key in state:
-            state[key].update(latest)
-        else:
-            latest["first_seen"] = today
-            state[key] = latest
+        if "fix_pr" in r:  # "" = the analysis found none
+            latest["fix_pr"] = r["fix_pr"]
+        e = active.get(key)
+        if e is None:
+            back = next((a for a in archive if a[1] == key), None)
+            if back is not None:
+                archive.remove(back)
+                e = {"id": back[0], "back_from": back[3]}
+            else:
+                e = {"id": _next_id(state)}
+            e.update(first_seen=today, last_seen="", seen_days=0, streak_start=today)
+            active[key] = e
+        prev = e.get("last_seen", "")
+        if prev != today:
+            e["seen_days"] = e.get("seen_days", 0) + 1
+            if not (prev and prev < today and _days_between(prev, today) == 1):
+                e["streak_start"] = today
+        e.update(latest)
+        e["last_seen"] = today
     return state
+
+
+def _archive_row(entry: dict) -> list:
+    key = f"{entry.get('test_file', '')}::{entry.get('test_function', '')}"
+    err = entry.get("error") or "—"
+    if len(err) > 80:
+        err = _truncate(err, 80)
+    return [entry.get("id", ""), key, entry.get("first_seen", ""),
+            entry.get("last_seen", ""), entry.get("seen_days", 1), err]
+
+
+def archive_quiet(state: dict, today: str, retention_days: int = RETENTION_DAYS) -> tuple[int, int]:
+    """Archive failures quiet for over ``retention_days``; drop old archive rows.
+
+    Returns (archived, dropped). Entries with an unparseable ``last_seen`` stay.
+    """
+    stale = [
+        key for key, e in state["active"].items()
+        if _days_between(e.get("last_seen", ""), today) > retention_days
+    ]
+    for key in stale:
+        state["archive"].append(_archive_row(state["active"].pop(key)))
+    before = len(state["archive"])
+    state["archive"] = [
+        a for a in state["archive"] if _days_between(a[3], today) <= ARCHIVE_KEEP_DAYS
+    ]
+    return len(stale), before - len(state["archive"])
+
+
+_FIX_RE = re.compile(
+    r"In-flight fix:[*\s]*✅[`*\s]*\[([^\]]+)\]\((https://github\.com/[^)\s]+/pull/\d+)\)"
+)
+
+
+_NO_FIX_RE = re.compile(r"In-flight fix:[*\s]*❌")
+
+
+def fix_prs_by_job(analyses: list[dict]) -> dict[str, str]:
+    """Map job ID → the in-flight fix PR its daily analysis found, as a link.
+
+    A job whose analysis says ``In-flight fix: ❌`` maps to "", which clears
+    an earlier fix PR; a job that says nothing is left out.
+    """
+    out: dict[str, str] = {}
+    for ja in analyses:
+        if not ja.get("job_id"):
+            continue
+        text = ja.get("analysis") or ""
+        m = _FIX_RE.search(text)
+        if m:
+            out[str(ja["job_id"])] = f"[{m.group(1)}]({m.group(2)})"
+        elif _NO_FIX_RE.search(text):
+            out[str(ja["job_id"])] = ""
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -289,8 +482,13 @@ def merge_state(state: dict, rows: list[dict], today: str, detail_base: str) -> 
 def _one_line(text: str, limit: int = 110) -> str:
     flat = " ".join((text or "").split()).replace("|", "\\|")
     if len(flat) > limit:
-        flat = flat[: limit - 1].rstrip() + "…"
+        flat = _truncate(flat, limit)
     return flat or "—"
+
+
+def _truncate(text: str, limit: int) -> str:
+    # A cut inside an escaped "|" would leave a backslash escaping the cell pipe.
+    return text[: limit - 1].rstrip().rstrip("\\") + "…"
 
 
 def _cell(text: str) -> str:
@@ -306,33 +504,76 @@ def _days_between(start: str, end: str) -> int:
         return 0
 
 
+def classify(entry: dict, today: str) -> str:
+    """``broken`` / ``intermittent`` / ``new`` / ``quiet`` (see render_body)."""
+    if entry.get("last_seen") != today:
+        return "quiet"
+    if _days_between(entry.get("streak_start") or today, today) >= 1:
+        return "broken"
+    if entry.get("seen_days", 1) > 1 or entry.get("back_from"):
+        return "intermittent"
+    return "new"
+
+
+def _state_cell(entry: dict, today: str) -> str:
+    kind = classify(entry, today)
+    if kind == "broken":
+        return f"🔴 broken {_days_between(entry['streak_start'], today) + 1}d"
+    if kind == "intermittent":
+        return "🟡 intermittent"
+    if kind == "new":
+        return "🆕 new"
+    return f"⚪ quiet {_days_between(entry.get('last_seen', ''), today)}d"
+
+
+def _seen_cell(entry: dict) -> str:
+    span = _days_between(entry.get("first_seen", ""), entry.get("last_seen", "")) + 1
+    txt = f"{entry.get('seen_days', 1)}/{span}d"
+    if entry.get("back_from"):
+        txt += f" · back (was quiet since {entry['back_from']})"
+    return txt
+
+
+def _test_cell(test_file: str, test_function: str) -> str:
+    name = test_file or "—"
+    if test_function:
+        name += f"::{test_function}"
+    return f"`{name}`"
+
+
 def _render_row(entry: dict, today: str) -> str:
-    first = entry.get("first_seen", "?")
-    last = entry.get("last_seen", "?")
-    dur = _days_between(first, last)
-    dur_txt = "new" if dur == 0 and last == today else f"{dur}d"
-    if last == today:
-        state = "🔴 failing"
-    else:
-        state = f"⚪ quiet {_days_between(last, today)}d"
-    tf = entry.get("test_file") or "—"
-    fn = entry.get("test_function") or "—"
-    cluster = _cell(entry.get("cluster") or "—")
-    err = entry.get("error") or "—"
     job_url = entry.get("job_url") or ""
     job = f"[job]({job_url})" if job_url else "—"
     detail = f"[详情]({entry['detail_url']})" if entry.get("detail_url") else "—"
     return (
-        f"| {first} | {last} | {dur_txt} | {state} "
-        f"| `{tf}` | `{fn}` | {cluster} | {err} | {job} | {detail} |"
+        f"| {entry.get('id', '—')} | {_state_cell(entry, today)} "
+        f"| {entry.get('first_seen', '?')} | {entry.get('last_seen', '?')} "
+        f"| {_seen_cell(entry)} "
+        f"| {_test_cell(entry.get('test_file', ''), entry.get('test_function', ''))} "
+        f"| {_cell(entry.get('cluster') or '—')} | {entry.get('error') or '—'} "
+        f"| {entry.get('fix_pr') or '—'} | {job} | {detail} |"
     )
 
 
 _TABLE_HEADER = (
-    "| Broken since | Last seen | Duration | State "
-    "| Test File | Test Function | Cluster | Error | Job | Detail |\n"
-    "|---|---|---|---|---|---|---|---|---|---|"
+    "| ID | State | Broken since | Last seen | Seen | Test | Cluster | Error "
+    "| Fix PR | Job | Detail |\n"
+    "|---|---|---|---|---|---|---|---|---|---|---|"
 )
+
+_ARCHIVE_HEADER = (
+    "| ID | Test | Broken since | Last seen | Seen | Error |\n"
+    "|---|---|---|---|---|---|"
+)
+
+_KIND_ORDER = {"broken": 0, "intermittent": 1, "new": 2}
+
+
+def _state_blob(state: dict) -> str:
+    blob = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    # Text inside the blob must not close the HTML comment that holds it.
+    blob = blob.replace("-->", "--\\u003e")
+    return f"{STATE_PREFIX}\n{blob}\n{STATE_SUFFIX}"
 
 
 def render_body(
@@ -344,50 +585,53 @@ def render_body(
 ) -> str:
     """Render a single workflow Failure Tracker issue body (state blob + tables)."""
     today = snapshot_utc.split(" ")[0]
-    entries = list(state.values())
+    entries = list(state["active"].values())
     failing = [e for e in entries if e.get("last_seen") == today]
     quiet = [e for e in entries if e.get("last_seen") != today]
-    failing.sort(key=lambda e: (e.get("first_seen", ""), e.get("test_file", "")))
+    failing.sort(key=lambda e: (
+        _KIND_ORDER[classify(e, today)], e.get("streak_start", ""),
+        -e.get("seen_days", 1), e.get("first_seen", ""), e.get("test_file", ""),
+    ))
     quiet.sort(key=lambda e: (e.get("last_seen", ""), e.get("first_seen", "")), reverse=True)
-
-    state_blob = (
-        f"{STATE_PREFIX}\n{json.dumps(state, ensure_ascii=False, indent=0)}\n{STATE_SUFFIX}"
-    )
+    archive = sorted(state["archive"], key=lambda a: (a[3], a[2]), reverse=True)
+    counts = {k: sum(1 for e in failing if classify(e, today) == k) for k in _KIND_ORDER}
 
     lines = [
         BODY_START,
-        state_blob,
+        _state_blob(state),
         f"# {display} — Failure Tracker",
         "",
-        f"_Maintained by amd-bot · workflow `{workflow}` · last updated "
-        f"{snapshot_utc} · {len(failing)} failing in latest scan · "
-        f"{len(entries)} tracked total_",
+        f"_Maintained by amd-bot · workflow `{workflow}` (scheduled runs on `main`) · "
+        f"last updated {snapshot_utc}_",
         "",
-        f"This is a **long-lived failure tracker** for `{workflow}`: once a "
-        "test failure is recorded its **Broken since** date is preserved "
-        "indefinitely (even months), so you can always see how long something "
-        "has been red. It complements the bot's "
-        f"[daily report]({bot_daily_url}) (a rolling recent-days view) — click "
-        "**Detail** on any row to jump to the full analysis (stack trace, "
-        "suspected commits, in-flight fixes) in that day's daily report.",
+        f"**{counts['broken']} broken · {counts['intermittent']} intermittent · "
+        f"{counts['new']} new · {len(quiet)} quiet · {len(archive)} archived**",
         "",
-        "- **Duration** = observed broken span (`Last seen − Broken since`), not time-since-first-seen.",
-        "- **State** 🔴 = seen failing in the latest scan · ⚪ = not seen in the latest scan "
-        "(may be fixed, or simply did not re-run — check **Last seen**).",
+        f"This tracker lists the test failures of `{workflow}` and how long each "
+        "has been red; a failure keeps its **Broken since** date for as long as it "
+        f"keeps failing. It complements the bot's [daily report]({bot_daily_url}) "
+        "(a rolling recent-days view) — click **Detail** on any row to jump to the "
+        "full analysis (stack trace, suspected commits, in-flight fixes) in that "
+        "day's daily report.",
+        "",
+        "- **State**: 🔴 broken = failed in the latest scan and on every day of the "
+        "current streak (its length is shown) · 🟡 intermittent = failed in the "
+        "latest scan, and on earlier days, but not the day before · 🆕 new = first "
+        "seen in the latest scan · ⚪ quiet = not in the latest scan (fixed, or "
+        "simply did not re-run — check **Last seen**).",
+        "- **Seen** = days it failed / days from **Broken since** to **Last seen**.",
+        "- **Fix PR** = the in-flight fix the daily analysis found, if any.",
+        f"- **ID** is never reused, so it can be cited (\"AMD tracker {ID_PREFIX}12\"). "
+        f"A failure quiet for over {RETENTION_DAYS} days moves to **Archived**, one "
+        "line each, and keeps its ID if it comes back.",
+        "",
+        "## Currently failing (latest scan)",
         "",
     ]
-
     if failing:
-        lines += ["## 🔴 Currently failing (latest scan)", "", _TABLE_HEADER]
-        lines += [_render_row(e, today) for e in failing]
-        lines.append("")
+        lines += [_TABLE_HEADER] + [_render_row(e, today) for e in failing] + [""]
     else:
-        lines += [
-            "## 🔴 Currently failing (latest scan)",
-            "",
-            f"_No `{workflow}` failures observed in the latest scan._",
-            "",
-        ]
+        lines += [f"_No `{workflow}` failures observed in the latest scan._", ""]
 
     if quiet:
         lines += [
@@ -399,8 +643,67 @@ def render_body(
         lines += [_render_row(e, today) for e in quiet]
         lines += ["", "</details>", ""]
 
+    if archive:
+        lines += [
+            f"<details><summary><b>🗄️ Archived: not seen for over {RETENTION_DAYS} days "
+            f"({len(archive)})</b> · click to expand</summary>",
+            "",
+            _ARCHIVE_HEADER,
+        ]
+        for a_id, key, first, last, seen, err in (a[:6] for a in archive):
+            tf, _, fn = key.partition("::")
+            span = _days_between(first, last) + 1
+            lines.append(
+                f"| {a_id} | {_test_cell(tf, fn)} | {first} | {last} | {seen}/{span}d | {err} |"
+            )
+        lines += ["", "</details>", ""]
+
     lines += ["---", f"*Auto-generated by amd-bot · {snapshot_utc}*", BODY_END]
     return "\n".join(lines)
+
+
+def render_bounded_body(
+    workflow: str,
+    display: str,
+    state: dict,
+    snapshot_utc: str,
+    bot_daily_url: str,
+    max_bytes: int = MAX_BODY_BYTES,
+) -> tuple[str, int]:
+    """Render the body within ``max_bytes``.
+
+    Over budget, the oldest archived entries are dropped first; once the
+    archive is empty, the oldest quiet entries are archived (and so become
+    droppable). Mutates ``state`` and returns the body and how many entries
+    were dropped. Raises ``ValueError`` if today's failures alone do not fit.
+    """
+    today = snapshot_utc.split(" ")[0]
+    dropped = 0
+    while True:
+        body = render_body(workflow, display, state, snapshot_utc, bot_daily_url)
+        size = len(body.encode("utf-8"))
+        if size <= max_bytes:
+            return body, dropped
+        # An entry is a few hundred bytes: shed in batches, not one per render.
+        batch = max(1, (size - max_bytes) // 300)
+        if state["archive"]:
+            state["archive"].sort(key=lambda a: (a[3], a[2]))
+            n = min(batch, len(state["archive"]))
+            del state["archive"][:n]
+            dropped += n
+            continue
+        quiet = sorted(
+            (k for k, e in state["active"].items() if e.get("last_seen") != today),
+            key=lambda k: (state["active"][k].get("last_seen", ""),
+                           state["active"][k].get("first_seen", "")),
+        )
+        if not quiet:
+            raise ValueError(
+                f"tracker body is {size} bytes with only today's failures "
+                f"(budget {max_bytes})"
+            )
+        for key in quiet[:batch]:
+            state["archive"].append(_archive_row(state["active"].pop(key)))
 
 
 # ---------------------------------------------------------------------------
@@ -408,17 +711,47 @@ def render_body(
 # ---------------------------------------------------------------------------
 
 def find_tracker_issue(token: str, title: str) -> int | None:
-    """Find an open issue with EXACTLY this title on the upstream repo."""
-    q = f'repo:{REPO} is:issue is:open in:title "{title}"'
+    """Find an open issue with EXACTLY this title on the upstream repo.
+
+    Lists the labelled issues first: the search index can lag or miss, and on
+    2026-10-22 two ticks in a row found nothing and created duplicates. Search
+    stays as a fallback for an issue that lost its label (or a legacy title).
+    If several match, the oldest one wins.
+    """
+    found: dict[int, dict] = {}
     resp = gh_get(
-        "https://api.github.com/search/issues",
-        headers=gh_headers(token), params={"q": q, "per_page": 20},
+        f"https://api.github.com/repos/{REPO}/issues",
+        headers=gh_headers(token),
+        params={"labels": TRACKER_LABEL, "state": "open", "per_page": 100},
     )
     resp.raise_for_status()
-    for item in resp.json().get("items", []):
-        if item.get("title") == title:
-            return item["number"]
-    return None
+    for item in resp.json():
+        if "pull_request" not in item:
+            found[item["number"]] = item
+    if not any(i.get("title") == title for i in found.values()):
+        q = f'repo:{REPO} is:issue is:open in:title "{title}"'
+        resp = gh_get(
+            "https://api.github.com/search/issues",
+            headers=gh_headers(token), params={"q": q, "per_page": 20},
+        )
+        resp.raise_for_status()
+        for item in resp.json().get("items", []):
+            found[item["number"]] = item
+    matches = [
+        i for i in found.values()
+        if i.get("title") == title and i.get("state", "open") == "open"
+    ]
+    if not matches:
+        return None
+    # The oldest wins: a stable choice, unlike updated_at, which any comment
+    # on a stale duplicate would change.
+    matches.sort(key=lambda i: i["number"])
+    if len(matches) > 1:
+        log.warning(
+            "Several open issues titled %r: %s; using #%d",
+            title, ", ".join(f"#{i['number']}" for i in matches), matches[0]["number"],
+        )
+    return matches[0]["number"]
 
 
 def _rename_issue(token: str, issue_num: int, title: str) -> None:
@@ -476,17 +809,37 @@ def update_one_workflow(
     issue = get_issue(token, REPO, issue_num)
     state = load_state(issue.get("body", ""))
     state = merge_state(state, rows, today, detail_base)
+    archived, expired = archive_quiet(state, today)
 
-    new_body = render_body(
+    new_body, dropped = render_bounded_body(
         workflow, cfg["display"], state, snapshot_utc, bot_daily_url,
     )
+    if archived or expired or dropped:
+        log.info(
+            "[%s] archived %d entries quiet over %d days; dropped %d archived over "
+            "%d days and %d more to fit %d bytes",
+            workflow, archived, RETENTION_DAYS, expired, ARCHIVE_KEEP_DAYS,
+            dropped, MAX_BODY_BYTES,
+        )
     if new_body.strip() == (issue.get("body") or "").strip():
         log.info("[%s] tracker #%d unchanged; skipping PATCH", workflow, issue_num)
         return issue_num
     update_issue_body(token, REPO, issue_num, new_body)
+    # A 2xx PATCH is not proof the body was saved (see MAX_BODY_BYTES). Read
+    # back twice before failing, in case the first read hits a lagging replica.
+    for delay in (0, READ_BACK_DELAY_SECS):
+        time.sleep(delay)
+        saved = (get_issue(token, REPO, issue_num).get("body") or "").strip()
+        if saved == new_body.strip():
+            break
+    else:
+        raise RuntimeError(
+            f"tracker #{issue_num} body was not saved "
+            f"({len(new_body.encode('utf-8'))} bytes sent, {len(saved.encode('utf-8'))} read back)"
+        )
     log.info(
-        "[%s] updated tracker #%d (%d tracked, %d failing this scan)",
-        workflow, issue_num, len(state), len(rows),
+        "[%s] updated tracker #%d (%d active, %d archived, %d failing this scan)",
+        workflow, issue_num, len(state["active"]), len(state["archive"]), len(rows),
     )
     return issue_num
 
@@ -617,6 +970,14 @@ def update_trackers(
             # Single tracked workflow: tolerate a missing/blank workflow tag.
             by_wf[next(iter(TRACKED_WORKFLOWS))].append(r)
 
+    # The fix PR comes from the job's own analysis, by code, not the agent.
+    for wf, wf_rows in by_wf.items():
+        fixes = fix_prs_by_job(wf_analyses.get(wf, []))
+        for r in wf_rows:
+            fix = fixes.get(str(r.get("job_id")))
+            if fix is not None:
+                r["fix_pr"] = fix
+
     results: dict[str, int | None] = {}
     for wf, cfg in TRACKED_WORKFLOWS.items():
         try:
@@ -624,7 +985,7 @@ def update_trackers(
                 token, wf, cfg, bot_repo, issue_num, by_wf[wf], snapshot_utc,
             )
         except Exception as exc:
-            log.warning("[%s] tracker update failed (%s)", wf, exc)
+            log.error("[%s] tracker update failed (%s)", wf, exc)
             results[wf] = None
     return results
 
@@ -665,8 +1026,9 @@ def main() -> int:
         date_str=args.date, use_agent=args.use_agent,
     )
     for wf, num in results.items():
-        log.info("%s → issue %s", wf, f"#{num}" if num else "(skipped)")
-    return 0
+        log.info("%s → issue %s", wf, f"#{num}" if num else "(failed)")
+    # Fail the step so a tracker that stops updating shows up as a red run.
+    return 1 if any(num is None for num in results.values()) else 0
 
 
 if __name__ == "__main__":
