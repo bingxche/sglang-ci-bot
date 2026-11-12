@@ -1541,7 +1541,9 @@ def _find_agent_file(name: str) -> Path | None:
 class AgentTask:
     doc: str          # methodology file under agent/tasks/
     model: str = ""   # "" = the runner's default (ANTHROPIC_MODEL)
-    effort: str = ""  # --effort level; "" = the CLI's default
+    # --effort level. xhigh for every task (user's choice, 2026-11-12); without
+    # the flag the CLI uses its own default (high).
+    effort: str = "xhigh"
     # Model and effort are fixed: AGENT_MODEL_<TASK> cannot change them, and a
     # model the gateway does not serve fails the task (ModelUnavailable)
     # instead of falling back to the default model.

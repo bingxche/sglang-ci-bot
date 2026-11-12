@@ -126,7 +126,7 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 <a id="r9"></a>**R9. Cost is bounded.**
 - Every agent run has a turn limit and a timeout.
 - Every fan-out has a cap: agents per matrix job, reviewers, findings verified, suspects verified per tick, autofix problems started per hour (each at most two attempts and two GPU runs).
-- Every task's model is chosen for its stakes (most use the default model; `AGENT_TASKS` can give one a cheaper model). Both CI autofix tasks are pinned to Opus 5.5 1M at effort max: `AGENT_MODEL_<TASK>` cannot change them, and they never fall back to another model ([R6](#r6)).
+- Every task's model is chosen for its stakes (most use the default model; `AGENT_TASKS` can give one a cheaper model), and every task runs at effort `xhigh`. Both CI autofix tasks are pinned to Opus 5.5 1M at effort max: `AGENT_MODEL_<TASK>` cannot change them, and they never fall back to another model ([R6](#r6)).
 
 *Why:* one loop without a bound spends the team's gateway quota. *Kept by:* review only. The limits are in the [environment variables](#environment-variables) table.
 
@@ -185,22 +185,22 @@ Every agent run goes through [`claude_code_analyze()`](scripts/utils.py):
 2. The instructions, [`agent/ground-rules.md`](agent/ground-rules.md) followed by `agent/tasks/<task>.md` ([`agent_instructions()`](scripts/utils.py)), are passed with `--append-system-prompt`. Nothing is read from the checkout's own `CLAUDE.md` or `.claude/`.
 3. Context files the script prepared (logs, evidence packs, other agents' output) are written to `.ci-context/` in the working directory and removed afterwards.
 4. It runs `claude -p` in the worktree:
-   - flags: `--setting-sources user --disable-slash-commands --dangerously-skip-permissions`, with a turn limit and a timeout. A task with a tool allowlist (`tools` in its `AgentTask`) runs with `--restricted --permission-mode dontAsk --allowedTools …` instead, so any other tool call is denied and file tools stay in the working directory; a task with an `effort` adds `--effort`;
+   - flags: `--setting-sources user --disable-slash-commands --dangerously-skip-permissions`, with a turn limit and a timeout. A task with a tool allowlist (`tools` in its `AgentTask`) runs with `--restricted --permission-mode dontAsk --allowedTools …` instead, so any other tool call is denied and file tools stay in the working directory; every task adds `--effort` (see Models below);
    - environment: no `BOT_PAT`, `AUTOFIX_TOKEN` or `LLM_GATEWAY_KEY`, and `AGENT_GH_TOKEN` in place of `GH_PAT` when set. A task with `github_token=False` gets no GitHub token at all.
 5. The text output is returned. When the final message misses the expected report (empty, or overwritten by a follow-up), the report is recovered from the session log. When `AGENT_ARCHIVE_DIR` is set, the prompt and session are archived with secrets redacted.
 
 Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sglang_repo()`](scripts/utils.py), [`create_agent_worktree()`](scripts/utils.py)), checked out at the exact commit the CI run or PR used. The clone is re-made if it is broken (an interrupted clone once left runner-7 with no `HEAD`).
 
-| `Task:` | Instructions | Model | Called from |
+| `Task:` | Instructions | Model, effort | Called from |
 |---|---|---|---|
-| Job Failure Analysis | [`job-failure-analysis.md`](agent/tasks/job-failure-analysis.md) | default | [`analyze_job_with_agent()`](scripts/utils.py) |
-| Cross-Job Summary | [`cross-job-summary.md`](agent/tasks/cross-job-summary.md) | default | [`cross_job_analysis()`](scripts/utils.py) |
-| Cross-Run Pattern Analysis | [`cross-run-pattern-analysis.md`](agent/tasks/cross-run-pattern-analysis.md) | default | [`maybe_publish_cross_run_summary()`](scripts/monitor_ci.py) |
-| Daily Cross-Workflow Summary | [`daily-cross-workflow-summary.md`](agent/tasks/daily-cross-workflow-summary.md) | default | [`build_and_publish_summary()`](scripts/daily_cross_workflow_summary.py) |
-| Failure Tracker Data | [`failure-tracker-data.md`](agent/tasks/failure-tracker-data.md) | default | [`run_agent_extraction()`](scripts/failure_tracker.py) |
-| SGLang AMD CI Staging Candidates | [`staging-candidates.md`](agent/tasks/staging-candidates.md) | default | [`analyze()`](scripts/stage_notion.py) |
-| PR CI Status Check | [`pr-ci-status-check.md`](agent/tasks/pr-ci-status-check.md) | default | [`check_ci_for_pr()`](scripts/check_ci_for_pr.py) |
-| PR Code Review | [`pr-code-review.md`](agent/tasks/pr-code-review.md) | default | [`review_pr_with_agent()`](scripts/review_pr.py) |
+| Job Failure Analysis | [`job-failure-analysis.md`](agent/tasks/job-failure-analysis.md) | default, xhigh | [`analyze_job_with_agent()`](scripts/utils.py) |
+| Cross-Job Summary | [`cross-job-summary.md`](agent/tasks/cross-job-summary.md) | default, xhigh | [`cross_job_analysis()`](scripts/utils.py) |
+| Cross-Run Pattern Analysis | [`cross-run-pattern-analysis.md`](agent/tasks/cross-run-pattern-analysis.md) | default, xhigh | [`maybe_publish_cross_run_summary()`](scripts/monitor_ci.py) |
+| Daily Cross-Workflow Summary | [`daily-cross-workflow-summary.md`](agent/tasks/daily-cross-workflow-summary.md) | default, xhigh | [`build_and_publish_summary()`](scripts/daily_cross_workflow_summary.py) |
+| Failure Tracker Data | [`failure-tracker-data.md`](agent/tasks/failure-tracker-data.md) | default, xhigh | [`run_agent_extraction()`](scripts/failure_tracker.py) |
+| SGLang AMD CI Staging Candidates | [`staging-candidates.md`](agent/tasks/staging-candidates.md) | default, xhigh | [`analyze()`](scripts/stage_notion.py) |
+| PR CI Status Check | [`pr-ci-status-check.md`](agent/tasks/pr-ci-status-check.md) | default, xhigh | [`check_ci_for_pr()`](scripts/check_ci_for_pr.py) |
+| PR Code Review | [`pr-code-review.md`](agent/tasks/pr-code-review.md) | default, xhigh | [`review_pr_with_agent()`](scripts/review_pr.py) |
 | CI Autofix | [`ci-autofix.md`](agent/tasks/ci-autofix.md) | `Claude-Opus-5.5[1m]`, effort max, pinned | [`run_fix_agent()`](scripts/autofix_agents.py) |
 | CI Autofix Review | [`ci-autofix-review.md`](agent/tasks/ci-autofix-review.md) | `Claude-Opus-5.5[1m]`, effort max, pinned | [`run_review_agent()`](scripts/autofix_agents.py) |
 
@@ -208,7 +208,7 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 - `AGENT_MODEL_<TASK>` overrides the model for one task, e.g. `AGENT_MODEL_FAILURE_TRACKER_DATA=sonnet`.
 - An alias such as `sonnet` is used only when `claude.env` maps it (`ANTHROPIC_DEFAULT_SONNET_MODEL`); otherwise the task keeps the default model.
 - If the gateway has no deployment of the requested model, the task is retried once with the default ([`task_model()`](scripts/utils.py)).
-- An `AgentTask` can also set `effort` (passed as `--effort`) and `pinned`. A pinned task (the two CI autofix tasks) ignores `AGENT_MODEL_<TASK>`, is never retried with the default model, and is checked after the run: if the gateway does not serve its model, or the session log shows any other model, it fails with `ModelUnavailable` ([`claude_code_analyze()`](scripts/utils.py)). A pinned task that times out returns nothing.
+- Every task runs at effort `xhigh` (the `effort` default in `AgentTask`, always passed as `--effort`; without it the CLI uses `high`), except the two CI autofix tasks at `max`. An `AgentTask` can also set `pinned`. A pinned task (the two CI autofix tasks) ignores `AGENT_MODEL_<TASK>`, is never retried with the default model, and is checked after the run: if the gateway does not serve its model, or the session log shows any other model, it fails with `ModelUnavailable` ([`claude_code_analyze()`](scripts/utils.py)). A pinned task that times out returns nothing.
 
 **Output contracts.** Reports start with a fixed first line (`### Commit Info`, `**Counts**:`, `# Daily Cross-Workflow Summary`), and the harness strips anything before it. Machine-readable results come in hidden or fenced blocks that code parses and validates: `ci-status-verdicts`, `job-clusters`, `suspect-prs`, and tracker data.
 

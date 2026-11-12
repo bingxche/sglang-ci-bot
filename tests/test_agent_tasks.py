@@ -105,6 +105,12 @@ class ClaudeCommandTest(unittest.TestCase):
         cmd = self.run_agent("Task: Job Failure Analysis\nJob: x", {})
         self.assertNotIn("--model", cmd)
 
+    def test_every_task_runs_at_xhigh_except_autofix_at_max(self):
+        for task, spec in utils.AGENT_TASKS.items():
+            self.assertEqual(spec.effort, "max" if spec.pinned else "xhigh", task)
+        cmd = self.run_agent("Task: PR CI Status Check\nPR: x", {})
+        self.assertEqual(cmd[cmd.index("--effort") + 1], "xhigh")
+
     def test_unserved_model_retries_with_the_default(self):
         # The runners mapped sonnet to Claude-Sonnet-4.7, which the gateway no longer serves.
         cmds = []
