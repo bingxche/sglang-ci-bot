@@ -227,7 +227,8 @@ def commands(platform: str, sel: dict, amd_rerun: bool) -> list[str]:
             any(not f["rerunnable"] for f in extra):
         out.append(f"/run-extra-ci {platform}")
         files = [f for f in files if f["tier"] != "extra"]
-    files = [f for f in files if f["rerunnable"]]
+    # A file that already passed in this CI is listed, but not run again.
+    files = [f for f in files if f["rerunnable"] and f.get("ci") != "passed"]
     if files:
         out.append(f"/rerun-test {flag}" + " ".join(f["spec"] for f in files))
     if sel["groups"]:

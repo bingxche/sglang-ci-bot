@@ -174,6 +174,11 @@ class CommandTest(unittest.TestCase):
                 "files": [{"spec": f"registered/t{i}.py", "tier": t, "rerunnable": rerunnable}
                           for i, t in enumerate(tiers)]}
 
+    def test_files_that_passed_in_this_ci_are_not_rerun(self):
+        sel = self.sel(["base", "extra"])
+        sel["files"][0]["ci"] = "passed"
+        self.assertEqual(ts.commands("nv", sel, False), ["/rerun-test registered/t1.py"])
+
     def test_files_rerun_test_cannot_take(self):
         # Over 60 minutes or a legacy suite= registration: nightly ones get no command,
         # an extra one is covered by the whole tier.
@@ -229,7 +234,7 @@ class CiStatusIntegrationTest(unittest.TestCase):
 
     def test_report_gets_the_checked_section(self):
         block = {"nv": {"extra_needed": True, "reason": "ping @someone about python/sglang/srt/x.py",
-                        "files": [{"file": "test/registered/a/test_extra.py", "why": "covers x @dev", "ci": "passed"},
+                        "files": [{"file": "test/registered/a/test_extra.py", "why": "covers x @dev", "ci": "not_run"},
                                   {"file": "test/registered/a/test_fake.py", "why": "made up"}]},
                  "amd": {"extra_needed": False, "reason": "no ROCm path", "files": []}}
         agent_out = ("## CI Status for PR #7\n\n**Verdict:** no failures.\n"
