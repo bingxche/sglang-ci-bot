@@ -4,7 +4,7 @@
 Every non-GET request through ``requests`` is refused, so reports are printed
 instead of posted. Used to validate a branch on a runner container:
 
-    python scripts/validate_live.py monitor|crossrun|daily|tracker|staging|cistatus|review
+    python scripts/validate_live.py monitor|crossrun|daily|tracker|cistatus|review
 """
 
 import logging
@@ -90,13 +90,6 @@ def tracker():
         print(" ", r)
 
 
-def staging():
-    import stage_notion
-    out = Path("/tmp/val/staging-candidates.json")
-    result = stage_notion.analyze(TOKEN, BOT_REPO, int(os.environ.get("VALIDATE_LOOKBACK", "3")), out)
-    print(result)
-
-
 def cistatus():
     import check_ci_for_pr
     check_ci_for_pr.check_ci_for_pr(TOKEN, int(os.environ.get("VALIDATE_PR", "47179")), post_comment_flag=False)
@@ -108,7 +101,7 @@ def review():
     review_pr.review_pr(TOKEN, int(os.environ.get("VALIDATE_PR", "47179")), post_comment_flag=False)
 
 
-CASES = {f.__name__: f for f in (monitor, crossrun, daily, tracker, staging, cistatus, review)}
+CASES = {f.__name__: f for f in (monitor, crossrun, daily, tracker, cistatus, review)}
 
 if __name__ == "__main__":
     logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
