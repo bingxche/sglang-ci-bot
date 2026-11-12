@@ -307,7 +307,7 @@ Each decision is kept in the monitor state under `auto_rerun`, keyed `<run_id>:<
 **Purpose.** One long-lived issue on sgl-project/sglang per tracked workflow, `[Failure Tracker] <name>`. It lists the test failures that workflow has shown recently and how long each has been red, beyond the daily report's 24 h window and GitHub's log retention. Like the daily report, it covers only the scheduled runs on `main`, so it answers "was this already red on main?". sglang contributors link it in their PRs for that.
 
 **Flow** ([`update_trackers()`](scripts/failure_tracker.py), once per tick in `finalize`):
-1. **Find the issue** ([`find_tracker_issue()`](scripts/failure_tracker.py)). It lists the open issues labelled `ci-failure-tracker` and falls back to search only when none matches. Search alone once missed the existing tracker on two ticks in a row (2026-10-22) and created two duplicates. If several open issues match, the most recently updated one is used and a warning names the others.
+1. **Find the issue** ([`find_tracker_issue()`](scripts/failure_tracker.py)). It lists the open issues labelled `ci-failure-tracker` and falls back to search only when none matches. Search alone once missed the existing tracker on two ticks in a row (2026-10-22) and created two duplicates. If several open issues match, the oldest one is used and a warning names the others.
 2. **Content.** A small, JSON-only agent task (Failure Tracker Data) reads the same per-job analyses as the daily report. If the agent fails, [`deterministic_rows()`](scripts/failure_tracker.py) parses each analysis's `Failed Tests` table instead.
 3. **State.** [`merge_state()`](scripts/failure_tracker.py) keeps each failure, keyed by test file and function, in a hidden JSON blob in the issue body:
    - an existing failure keeps its `first_seen` and only updates `last_seen`, so a test that stays red keeps its original "Broken since" date;
@@ -316,9 +316,9 @@ Each decision is kept in the monitor state under `auto_rerun`, keyed `<run_id>:<
 
    The LLM is never asked to remember dates.
 4. **Render** the table, linking each row back to its analysis in that day's daily issue. [`render_bounded_body()`](scripts/failure_tracker.py) keeps the body within [`MAX_BODY_BYTES`](scripts/failure_tracker.py) by dropping the oldest quiet failures first.
-5. **Write and check.** After the PATCH, the body is read back. If it is not what was sent, the step fails.
+5. **Write and check.** After the PATCH, the body is read back (once more after a few seconds if it differs). If it is still not what was sent, the step fails.
 
-**Why the size bound and the read-back.** GitHub saves at most 262,144 UTF-8 bytes of issue body ([`GITHUB_ISSUE_BODY_MAX_BYTES`](scripts/utils.py)). A larger PATCH still gets `200 OK` with the new body echoed back, but the old body stays. The tracker used to grow without bound, so it froze without any error: #37451 from 2026-09-03 and #45847 from 2026-10-25 until 2026-11-12. [`update_issue_body()`](scripts/utils.py) now refuses an oversized body for every caller, and the tracker step exits non-zero whenever a tracker could not be updated.
+**Why the size bound and the read-back.** GitHub saves at most 262,144 UTF-8 bytes of issue body ([`GITHUB_ISSUE_BODY_MAX_BYTES`](scripts/utils.py)). A larger PATCH still gets `200 OK` with the new body echoed back, but the old body stays. The tracker used to grow without bound, so it froze without any error: sgl-project/sglang#37451 from 2026-09-03 and sgl-project/sglang#45847 from 2026-10-25 until 2026-11-12. [`update_issue_body()`](scripts/utils.py) now refuses an oversized body for every caller, and the tracker step exits non-zero whenever a tracker could not be updated.
 
 Tracked workflows are configured in [`TRACKED_WORKFLOWS`](scripts/failure_tracker.py), currently `pr-test-amd.yml`. Adding an entry is all it takes to get a new tracker.
 

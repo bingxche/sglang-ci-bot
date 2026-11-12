@@ -87,18 +87,33 @@ class RenderBoundedBodyTest(unittest.TestCase):
 class UpdateOneWorkflowTest(unittest.TestCase):
     ROWS = [{"workflow": WF, "test_file": "test/a.py", "test_function": "test_a", "error": "boom"}]
 
-    def _run(self, saved_body):
-        old = {"body": "", "number": 45847}
-        with patch.object(ft, "find_or_create_tracker_issue", return_value=45847), \
-             patch.object(ft, "get_issue", side_effect=[old, {"body": saved_body}]), \
-             patch.object(ft, "update_issue_body") as upd:
-            result = ft.update_one_workflow("t", WF, CFG, "bingxche/sglang-ci-bot", 287, self.ROWS, SNAPSHOT)
-        return result, upd
-
     def test_body_that_was_not_saved_raises(self):
         # GitHub answers 200 to an oversized body and keeps the old one.
-        with self.assertRaises(RuntimeError):
-            self._run(saved_body="stale")
+        reads = [{"body": ""}, {"body": "stale"}, {"body": "stale"}]
+        with patch.object(ft, "find_or_create_tracker_issue", return_value=45847), \
+             patch.object(ft, "get_issue", side_effect=reads), \
+             patch.object(ft, "update_issue_body"), \
+             patch.object(ft.time, "sleep") as sleep:
+            with self.assertRaises(RuntimeError):
+                ft.update_one_workflow("t", WF, CFG, "bingxche/sglang-ci-bot", 287, self.ROWS, SNAPSHOT)
+        sleep.assert_called_with(ft.READ_BACK_DELAY_SECS)
+
+    def test_lagging_first_read_back_is_retried(self):
+        sent = {}
+        reads = iter([{"body": ""}, {"body": "stale"}])
+
+        def fake_get(token, repo, num):
+            return next(reads, None) or {"body": sent["body"]}
+
+        with patch.object(ft, "find_or_create_tracker_issue", return_value=45847), \
+             patch.object(ft, "get_issue", side_effect=fake_get), \
+             patch.object(ft, "update_issue_body",
+                          side_effect=lambda t, r, n, b: sent.setdefault("body", b)), \
+             patch.object(ft.time, "sleep"):
+            self.assertEqual(
+                ft.update_one_workflow("t", WF, CFG, "bingxche/sglang-ci-bot", 287, self.ROWS, SNAPSHOT),
+                45847,
+            )
 
     def test_saved_body_returns_issue(self):
         captured = {}
@@ -143,14 +158,16 @@ class FindTrackerIssueTest(unittest.TestCase):
         with patch.object(ft, "gh_get", side_effect=responses):
             self.assertIsNone(ft.find_tracker_issue("t", self.TITLE))
 
-    def test_duplicates_pick_most_recently_updated_open_issue(self):
+    def test_duplicates_pick_the_oldest_open_issue(self):
+        # Stable whatever gets commented on; a closed one is skipped even if
+        # the listing still returns it.
         listing = [
-            self._issue(37451, "2026-10-22T04:02:48Z"),
-            self._issue(45847, "2026-10-25T12:07:09Z"),
-            self._issue(45835, "2026-11-12T00:00:00Z", state="closed"),
+            self._issue(45847, "2026-11-12T00:00:00Z"),
+            self._issue(45835, "2026-11-12T00:00:01Z"),
+            self._issue(37451, "2026-11-12T00:00:02Z", state="closed"),
         ]
         with patch.object(ft, "gh_get", return_value=_resp(listing)):
-            self.assertEqual(ft.find_tracker_issue("t", self.TITLE), 45847)
+            self.assertEqual(ft.find_tracker_issue("t", self.TITLE), 45835)
 
 
 class MainExitCodeTest(unittest.TestCase):

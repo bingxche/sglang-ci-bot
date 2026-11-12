@@ -47,6 +47,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -106,6 +107,7 @@ RETENTION_DAYS = 30
 # from 2026-10-25 and #37451 from 2026-09-03. Past it, the oldest quiet
 # entries are dropped first.
 MAX_BODY_BYTES = 250_000
+READ_BACK_DELAY_SECS = 5
 
 # Body markers (generic, shared across all per-workflow tracker issues — they
 # are scoped inside each issue's own body). We always rewrite the FULL body,
@@ -471,7 +473,7 @@ def find_tracker_issue(token: str, title: str) -> int | None:
     Lists the labelled issues first: the search index can lag or miss, and on
     2026-10-22 two ticks in a row found nothing and created duplicates. Search
     stays as a fallback for an issue that lost its label (or a legacy title).
-    If several match, the most recently updated one wins.
+    If several match, the oldest one wins.
     """
     found: dict[int, dict] = {}
     resp = gh_get(
@@ -498,7 +500,9 @@ def find_tracker_issue(token: str, title: str) -> int | None:
     ]
     if not matches:
         return None
-    matches.sort(key=lambda i: (i.get("updated_at") or "", i["number"]), reverse=True)
+    # The oldest wins: a stable choice, unlike updated_at, which any comment
+    # on a stale duplicate would change.
+    matches.sort(key=lambda i: i["number"])
     if len(matches) > 1:
         log.warning(
             "Several open issues titled %r: %s; using #%d",
@@ -576,9 +580,14 @@ def update_one_workflow(
         log.info("[%s] tracker #%d unchanged; skipping PATCH", workflow, issue_num)
         return issue_num
     update_issue_body(token, REPO, issue_num, new_body)
-    # A 2xx PATCH is not proof the body was saved (see MAX_BODY_BYTES).
-    saved = (get_issue(token, REPO, issue_num).get("body") or "").strip()
-    if saved != new_body.strip():
+    # A 2xx PATCH is not proof the body was saved (see MAX_BODY_BYTES). Read
+    # back twice before failing, in case the first read hits a lagging replica.
+    for delay in (0, READ_BACK_DELAY_SECS):
+        time.sleep(delay)
+        saved = (get_issue(token, REPO, issue_num).get("body") or "").strip()
+        if saved == new_body.strip():
+            break
+    else:
         raise RuntimeError(
             f"tracker #{issue_num} body was not saved "
             f"({len(new_body.encode('utf-8'))} bytes sent, {len(saved.encode('utf-8'))} read back)"
