@@ -18,7 +18,7 @@ from pathlib import Path
 
 import requests
 
-import test_selection
+import suggested_tests
 from ci_evidence import build_evidence_pack
 from ci_verdicts import annotate_report, parse_verdict_block, validate
 from suspect_pr_comments import neutralize_mentions
@@ -598,7 +598,7 @@ def _check_ci_with_agent(
     pack = build_evidence_pack(token, pr_number, repo_path, head_sha=head_sha, as_of=as_of)
     checkout = pack["checkout"]
     # From main, never from this checkout: the PR can change its own skill files.
-    skills, amd_rerun = test_selection.main_context(token)
+    skills, amd_rerun = suggested_tests.main_context(token)
     prompt = (
         f"Task: PR CI Status Check\n"
         f"PR: #{pr_number} (head {pack['request']['head_sha']})\n"
@@ -622,9 +622,14 @@ def _check_ci_with_agent(
         groups = set(json.loads(skills.get("sglang-skills/rerun_test_groups.json") or "{}"))
     except (json.JSONDecodeError, TypeError):
         groups = set()
-    selection = test_selection.check(test_selection.parse_block(agent_report), repo_path, token, groups, amd_rerun)
-    report = annotate_report(test_selection.strip_block(agent_report), pack, checked, problems)
-    report = neutralize_mentions(report.rstrip() + "\n\n" + test_selection.render(selection))
+    try:
+        selection = suggested_tests.check(suggested_tests.parse_block(agent_report), repo_path, groups, amd_rerun)
+    except Exception as exc:  # the attribution above must still be posted
+        print(f"  WARNING: could not check the suggested tests ({exc})")
+        selection = {"amd_rerun": amd_rerun, "valid": False, "platforms": {}, "error": str(exc)}
+    report = annotate_report(suggested_tests.strip_block(agent_report), pack, checked, problems)
+    report = suggested_tests.neutralize_outside_code(
+        report.rstrip() + "\n\n" + suggested_tests.render(selection), neutralize_mentions)
     print(f"  Verdicts: {len(checked)} checked, "
           f"{sum(bool(v['validation']) for v in checked)} unsupported, {len(problems)} report problems")
     print("  Suggested tests: " + ", ".join(
@@ -639,7 +644,7 @@ def _check_ci_with_agent(
         (out_dir / "verdicts.json").write_text(
             json.dumps({"verdicts": verdicts, "problems": problems}, indent=1))
         (out_dir / "selection.json").write_text(json.dumps(
-            {"as_of": as_of, "agent_block": test_selection.parse_block(agent_report), **selection}, indent=1))
+            {"as_of": as_of, "agent_block": suggested_tests.parse_block(agent_report), **selection}, indent=1))
     return report
 
 

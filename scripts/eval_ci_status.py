@@ -36,7 +36,7 @@ from pathlib import Path
 
 import requests
 
-from test_selection import PLATFORMS, registrations
+from suggested_tests import PLATFORMS, registrations
 from utils import REPO, gh_headers
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -119,8 +119,8 @@ def format_score(result: dict) -> str:
     return "\n".join(out)
 
 
-def run_missing(cases: list[dict], runs_dir: Path, parallel: int = 1) -> None:
-    """Run ci-status (no posting) for each case without an artifact; sessions are archived in it.
+def run_missing(cases: list[dict], runs_dir: Path, parallel: int = 1, marker: str = "verdicts.json") -> None:
+    """Run ci-status (no posting) for each case whose artifact lacks *marker*; sessions are archived in it.
 
     With ``parallel`` > 1 each case gets its own sglang clone, so concurrent
     runs never share a git index.
@@ -137,7 +137,7 @@ def run_missing(cases: list[dict], runs_dir: Path, parallel: int = 1) -> None:
                             "--out-dir", str(artifact)], check=False, env=env, stdout=log, stderr=subprocess.STDOUT)
 
     runs_dir.mkdir(parents=True, exist_ok=True)
-    todo = [c for c in cases if not (runs_dir / c["id"] / "verdicts.json").exists()]
+    todo = [c for c in cases if not (runs_dir / c["id"] / marker).exists()]
     with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
         list(pool.map(run, todo))
 
@@ -163,21 +163,31 @@ def _tool_results(session: Path):
             yield item.get("tool_use_id", ""), str(body or "")
 
 
+def _read_texts(artifact: Path):
+    """``(file name, text)`` of everything a session read: tool results in the logs (subagents' too)
+    and the large ones Claude Code keeps in ``<session>/tool-results/``."""
+    for path in sorted((artifact / "sessions").glob("**/*")):
+        if path.suffix == ".jsonl":
+            for _, text in _tool_results(path):
+                yield path.name, text
+        elif path.is_file() and path.parent.name == "tool-results":
+            yield path.name, path.read_text(errors="replace")
+
+
 def leaks(artifact: Path, as_of: str) -> list[str]:
     """What the agent read that is dated after ``as_of`` (gh JSON dates, git log dates)."""
     limit = _parse_time(as_of)
     found = []
-    for session in sorted((artifact / "sessions").glob("**/*.jsonl")):
-        for _, text in _tool_results(session):
-            dates = [(f, _parse_time(t)) for f, t in _DATED_FIELD_RE.findall(text)]
-            for raw in _GIT_DATE_RE.findall(text):
-                try:
-                    dates.append(("git date", parsedate_to_datetime(raw)))
-                except (TypeError, ValueError):
-                    pass
-            for field, when in dates:
-                if when > limit:
-                    found.append(f"{session.name}: {field} {when.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}")
+    for name, text in _read_texts(artifact):
+        dates = [(f, _parse_time(t)) for f, t in _DATED_FIELD_RE.findall(text)]
+        for raw in _GIT_DATE_RE.findall(text):
+            try:
+                dates.append(("git date", parsedate_to_datetime(raw)))
+            except (TypeError, ValueError):
+                pass
+        for field, when in dates:
+            if when > limit:
+                found.append(f"{name}: {field} {when.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}")
     return found
 
 
@@ -198,15 +208,20 @@ def session_cost(artifact: Path) -> dict:
             if rec.get("type") == "assistant" and isinstance(usage, dict) and msg.get("id") not in seen:
                 seen.add(msg.get("id"))
                 tokens += sum(v for k, v in usage.items() if k.endswith("_tokens") and isinstance(v, int))
-        if stamps:
+        if stamps and "subagents" not in session.parts:  # subagents run inside the main session's time
             seconds += (max(stamps) - min(stamps)).total_seconds()
     return {"seconds": seconds, "tokens": tokens}
 
 
-def _registered(sglang: Path, path: str, backend: str) -> bool:
-    file = sglang / path
-    return file.is_file() and any(r["backend"] == backend and not r["disabled"]
-                                  for r in registrations(file.read_text(errors="replace")))
+def _registered(sglang: Path, commit: str, path: str, backend: str) -> bool:
+    """Whether *path* has an enabled registration for *backend* at *commit* of the sglang clone.
+
+    The PR's head, not main: a PR's own new test may be gone from main (a revert).
+    """
+    shown = subprocess.run(["git", "-C", str(sglang), "show", f"{commit}:{path}"],
+                           capture_output=True, text=True, errors="replace")
+    return shown.returncode == 0 and any(r["backend"] == backend and not r["disabled"]
+                                         for r in registrations(shown.stdout))
 
 
 def score_selection(cases: list[dict], runs_dir: Path, sglang: Path | None = None) -> dict:
@@ -230,7 +245,8 @@ def score_selection(cases: list[dict], runs_dir: Path, sglang: Path | None = Non
                 "truth_extra": truth["extra_needed"], "bot_extra": got.get("extra_needed"),
                 "must_run": must, "hits": [f for f in must if f in files], "suggested": files,
                 "commands": got.get("commands", []),
-                "invalid": None if sglang is None else [f for f in files if not _registered(sglang, f, backend)],
+                "invalid": None if sglang is None else [
+                    f for f in files if not _registered(sglang, case["head_sha"], f, backend)],
             })
     result = {"rows": rows}
     for scope, selected in (("all", rows), ("confirmed", [r for r in rows if r["status"] == "confirmed"])):
@@ -298,7 +314,8 @@ def main() -> None:
     parser.add_argument("--run-missing", action="store_true", help="run ci-status (no posting) for cases without an artifact")
     parser.add_argument("--parallel", type=int, default=1, help="cases run at once by --run-missing")
     parser.add_argument("--selection", action="store_true", help="score the Suggested tests section")
-    parser.add_argument("--sglang", type=Path, help="sglang main checkout, to re-check every suggested file (--selection)")
+    parser.add_argument("--sglang", type=Path, help="sglang clone with the cases' head commits, to re-check every "
+                        "suggested file at the PR head (--selection)")
     parser.add_argument("--list-candidates", type=int, nargs="?", const=30, metavar="N",
                         help="list N recent PRs with amd-bot ci-status reports")
     args = parser.parse_args()
@@ -309,7 +326,7 @@ def main() -> None:
         sys.exit("--runs is required")
     cases = load_cases(Path(args.cases or (SELECTION_CASES_DIR if args.selection else CASES_DIR)))
     if args.run_missing:
-        run_missing(cases, Path(args.runs), args.parallel)
+        run_missing(cases, Path(args.runs), args.parallel, "selection.json" if args.selection else "verdicts.json")
     if args.selection:
         print(format_selection_score(score_selection(cases, Path(args.runs), args.sglang)))
     else:

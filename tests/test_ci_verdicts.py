@@ -187,6 +187,10 @@ class TestAgentHarness(unittest.TestCase):
                 seen.update(cmd=cmd, env=kwargs["env"])
                 project.mkdir(parents=True)
                 (project / "s.jsonl").write_text('{"text": "token SECRETVALUE123"}\n')
+                (project / "s" / "tool-results").mkdir(parents=True)
+                (project / "s" / "tool-results" / "b1.txt").write_text("big output SECRETVALUE123")
+                (project / "s" / "subagents").mkdir()
+                (project / "s" / "subagents" / "agent-1.jsonl").write_text("{}\n")
                 return subprocess.CompletedProcess(cmd, 0, stdout="## CI Status for PR #1\nok", stderr="")
 
             env = {"GH_PAT": "SECRETVALUE123", "AGENT_GH_TOKEN": "READONLY789", "BOT_PAT": "BOTVALUE000",
@@ -201,6 +205,8 @@ class TestAgentHarness(unittest.TestCase):
             [session_dir] = archive.iterdir()
             self.assertTrue(session_dir.name.endswith("PR_CI_Status_Check"))
             self.assertEqual((session_dir / "s.jsonl").read_text(), '{"text": "token [redacted]"}\n')
+            self.assertEqual((session_dir / "s" / "tool-results" / "b1.txt").read_text(), "big output [redacted]")
+            self.assertTrue((session_dir / "s" / "subagents" / "agent-1.jsonl").exists())
 
 
 if __name__ == "__main__":

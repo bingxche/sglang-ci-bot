@@ -4,9 +4,10 @@ The ci-status agent picks the tests a PR should run, following sglang main's
 ``rerun-test`` and ``write-sglang-test`` skills (copied from ``main`` into
 ``.ci-context/sglang-skills/``, never read from the PR checkout, which the PR
 can change). It ends its report with a hidden ``test-selection`` block. Code
-keeps only the files that exist, are registered for the platform and are not
-disabled, then writes the commands, so the section never asks anyone to run a
-test that cannot run. The bot only suggests; it triggers nothing (R3).
+keeps only the files that exist in the checkout CI tested, are registered for
+the platform and are not disabled, then writes the commands, so the section
+never asks anyone to run a test that cannot run. The bot only suggests; it
+triggers nothing (R3).
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ import ast
 import json
 import re
 from pathlib import Path
+
+import requests
 
 from utils import get_file_content_at_ref
 
@@ -29,23 +32,36 @@ HANDLER_PATH = "scripts/ci/utils/slash_command_handler.py"
 MAX_FILES = 8
 # More extra-tier files than this on one platform: suggest the whole extra tier.
 MAX_EXTRA_FILES = 3
+# /rerun-test rejects a file estimated above 60 minutes (rerun-test skill, "Limits").
+MAX_RERUN_SECS = 3600
 DISCLAIMER = "🤖 AI-generated suggestion — use it with your own judgement."
 PLATFORMS = {"nv": ("NVIDIA", "cuda"), "amd": ("AMD", "amd")}
+_TIERS = ("base", "extra", "nightly", "weekly", "other")
 _REGISTER_RE = re.compile(r"^register_(\w+)_ci$")
 _BLOCK_RE = re.compile(r"<!--\s*test-selection\s*(\{.*?\})\s*-->", re.DOTALL)
+_PATH_RE = re.compile(r"^[\w./-]+\.py$")
+_SPEC_SUFFIX_RE = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)?$")
+_GROUP_RE = re.compile(r"^[\w.-]+$")
 _CI_STATES = ("passed", "failed", "not_run", "pending")
+# ci_register's positional order: register_*_ci(est_time, suite, nightly, disabled)
+_POSITIONAL = ("est_time", "suite", "nightly", "disabled")
 
 
 def main_context(token: str, fetch=None) -> tuple[dict[str, str], bool]:
-    """The skill files from sglang ``main`` as context files, and whether ``/rerun-test --amd`` exists there."""
+    """The skill files from sglang ``main`` as context files, and whether ``/rerun-test --amd`` exists there.
+
+    A file that cannot be fetched is left out; the agent is told which ones it has.
+    """
     fetch = fetch or get_file_content_at_ref
-    files = {}
-    for name, path in SKILL_FILES.items():
-        text = fetch(token, path, "main")
-        if text:
-            files[f"sglang-skills/{name}"] = text
-    handler = fetch(token, HANDLER_PATH, "main") or ""
-    return files, bool(re.search(r"""=\s*["']--amd["']""", handler))
+
+    def get(path: str) -> str | None:
+        try:
+            return fetch(token, path, "main")
+        except requests.RequestException:
+            return None
+
+    files = {f"sglang-skills/{name}": text for name, path in SKILL_FILES.items() if (text := get(path))}
+    return files, bool(re.search(r"""=\s*["']--amd["']""", get(HANDLER_PATH) or ""))
 
 
 def parse_block(report: str) -> dict | None:
@@ -77,7 +93,12 @@ def tier(suite: str, nightly: bool = False) -> str:
 
 
 def registrations(text: str) -> list[dict]:
-    """Module-level ``register_<backend>_ci(...)`` calls, read the way ``test/run_suite.py`` reads them."""
+    """Module-level ``register_<backend>_ci(...)`` calls, read the way ``test/run_suite.py`` reads them.
+
+    ``disabled`` counts when it is given at all and not ``None`` (as in run_suite.py).
+    ``rerunnable`` is False for a CUDA registration without ``stage`` + ``runner_config``:
+    ``/rerun-test`` cannot dispatch a legacy ``suite=`` string.
+    """
     try:
         tree = ast.parse(text)
     except SyntaxError:
@@ -90,29 +111,29 @@ def registrations(text: str) -> list[dict]:
         m = _REGISTER_RE.match(call.func.id)
         if not m:
             continue
-        kw = {k.arg: k.value.value for k in call.keywords
-              if k.arg and isinstance(k.value, ast.Constant)}
-        if len(call.args) > 1 and isinstance(call.args[1], ast.Constant):
-            kw.setdefault("suite", call.args[1].value)
-        if kw.get("stage") and kw.get("runner_config"):
-            suite = f"{kw['stage']}-test-{kw['runner_config']}"
-        else:
-            suite = str(kw.get("suite") or "")
-        est = kw.get("est_time", call.args[0].value if call.args and isinstance(call.args[0], ast.Constant) else None)
+        nodes = dict(zip(_POSITIONAL, call.args))
+        nodes.update({k.arg: k.value for k in call.keywords if k.arg})
+        kw = {k: v.value for k, v in nodes.items() if isinstance(v, ast.Constant)}
+        staged = bool(kw.get("stage") and kw.get("runner_config"))
+        suite = f"{kw['stage']}-test-{kw['runner_config']}" if staged else str(kw.get("suite") or "")
+        disabled = "disabled" in nodes and not (isinstance(nodes["disabled"], ast.Constant)
+                                                and nodes["disabled"].value is None)
+        est = kw.get("est_time")
         out.append({"backend": m.group(1), "suite": suite, "tier": tier(suite, kw.get("nightly") is True),
-                    "disabled": bool(kw.get("disabled")), "est_time": est})
+                    "disabled": disabled, "est_time": est if isinstance(est, (int, float)) else None,
+                    "rerunnable": staged or m.group(1) != "cuda"})
     return out
 
 
-def _normalize(entry: str) -> tuple[str, str]:
-    """``(file path from the repo root, spec for /rerun-test)`` from what the agent wrote."""
-    entry = entry.strip().strip("`")
-    path, sep, rest = entry.partition("::")
-    path = path.lstrip("./")
+def _normalize(entry: str) -> tuple[str, str] | None:
+    """``(file path from the repo root, spec for /rerun-test)``, or None when it is not a plain test path."""
+    path, sep, rest = entry.strip().strip("`").partition("::")
+    path = path.removeprefix("./")
     if path.startswith("registered/"):
         path = "test/" + path
-    spec = path.removeprefix("test/") + (f"::{rest}" if sep and rest else "")
-    return path, spec
+    if not _PATH_RE.match(path) or ".." in path.split("/") or (sep and not _SPEC_SUFFIX_RE.match(rest)):
+        return None
+    return path, path.removeprefix("test/") + (f"::{rest}" if sep else "")
 
 
 def _cell(value, limit: int = 300) -> str:
@@ -120,56 +141,64 @@ def _cell(value, limit: int = 300) -> str:
     return (text[:limit] + "…" if len(text) > limit else text).replace("|", "\\|")
 
 
-def check(block: dict | None, repo_path: Path, token: str, groups: set[str], amd_rerun: bool,
-          fetch=None) -> dict:
+def _items(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def check(block: dict | None, repo_path: Path, groups: set[str], amd_rerun: bool) -> dict:
     """Keep the suggested files that exist, are registered for the platform and are not disabled.
 
-    A file is read from the checkout CI tested (the PR's own tests) and, when
-    absent there, from ``main``. At most ``MAX_FILES`` per platform are kept.
+    Files are read from the checkout CI tested, so a PR's new tests count and a
+    test it deletes does not. At most ``MAX_FILES`` per platform are kept.
     Returns, per platform, what is kept, what was dropped and why, and the commands.
     """
-    fetch = fetch or get_file_content_at_ref
     result = {"amd_rerun": amd_rerun, "valid": block is not None, "platforms": {}}
     for key, (_, backend) in PLATFORMS.items():
-        raw = (block or {}).get(key) if isinstance(block, dict) else None
+        raw = block.get(key) if isinstance(block, dict) else None
         raw = raw if isinstance(raw, dict) else {}
-        kept, dropped, seen = [], [], set()
-        for item in raw.get("files") or []:
+        kept, dropped, by_path = [], [], {}
+        for item in _items(raw.get("files")):
             item = item if isinstance(item, dict) else {"file": item}
-            path, spec = _normalize(str(item.get("file") or ""))
-            if not path.endswith(".py") or ".." in path.split("/"):
-                dropped.append({"file": path, "reason": "not a test file path"})
+            entry = str(item.get("file") or "")
+            norm = _normalize(entry)
+            if norm is None:
+                dropped.append({"file": entry[:200], "reason": "not a test file path"})
                 continue
-            if path in seen:
+            path, spec = norm
+            if path in by_path:
+                by_path[path]["spec"] = path.removeprefix("test/")  # two specs of one file: run all of it
                 continue
-            seen.add(path)
             if len(kept) >= MAX_FILES:
                 dropped.append({"file": path, "reason": f"over the limit of {MAX_FILES} files"})
                 continue
             local = repo_path / path
-            text = local.read_text(errors="replace") if local.is_file() else fetch(token, path, "main")
-            if text is None:
-                dropped.append({"file": path, "reason": "not in the tested checkout or on main"})
+            if not local.is_file():
+                dropped.append({"file": path, "reason": "not in the checkout CI tested"})
                 continue
-            regs = [r for r in registrations(text) if r["backend"] == backend]
+            regs = [r for r in registrations(local.read_text(errors="replace")) if r["backend"] == backend]
             live = [r for r in regs if not r["disabled"]]
             if not live:
                 dropped.append({"file": path, "reason": f"no enabled register_{backend}_ci"
                                                        + (" (disabled)" if regs else "")})
                 continue
-            best = min(live, key=lambda r: ("base", "extra", "nightly", "weekly", "other").index(r["tier"]))
+            best = min(live, key=lambda r: _TIERS.index(r["tier"]))
+            est = best["est_time"]
             ci = str(item.get("ci") or "")
-            kept.append({"file": path, "spec": spec, "tier": best["tier"], "suite": best["suite"],
-                         "why": _cell(item.get("why")), "ci": ci if ci in _CI_STATES else "unknown"})
+            by_path[path] = {"file": path, "spec": spec, "tier": best["tier"], "suite": best["suite"],
+                             "rerunnable": best["rerunnable"] and not (est and est > MAX_RERUN_SECS),
+                             "why": _cell(item.get("why")), "ci": ci if ci in _CI_STATES else "unknown"}
+            kept.append(by_path[path])
         kept_groups = []
-        for g in raw.get("groups") or []:
+        for g in _items(raw.get("groups")):
             g = g if isinstance(g, dict) else {"group": g}
             name = str(g.get("group") or "")
-            if name not in groups:
-                dropped.append({"group": name, "reason": "not a group in main's rerun_test_groups.json"})
+            # /rerun-group takes a rerun_test_groups.json key or a test/registered/<dir> name.
+            known = name in groups or (_GROUP_RE.match(name) and (repo_path / "test" / "registered" / name).is_dir())
+            if not known:
+                dropped.append({"group": name[:200], "reason": "not a group /rerun-group knows"})
             elif key == "amd" and not amd_rerun:
                 dropped.append({"group": name, "reason": "/rerun-group cannot run AMD tests yet"})
-            else:
+            elif name not in [k["group"] for k in kept_groups]:
                 kept_groups.append({"group": name, "why": _cell(g.get("why"))})
         extra_needed = raw.get("extra_needed")
         platform = {"extra_needed": extra_needed if isinstance(extra_needed, bool) else None,
@@ -193,10 +222,12 @@ def commands(platform: str, sel: dict, amd_rerun: bool) -> list[str]:
         # --amd runs per-commit and extra suites only.
         files = [f for f in files if f["tier"] in ("base", "extra")]
     out = []
-    whole_extra = len(extra) > MAX_EXTRA_FILES or (sel["extra_needed"] and not extra)
-    if whole_extra:
+    # The whole tier also covers an extra file /rerun-test cannot take.
+    if len(extra) > MAX_EXTRA_FILES or (sel["extra_needed"] and not extra) or \
+            any(not f["rerunnable"] for f in extra):
         out.append(f"/run-extra-ci {platform}")
         files = [f for f in files if f["tier"] != "extra"]
+    files = [f for f in files if f["rerunnable"]]
     if files:
         out.append(f"/rerun-test {flag}" + " ".join(f["spec"] for f in files))
     if sel["groups"]:
@@ -204,12 +235,15 @@ def commands(platform: str, sel: dict, amd_rerun: bool) -> list[str]:
     return out
 
 
-def _no_command_note(platform: str, f: dict, amd_rerun: bool) -> str:
+def _note(platform: str, f: dict, amd_rerun: bool) -> str:
+    """Why a kept file has no command of its own, when it has none."""
     if platform == "amd" and not amd_rerun and f["tier"] != "extra":
         return " (no PR command on AMD yet; it runs in AMD PR CI)" if f["tier"] == "base" else \
             f" (runs only in AMD {f['tier']}; no PR command)"
     if platform == "amd" and f["tier"] not in ("base", "extra"):
         return f" (runs only in AMD {f['tier']}; `--amd` takes per-commit and extra suites)"
+    if not f["rerunnable"] and f["tier"] != "extra":
+        return " (`/rerun-test` cannot run it: over 60 min or a legacy `suite=` registration)"
     return ""
 
 
@@ -226,7 +260,7 @@ def render(result: dict) -> str:
             if sel["files"]:
                 lines += ["| Test | Tier | Why | This CI |", "|---|---|---|---|"]
                 for f in sel["files"]:
-                    note = _no_command_note(key, f, result["amd_rerun"])
+                    note = _note(key, f, result["amd_rerun"])
                     lines.append(f"| `{f['spec']}` | {f['tier']}{note} | {f['why']} | {f['ci'].replace('_', ' ')} |")
                 lines.append("")
             for g in sel["groups"]:
@@ -239,3 +273,12 @@ def render(result: dict) -> str:
                 lines += ["No extra tests suggested.", ""]
     lines.append(f"> {DISCLAIMER}")
     return "\n".join(lines) + "\n"
+
+
+def neutralize_outside_code(text: str, neutralize) -> str:
+    """Apply *neutralize* (``neutralize_mentions``) to everything except fenced code blocks.
+
+    GitHub pings nobody from inside a fence, and rewriting ``@decorator`` lines there garbles code.
+    """
+    parts = re.split(r"(^```.*?^```[^\n]*$)", text, flags=re.M | re.S)
+    return "".join(p if i % 2 else neutralize(p) for i, p in enumerate(parts))

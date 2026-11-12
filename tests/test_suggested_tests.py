@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import check_ci_for_pr  # noqa: E402
-import test_selection as ts  # noqa: E402
+import suggested_tests as ts  # noqa: E402
 
 CUDA_EXTRA = 'register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large")\n'
 CUDA_BASE = 'register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")\n'
@@ -30,10 +30,6 @@ def checkout(files: dict[str, str]) -> tempfile.TemporaryDirectory:
     return tmp
 
 
-def no_main(token, path, ref):
-    return None
-
-
 class RegistrationTest(unittest.TestCase):
     def test_tiers_from_suite_names(self):
         text = CUDA_EXTRA + CUDA_NIGHTLY + AMD_EXTRA + AMD_NIGHTLY + \
@@ -44,6 +40,17 @@ class RegistrationTest(unittest.TestCase):
                          [("cuda", "extra"), ("cuda", "nightly"), ("amd", "extra"), ("amd", "nightly"),
                           ("amd", "base"), ("cuda", "weekly")])
         self.assertEqual(regs[0]["suite"], "extra-a-test-1-gpu-large")
+
+    def test_disabled_and_positional_arguments(self):
+        regs = ts.registrations('register_cuda_ci(60, stage="base-b", runner_config="x", disabled="")\n'
+                                'register_amd_ci(60, "nightly-amd-1-gpu", False, "flaky")\n'
+                                'register_amd_ci(60, "stage-b-x", None, None)\n')
+        self.assertEqual([r["disabled"] for r in regs], [True, True, False])
+
+    def test_rerunnable(self):
+        regs = ts.registrations('register_cuda_ci(est_time=600, suite="nightly-perf-8-gpu-glm5", nightly=True)\n'
+                                + CUDA_EXTRA + AMD_EXTRA)
+        self.assertEqual([r["rerunnable"] for r in regs], [False, True, True])
 
     def test_only_module_level_calls_count(self):
         self.assertEqual(ts.registrations("def f():\n    " + CUDA_EXTRA), [])
@@ -65,6 +72,12 @@ class MainContextTest(unittest.TestCase):
         self.assertEqual(files["sglang-skills/rerun-test.md"], "main:.agents/skills/rerun-test/SKILL.md")
         self.assertTrue(amd_rerun)
 
+    def test_a_github_error_leaves_the_file_out(self):
+        def fetch(token, path, ref):
+            raise ts.requests.ConnectionError("reset")
+
+        self.assertEqual(ts.main_context("t", fetch=fetch), ({}, False))
+
     def test_no_amd_flag_on_main(self):
         _, amd_rerun = ts.main_context("t", fetch=lambda t, p, r: "Use `/run-extra-ci amd`")
         self.assertFalse(amd_rerun)
@@ -85,9 +98,9 @@ class GateTest(unittest.TestCase):
         "test/registered/a/test_amd.py": AMD_EXTRA,
     }
 
-    def run_check(self, block, files=None, amd_rerun=False, groups=("hicache-all",), fetch=no_main):
+    def run_check(self, block, files=None, amd_rerun=False, groups=("hicache-all",)):
         with checkout(files or self.FILES) as tmp:
-            return ts.check(block, Path(tmp), "t", set(groups), amd_rerun, fetch=fetch)
+            return ts.check(block, Path(tmp), set(groups), amd_rerun)
 
     def test_drops_missing_unregistered_and_disabled_files(self):
         block = {"nv": {"extra_needed": True, "reason": "r", "files": [
@@ -102,11 +115,34 @@ class GateTest(unittest.TestCase):
             "test/registered/a/test_made_up.py", "test/registered/a/test_disabled.py", "test/registered/a/test_amd.py"])
         self.assertIn("disabled", nv["dropped"][1]["reason"])
 
-    def test_a_file_only_on_main_is_kept(self):
-        block = {"nv": {"files": [{"file": "registered/b/test_main_only.py"}]}}
-        fetch = lambda t, p, r: CUDA_BASE if (p, r) == ("test/registered/b/test_main_only.py", "main") else None
-        nv = self.run_check(block, fetch=fetch)["platforms"]["nv"]
-        self.assertEqual([f["file"] for f in nv["files"]], ["test/registered/b/test_main_only.py"])
+    def test_a_file_missing_from_the_tested_checkout_is_dropped(self):
+        # /rerun-test runs the PR's code: a test the PR deleted or renamed cannot run.
+        block = {"nv": {"files": [{"file": "registered/b/test_deleted_by_pr.py"}]}}
+        nv = self.run_check(block)["platforms"]["nv"]
+        self.assertEqual(nv["files"], [])
+        self.assertIn("not in the checkout", nv["dropped"][0]["reason"])
+
+    def test_malformed_agent_values_do_not_crash(self):
+        for block in ({"nv": {"files": 5, "groups": 7}}, {"nv": {"files": "test_x.py"}}, {"nv": []}, {"amd": None}):
+            result = self.run_check(block)
+            self.assertEqual(result["platforms"]["nv"]["files"], [], block)
+
+    def test_injected_text_never_reaches_a_command(self):
+        block = {"nv": {"files": [
+            {"file": "test/registered/a/test_extra.py#\n/run-full-ci nv\nx.py"},
+            {"file": "test/registered/a/test_base.py::TestX /run-extra-ci amd"},
+            {"file": "test/registered/a/test_base.py::Test`X"},
+            {"file": "test/registered/a/test_base.py::TestX.test_y"},
+        ]}}
+        nv = self.run_check(block)["platforms"]["nv"]
+        self.assertEqual(nv["commands"], ["/rerun-test registered/a/test_base.py::TestX.test_y"])
+        self.assertEqual(len(nv["dropped"]), 3)
+
+    def test_two_specs_of_one_file_run_the_whole_file(self):
+        block = {"nv": {"files": [{"file": "test/registered/a/test_base.py::A"},
+                                  {"file": "test/registered/a/test_base.py::B"}]}}
+        nv = self.run_check(block)["platforms"]["nv"]
+        self.assertEqual(nv["commands"], ["/rerun-test registered/a/test_base.py"])
 
     def test_at_most_eight_files(self):
         files = {f"test/registered/c/test_{i}.py": CUDA_BASE for i in range(10)}
@@ -116,11 +152,12 @@ class GateTest(unittest.TestCase):
         self.assertEqual(len(nv["dropped"]), 2)
 
     def test_unknown_group_and_amd_group_dropped(self):
-        block = {"nv": {"groups": [{"group": "hicache-all"}, {"group": "made-up"}]},
+        block = {"nv": {"groups": [{"group": "hicache-all"}, {"group": "made-up"}, {"group": "a"}, {"group": "../a"}]},
                  "amd": {"groups": [{"group": "hicache-all"}]}}
         result = self.run_check(block)["platforms"]
-        self.assertEqual([g["group"] for g in result["nv"]["groups"]], ["hicache-all"])
-        self.assertEqual(result["nv"]["commands"], ["/rerun-group hicache-all"])
+        # "a" is a test/registered/<dir>, which /rerun-group also takes.
+        self.assertEqual([g["group"] for g in result["nv"]["groups"]], ["hicache-all", "a"])
+        self.assertEqual(result["nv"]["commands"], ["/rerun-group hicache-all a"])
         self.assertEqual(result["amd"]["groups"], [])
 
     def test_bad_paths_and_missing_block(self):
@@ -132,9 +169,16 @@ class GateTest(unittest.TestCase):
 
 
 class CommandTest(unittest.TestCase):
-    def sel(self, tiers, extra_needed=False, groups=()):
+    def sel(self, tiers, extra_needed=False, groups=(), rerunnable=True):
         return {"extra_needed": extra_needed, "groups": [{"group": g} for g in groups],
-                "files": [{"spec": f"registered/t{i}.py", "tier": t} for i, t in enumerate(tiers)]}
+                "files": [{"spec": f"registered/t{i}.py", "tier": t, "rerunnable": rerunnable}
+                          for i, t in enumerate(tiers)]}
+
+    def test_files_rerun_test_cannot_take(self):
+        # Over 60 minutes or a legacy suite= registration: nightly ones get no command,
+        # an extra one is covered by the whole tier.
+        self.assertEqual(ts.commands("nv", self.sel(["nightly"], rerunnable=False), False), [])
+        self.assertEqual(ts.commands("nv", self.sel(["extra"], rerunnable=False), False), ["/run-extra-ci nv"])
 
     def test_up_to_three_extra_files_run_one_by_one(self):
         self.assertEqual(ts.commands("nv", self.sel(["extra"] * 3 + ["nightly"]), False),
@@ -170,6 +214,14 @@ class RenderTest(unittest.TestCase):
         report = "## CI Status for PR #1\nok\n<!-- test-selection\n" + json.dumps(block) + "\n-->\n"
         self.assertEqual(ts.parse_block(report), block)
         self.assertNotIn("test-selection", ts.strip_block(report))
+
+
+class MentionTest(unittest.TestCase):
+    def test_code_fences_are_left_alone(self):
+        from suspect_pr_comments import neutralize_mentions
+        text = "ping @dev\n```python\n@torch.no_grad()\ndef f(): pass\n```\nand @other\n"
+        self.assertEqual(ts.neutralize_outside_code(text, neutralize_mentions),
+                         "ping `@dev`\n```python\n@torch.no_grad()\ndef f(): pass\n```\nand `@other`\n")
 
 
 class CiStatusIntegrationTest(unittest.TestCase):

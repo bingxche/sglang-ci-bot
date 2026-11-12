@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -58,7 +59,7 @@ class TestSelectionScore(unittest.TestCase):
         (artifact / "sessions" / "s1" / "a.jsonl").write_text(_session(session))
 
     def case(self, case_id: str, status: str = "confirmed") -> dict:
-        return {"id": case_id, "as_of": self.AS_OF, "status": status, "platforms": {
+        return {"id": case_id, "as_of": self.AS_OF, "status": status, "head_sha": "HEAD", "platforms": {
             "nv": {"extra_needed": True, "must_run": ["test/registered/a/test_a.py", "test/registered/a/test_b.py"]},
             "amd": {"extra_needed": False, "must_run": []}}}
 
@@ -69,8 +70,14 @@ class TestSelectionScore(unittest.TestCase):
                 _tool_result('{"createdAt":"2026-11-03T08:00:00Z","body":"/rerun-test x.py"}'),
                 _tool_result("commit abc\nDate:   Mon Nov 2 10:00:00 2026 -0800\n"),
             ])
+            # A large tool output kept outside the log.
+            big = Path(tmp) / "c1" / "sessions" / "s1" / "a" / "tool-results"
+            big.mkdir(parents=True)
+            (big / "b1.txt").write_text('{"merged_at": "2026-11-04T00:00:00Z"}')
             found = ev.leaks(Path(tmp) / "c1", self.AS_OF)
-        self.assertEqual(found, ["a.jsonl: createdAt 2026-11-03T08:00:00Z", "a.jsonl: git date 2026-11-02T18:00:00Z"])
+        self.assertEqual(sorted(found), ["a.jsonl: createdAt 2026-11-03T08:00:00Z",
+                                         "a.jsonl: git date 2026-11-02T18:00:00Z",
+                                         "b1.txt: merged_at 2026-11-04T00:00:00Z"])
 
     def test_score_selection(self):
         clean = [{"type": "assistant", "timestamp": "2026-11-01T00:00:00Z",
@@ -85,6 +92,12 @@ class TestSelectionScore(unittest.TestCase):
             (sglang / "test/registered/a").mkdir(parents=True)
             (sglang / "test/registered/a/test_a.py").write_text(
                 'register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")\n')
+            git = ["git", "-C", str(sglang), "-c", "user.name=t", "-c", "user.email=t@t"]
+            subprocess.run([*git[:3], "init", "-q"], check=True)
+            subprocess.run([*git, "add", "-A"], check=True)
+            subprocess.run([*git, "commit", "-qm", "pr head"], check=True)
+            # The checkout moved on (a revert removed the file); the PR head still has it.
+            (sglang / "test/registered/a/test_a.py").unlink()
             result = ev.score_selection([self.case("c1"), self.case("c2"), self.case("c3", "proposed")], root, sglang)
         m = result["confirmed"]
         self.assertEqual((m["scored"], m["of"], m["leaked"]), (2, 4, 2))
