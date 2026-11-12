@@ -1,0 +1,24 @@
+{
+  "id": "41282-0448768b",
+  "pr": 41282,
+  "head_sha": "0448768b255b2c34f312f37541bdfbcc16c03186",
+  "as_of": "2026-10-02T18:50:00Z",
+  "kind": "broke-after-merge",
+  "status": "proposed",
+  "source": "https://github.com/sgl-project/sglang/pull/42541 (revert)",
+  "platforms": {
+    "nv": {
+      "extra_needed": false,
+      "must_run": [],
+      "basis": "Every change is under is_hip()."
+    },
+    "amd": {
+      "extra_needed": false,
+      "must_run": [
+        "test/registered/core/test_basic_sanity.py",
+        "test/registered/core/test_basic_sanity_eagle3.py"
+      ],
+      "basis": "#42541: keeping cos_sin_cache fp32 on HIP fails CUDA-graph capture in the sgl_kernel.rotary_embedding fallback, so stage-a-test-1-gpu-small-amd (these two files) failed on every AMD PR. #41282's own PR Test (AMD) stopped at the label gate, so stage-a never ran. Base tier: extra is not what was missing."
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "id": "44718-67e2eb60",
+  "pr": 44718,
+  "head_sha": "67e2eb60e7f530a291751cb4bfc7775a798666fb",
+  "as_of": "2026-10-28T12:33:00Z",
+  "kind": "feature",
+  "status": "proposed",
+  "source": "https://github.com/sgl-project/sglang/pull/44718 labels run-ci-nv-extra and run-ci-amd-extra; /run-extra-ci amd",
+  "platforms": {
+    "nv": {
+      "extra_needed": true,
+      "must_run": [
+        "test/registered/kernels/ops/attention/test_gdn_prefill_graph.py",
+        "test/registered/kernels/ops/attention/test_kda_fused_verify_backend.py",
+        "test/registered/kernels/ops/attention/test_kda_prefill_graph.py",
+        "test/registered/unit/mem_cache/test_hicache_load_back_timing.py",
+        "test/registered/unit/mem_cache/test_mamba_path_state_cap.py",
+        "test/registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_load_back.py"
+      ],
+      "basis": "Judgment from the diff: the new path is env-gated (default off) but the PR changes shared kv_cache_configurator / unified radix cache code; must_run = its changed tests that have register_cuda_ci (the PR carried run-ci-nv-extra). Changed tests at the final head; the head at as_of may differ."
+    },
+    "amd": {
+      "extra_needed": true,
+      "must_run": [
+        "test/registered/unit/mem_cache/test_hicache_load_back_timing.py",
+        "test/registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_load_back.py"
+      ],
+      "basis": "The author posted /run-extra-ci amd (Kimi-K3 on MI355 is the target); must_run = its changed tests that have register_amd_ci."
+    }
+  }
+}

@@ -37,6 +37,33 @@ How to weigh evidence:
 
 Secondary, briefly: if upstream stages failed and later jobs were skipped, say PR CI is incomplete and name the workflow and stage; pending jobs are still running, not passing. Mention coverage only when evidence shows the PR's central change ran in no executed job.
 
+**Replays.** When the prompt has an `As of:` time, judge with what existed then. Do not read PR comments, reviews, commits, workflow runs or other PRs created after it (on this PR or on `main`); filter `gh` queries by date.
+
+### Suggested tests
+
+Base CI does not cover every path a PR touches: other features' tests run in the extra, nightly and weekly tiers. Besides attributing failures, say which tests this PR should still run, on NVIDIA and on AMD. Use sglang's own method, copied from sglang `main` into `.ci-context/sglang-skills/`:
+
+- pick tests the way `rerun-test.md` says ("Pick the tests": the PR's own changed tests, tests that exercise the changed modules, functions and flags, one end-to-end test per touched subsystem), within its "Limits";
+- use a group from `rerun_test_groups.json` when a whole group fits the change better than single files;
+- decide whether the PR needs the **extra** tier with `write-sglang-test.md`'s "Choosing a Tier": does the change reach a feature whose tests live in extra?
+
+AMD needs one more check:
+- suggest AMD tests only when the change reaches a ROCm-specific path (`is_hip()`, aiter, `amd/` or `rocm` code, HIP kernels, AMD CI files); `write-sglang-test.md` registers a test on AMD only in that case;
+- pick only files with a `register_amd_ci(...)`; their suite says the tier (`extra-…` is extra, `nightly…` or `nightly=True` is nightly).
+
+Every reason cites the changed paths (`python/sglang/srt/…`), not "this PR touches X". Give at most 8 files per platform, most important first, as repo paths (`test/registered/…/test_x.py`, optionally `::TestClass`). Say whether each one ran in this CI (`passed`, `failed`, `not_run`, `pending`). Docs-only or CPU-only changes need nothing: say so with `extra_needed: false` and no files.
+
+Do not write a visible section for this. After the verdict block, end the report with one hidden block; the harness checks every file (it exists, is registered for that platform, is not disabled), drops the rest, and renders the section and its commands:
+
+```
+<!-- test-selection
+{"nv": {"extra_needed": true, "reason": "python/sglang/srt/mem_cache/hiradix_cache.py changes HiCache write-back, which only extra tests cover",
+        "files": [{"file": "test/registered/hicache/test_hicache_storage.py", "why": "…", "ci": "not_run"}],
+        "groups": [{"group": "hicache-all", "why": "…"}]},
+ "amd": {"extra_needed": false, "reason": "no ROCm-specific path changed", "files": [], "groups": []}}
+-->
+```
+
 ### Output
 
 Your first output line is the report heading — no preamble. Keep this skeleton and drop empty sections. AMD failures (workflow file names containing `amd`) come before others. Link jobs as `https://github.com/sgl-project/sglang/actions/runs/{run_id}/job/{job_id}` and log lines as `…/job/{job_id}#step:{step}:{line}`.
@@ -62,7 +89,7 @@ Your first output line is the report heading — no preamble. Keep this skeleton
 For each 🔴 / 🟡 / ⚪ row: the one most informative next step (e.g. an A/B with a specific flag, a rerun on a specific GPU) and what outcome would confirm or refute the verdict.
 ```
 
-End the report with a machine-readable verdict block: one entry per failure ID in `evidence.md` that needs a verdict (cascades excluded). The harness checks it against the evidence pack and marks rows it cannot verify. Readers do not see it.
+After the visible report, add a machine-readable verdict block (and then the `test-selection` block above): one entry per failure ID in `evidence.md` that needs a verdict (cascades excluded). The harness checks it against the evidence pack and marks rows it cannot verify. Readers do not see it.
 
 ```
 <!-- ci-status-verdicts
