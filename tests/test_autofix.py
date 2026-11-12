@@ -133,6 +133,16 @@ class JobNameAndRecipeTest(unittest.TestCase):
         self.assertEqual(af_ci.job_family(SMALL), af_ci.job_family(SMALL.replace(", 3)", ", 5)")))
         self.assertNotEqual(af_ci.job_family(SMALL), af_ci.job_family(SMALL.replace("rocm10", "rocm720")))
 
+    def test_partitions_of_one_job(self):
+        mm = "multimodal-gen-test-1-gpu-amd (rocm720, linux-mi300-1gpu-sglang, 1)"
+        self.assertTrue(af_ci.same_job(mm, mm.replace(", 1)", ", 3)"), any_partition=True))
+        part1 = "nightly-test-1-gpu-unit (rocm720, linux-mi300-1gpu-sglang) part 1"
+        self.assertTrue(af_ci.same_job(part1, part1.replace("part 1", "part 2"), any_partition=True))
+        # Still not another ROCm version, GPU or job.
+        self.assertFalse(af_ci.same_job(mm, mm.replace("rocm720", "rocm10"), any_partition=True))
+        self.assertFalse(af_ci.same_job(mm, mm.replace("mi300", "mi325"), any_partition=True))
+        self.assertFalse(af_ci.same_job(mm, mm.replace("multimodal-gen", "unit"), any_partition=True))
+
     def test_one_job_on_two_runner_pools(self):
         gpu1 = "stage-b-test-1-gpu-small-amd-mi35x (rocm10, linux-mi35x-gpu-1)"
         self.assertTrue(af_ci.same_job(gpu1, gpu1.replace("linux-mi35x-gpu-1", "linux-sglang-mi35x-spur")))
@@ -257,6 +267,14 @@ class LogParsingTest(unittest.TestCase):
         log = ci_log("FAILED (errors=1)", "ERROR: setUpClass (__main__.TestTorchCompile)")
         self.assertEqual(af_ci.test_outcome(log, TEST_FILE, "TestTorchCompile.setUpClass").status, "failed")
         self.assertEqual(af_ci.test_outcome(PASSED_LOG, TEST_FILE, "setUpClass").status, "passed")
+
+    def test_a_pytest_line_of_another_file_does_not_count(self):
+        # Read whole (no run_suite markers): only the line of the file asked for counts.
+        log = "\n".join(["sglang/multimodal_gen/test/unit/test_other.py::test_x FAILED",
+                         "sglang/multimodal_gen/test/unit/test_nomas.py::test_x PASSED"])
+        f = "python/sglang/multimodal_gen/test/unit/test_nomas.py"
+        self.assertEqual(af_ci.test_outcome(log, f, "test_x").status, "passed")
+        self.assertEqual(af_ci.test_outcome(log, "python/sglang/x/test_absent.py", "test_x").status, "unknown")
 
     def test_pytest_status_on_a_later_line(self):
         log = "\n".join([
@@ -760,6 +778,38 @@ class SelectionTest(unittest.TestCase):
         # Once each has failed twice, it is sure.
         gh.timeline.insert(0, ("2026-11-12T01:10:00Z", {b: False, c: False}))
         self.assertEqual(autofix.build_plan(p, gh, CrusoeTest.yaml, NOW)[1], "")
+
+    def test_a_test_that_moved_partition_is_followed(self):
+        # R317: test_nomas.py ran in partition 1 on Nov 7 and Nov 11, in no partition on Nov 9 (the job died
+        # early), and the failure was read as "other", so two failures never made it sure.
+        p1, p3 = SMALL.replace(", 3)", ", 1)"), SMALL
+        fail = ci_log("FAILED (errors=1)", "ERROR: test_first_chunk_reads_fp8_pool "
+                      "(__main__.TestMiniMaxHD128AsmPrefill.test_first_chunk_reads_fp8_pool)")
+        other_only = "\n".join(["Begin (0/1):", "python3 /sglang-checkout/test/registered/a/test_other.py",
+                                "FAILED (errors=1)"])
+
+        class Moving(TimelineGitHub):
+            logs = {}
+
+            def job_log(self, job_id):
+                return self.logs.get(job_id, fail)
+        gh = Moving([("2026-11-11T19:05:00Z", {p3: False, p1: True}),
+                     ("2026-11-09T19:05:00Z", {p3: False, p1: False}),
+                     ("2026-11-07T19:05:00Z", {p3: True, p1: False}),
+                     ("2026-11-05T19:05:00Z", {p3: True, p1: True})])
+        # Nov 9: neither partition ran the file. Nov 7: it ran in partition 1 and failed.
+        gh.logs = {2010: other_only, 2011: other_only, 2021: fail}
+        plan, why = self.build(problem(), gh)
+        self.assertEqual(why, "")
+        self.assertEqual((plan["first_fail"]["at"], plan["last_pass"]["at"], plan["failing_runs"]),
+                         ("2026-11-07T19:05:00Z", "2026-11-05T19:05:00Z", 2))
+        self.assertEqual(plan["first_fail"]["job_url"], "https://github.com/x/job/2021")
+        # A run where the file ran in no failed partition but one succeeded: it passed there.
+        gh.logs = {2010: other_only, 2011: other_only, 2020: other_only, 2021: other_only}
+        gh.timeline[1] = ("2026-11-09T19:05:00Z", {p3: False, p1: True})
+        why = self.build(problem(), gh)[1]
+        self.assertTrue(why.startswith("not failing for sure: its latest scheduled runs were failed"), why)
+        self.assertIn("passed", why)
 
     def test_a_job_listed_twice_counts_where_it_ran(self):
         # The run lists the job on two pools; the first listed was cancelled, the second failed.

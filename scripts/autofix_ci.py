@@ -66,18 +66,26 @@ def _runner_gpu(label: str) -> tuple[str, str | None]:
     return (arch.group() if arch else label), (next(g for g in count.groups() if g) if count else None)
 
 
-def same_job(a: str, b: str) -> bool:
+def _same_gpu(x: str, y: str) -> bool:
+    (gx, cx), (gy, cy) = _runner_gpu(x), _runner_gpu(y)
+    return gx == gy and not (cx and cy and cx != cy)
+
+
+def same_job(a: str, b: str, any_partition: bool = False) -> bool:
     """Two names of one job that may have run on different pools of one GPU: ``x (rocm10, linux-mi35x-gpu-1)``
-    is ``x (rocm10, linux-sglang-mi35x-spur)``. GPUs, GPU counts (when both labels name one),
-    partitions, parts and ROCm versions still differ."""
+    is ``x (rocm10, linux-sglang-mi35x-spur)``. GPUs, GPU counts (when both labels name one) and
+    ROCm versions still differ; partitions (``…, 3)``) and parts (``part 2``) too, unless *any_partition*:
+    suites that place tests by time move a file from one partition to another between runs."""
+    if any_partition:
+        ja, jb = parse_job_name(a), parse_job_name(b)
+
+        def rest(j: JobName) -> tuple:
+            return j.caller, j.base, tuple(p for p in j.params if p != j.runner and not p.isdigit())
+        return rest(ja) == rest(jb) and bool(ja.runner) == bool(jb.runner) and _same_gpu(ja.runner, jb.runner)
     ra, rb = _RUNNER_LABEL_RE.findall(a or ""), _RUNNER_LABEL_RE.findall(b or "")
     if _RUNNER_LABEL_RE.sub("", a or "") != _RUNNER_LABEL_RE.sub("", b or "") or len(ra) != len(rb):
         return False
-    for x, y in zip(ra, rb):
-        (gx, cx), (gy, cy) = _runner_gpu(x), _runner_gpu(y)
-        if gx != gy or (cx and cy and cx != cy):
-            return False
-    return True
+    return all(_same_gpu(x, y) for x, y in zip(ra, rb))
 
 
 @dataclass(frozen=True)
@@ -290,8 +298,9 @@ def _unittest_ids(inner: str, name: str) -> str:
     return comps[-1]
 
 
-def func_status(lines: list[str], want: str) -> str | None:
-    """``passed`` / ``failed`` / ``skipped`` for test function *want*, or None when the lines never name it."""
+def func_status(lines: list[str], want: str, test_file: str = "") -> str | None:
+    """``passed`` / ``failed`` / ``skipped`` for test function *want*, or None when the lines never name it.
+    With *test_file*, a pytest line of another file does not count (a log read whole, not per file)."""
     statuses: list[str] = []
     pending: tuple[str, str, str] | None = None
     for raw in lines:
@@ -314,6 +323,9 @@ def func_status(lines: list[str], want: str) -> str | None:
                 pending = (cls, m.group(1), "")
             continue
         m = _PYTEST_RE.match(line)
+        if m and test_file and not same_file(m.group(2), test_file):
+            pending = None
+            continue
         if m:
             cls_name = m.group(3).split("::")
             cls = cls_name[-2] if len(cls_name) > 1 else ""
@@ -383,7 +395,7 @@ def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
     )
     last = mine[-1]
     ran = not whole_log
-    status = func_status(last.lines, test_func)
+    status = func_status(last.lines, test_func, test_file)
     if status:
         return Outcome(status, retried, ran_file=ran)
     _, name, _ = _split_func(test_func)
