@@ -86,7 +86,7 @@ log = logging.getLogger("daily-summary")
 SUMMARY_CONTENT_MARKER = "<!-- daily-cross-workflow-summary -->"
 LEGACY_SUMMARY_COMMENT_MARKER = "<!-- ci-monitor-daily-status-board -->"
 
-DEFAULT_SUMMARY_TIMEOUT = 1200
+DEFAULT_SUMMARY_TIMEOUT = 1800
 DEFAULT_AGENT_MAX_TURNS = 200
 
 # Matches the placeholder block under BOTH the new and the legacy marker

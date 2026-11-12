@@ -324,7 +324,7 @@ def analyze(
             work_dir=repo_path,
             context_files={"notion-staging-history.md": context},
             max_turns=int(os.environ.get("STAGING_AGENT_MAX_TURNS", "120")),
-            timeout_secs=int(os.environ.get("STAGING_AGENT_TIMEOUT_SECS", "1200")),
+            timeout_secs=int(os.environ.get("STAGING_AGENT_TIMEOUT_SECS", "1800")),
             output_must_contain=CANDIDATES_START,
         )
         output.parent.mkdir(parents=True, exist_ok=True)

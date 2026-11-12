@@ -559,7 +559,7 @@ def run_agent_extraction(
             work_dir=repo_path,
             context_files={"failure-tracker-analyses.md": _build_agent_context(wf_analyses)},
             max_turns=int(os.environ.get("TRACKER_AGENT_MAX_TURNS", "80")),
-            timeout_secs=int(os.environ.get("TRACKER_AGENT_TIMEOUT_SECS", "900")),
+            timeout_secs=int(os.environ.get("TRACKER_AGENT_TIMEOUT_SECS", "1800")),
         )
     except Exception as exc:
         log.warning("Agent extraction failed (%s)", exc)

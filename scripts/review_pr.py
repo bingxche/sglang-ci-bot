@@ -171,7 +171,7 @@ def review_pr_with_agent(
         prompt=prompt,
         work_dir=repo_path,
         max_turns=1000,
-        timeout_secs=600,
+        timeout_secs=1200,
     )
 
 

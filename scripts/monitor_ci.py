@@ -1177,7 +1177,7 @@ def maybe_publish_cross_run_summary(
                 work_dir=agent_repo_path,
                 context_files={"per-job-analyses.md": jobs_text},
                 max_turns=int(os.environ.get("AGENT_MAX_TURNS", "150")),
-                timeout_secs=int(os.environ.get("CROSS_RUN_TIMEOUT_SECS", "600")),
+                timeout_secs=int(os.environ.get("CROSS_RUN_TIMEOUT_SECS", "1200")),
             )
         except Exception as exc:
             log.warning("  Cross-run agent analysis failed (%s)", exc)
