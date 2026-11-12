@@ -1,0 +1,20 @@
+{
+  "id": "43703-d1a76e79",
+  "pr": 43703,
+  "head_sha": "d1a76e790193e5e2c9636ee6e75d3d5002da5fb5",
+  "as_of": "2026-11-07T00:40:00Z",
+  "kind": "broke-after-merge",
+  "status": "confirmed",
+  "source": "https://github.com/sgl-project/sglang/pull/49118 (revert), https://github.com/sgl-project/sglang/pull/49092",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
+  "platforms": {
+    "nv": {
+      "extra_needed": true,
+      "basis": "#49118: autotuned low-M BF16 GEMMs pick FlashInfer's TGV kernel that faults under CUDA graph + PDL: test_qwen4_exp_pd_prefill_cp.py (nightly 8-gpu-b200) failed, test_qwen4_exp_models.py (extra-b 4-gpu-b200) intermittently. #49092: it also broke test_full_cuda_graph_prefill.py (extra-b-test-4-gpu-b200). as_of is before BBuf's /rerun-test at 00:44:51Z."
+    },
+    "amd": {
+      "extra_needed": false,
+      "basis": "FlashInfer mm_bf16 path is NVIDIA-only."
+    }
+  }
+}

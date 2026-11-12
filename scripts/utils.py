@@ -2357,6 +2357,13 @@ def _archive_agent_session(work_dir: Path, started_at: float, prompt: str) -> No
                 # File mtimes come from a coarse clock and can trail time.time().
                 if session.stat().st_mtime >= started_at - 5:
                     (dest / session.name).write_text(redact_secrets(session.read_text(errors="replace")))
+                    # <session>/subagents/*.jsonl and <session>/tool-results/* (large tool outputs
+                    # the log only points to) are part of what the agent read.
+                    for extra in sorted((project / session.stem).glob("**/*")):
+                        if extra.is_file():
+                            out = dest / session.stem / extra.relative_to(project / session.stem)
+                            out.parent.mkdir(parents=True, exist_ok=True)
+                            out.write_text(redact_secrets(extra.read_text(errors="replace")))
     except Exception as exc:
         _agent_log.warning("Could not archive agent session: %s", exc)
 

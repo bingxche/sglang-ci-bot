@@ -1,0 +1,20 @@
+{
+  "id": "48282-511e1461",
+  "pr": 48282,
+  "head_sha": "511e146197e65bef4986c8b19b6e4cfee94bb3b8",
+  "as_of": "2026-11-04T01:39:00Z",
+  "kind": "docs-or-cpu",
+  "status": "confirmed",
+  "source": "test/registered/cpu/test_binding.py only",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
+  "platforms": {
+    "nv": {
+      "extra_needed": false,
+      "basis": "One import in a Xeon CPU test; no GPU code."
+    },
+    "amd": {
+      "extra_needed": false,
+      "basis": "One import in a Xeon CPU test; no GPU code."
+    }
+  }
+}

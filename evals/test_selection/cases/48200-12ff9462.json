@@ -1,0 +1,20 @@
+{
+  "id": "48200-12ff9462",
+  "pr": 48200,
+  "head_sha": "12ff946214871fa3d9b2d477c6a2a9f2bace1d10",
+  "as_of": "2026-11-11T01:40:00Z",
+  "kind": "docs-or-cpu",
+  "status": "confirmed",
+  "source": "docs/docs/sglang-diffusion/performance-optimization.mdx only",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
+  "platforms": {
+    "nv": {
+      "extra_needed": false,
+      "basis": "Docs only."
+    },
+    "amd": {
+      "extra_needed": false,
+      "basis": "Docs only."
+    }
+  }
+}

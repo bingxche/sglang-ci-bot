@@ -1,0 +1,20 @@
+{
+  "id": "47236-59f3abbf",
+  "pr": 47236,
+  "head_sha": "59f3abbfcddf65c09b22e8e3e0ec6123ada52451",
+  "as_of": "2026-10-30T08:36:00Z",
+  "kind": "feature",
+  "status": "confirmed",
+  "source": "https://github.com/sgl-project/sglang/pull/47236 comment 08:36:37Z",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
+  "platforms": {
+    "nv": {
+      "extra_needed": false,
+      "basis": "_use_rocm_triton_softmax_topk requires _use_aiter and gfx95."
+    },
+    "amd": {
+      "extra_needed": false,
+      "basis": "The reviewer posted /rerun-test for the PR's own test (stage-b mi35x)."
+    }
+  }
+}

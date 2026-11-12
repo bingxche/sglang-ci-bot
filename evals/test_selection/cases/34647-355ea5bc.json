@@ -1,0 +1,20 @@
+{
+  "id": "34647-355ea5bc",
+  "pr": 34647,
+  "head_sha": "355ea5bca37db654244e232597eb5e19b91830fb",
+  "as_of": "2026-09-01T06:40:00Z",
+  "kind": "broke-after-merge",
+  "status": "confirmed",
+  "source": "https://github.com/sgl-project/sglang/pull/37762",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
+  "platforms": {
+    "nv": {
+      "extra_needed": false,
+      "basis": "AITER Gluon MLA on ROCm only."
+    },
+    "amd": {
+      "extra_needed": false,
+      "basis": "#37762: the BF16-query exception meant for Kimi-K3's 12 heads applied to every AITER + FP8 MLA model; DeepSeek-R1-MXFP4 TP2 / TP4 / TP4-MTP lost nearly all GSM8K accuracy in the MI355X nightly (these three files)."
+    }
+  }
+}

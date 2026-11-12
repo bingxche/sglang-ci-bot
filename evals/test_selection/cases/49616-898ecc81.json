@@ -1,0 +1,20 @@
+{
+  "id": "49616-898ecc81",
+  "pr": 49616,
+  "head_sha": "898ecc813309fa3298eb9b3b70afe19ee254292c",
+  "as_of": "2026-11-10T20:47:00Z",
+  "kind": "feature",
+  "status": "confirmed",
+  "source": "https://github.com/sgl-project/sglang/pull/49616 comments 20:47-22:01Z",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
+  "platforms": {
+    "nv": {
+      "extra_needed": true,
+      "basis": "Files the author and a reviewer passed to /rerun-test. test_glm53_cp_bcg_dflash.py is extra-b-test-8-gpu-b300, so extra_needed is true."
+    },
+    "amd": {
+      "extra_needed": false,
+      "basis": "FlashMLA decode scheduling is CUDA-only."
+    }
+  }
+}

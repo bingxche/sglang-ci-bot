@@ -13,21 +13,48 @@ A runs directory holds one ci-status artifact per case (written by
     python scripts/eval_ci_status.py --runs RUNS                # score
     python scripts/eval_ci_status.py --runs RUNS --run-missing  # run the bot (no posting) for cases without one
     python scripts/eval_ci_status.py --list-candidates          # past bot reports to label
+
+``--selection`` scores the "Suggested extra CI" section instead, against
+``evals/test_selection/cases/*.json``: per platform, whether the PR needs the
+extra tier (``extra_needed``). A case whose agent session read anything dated
+after the case's ``as_of`` (a later comment, run or commit could give the
+answer away) is reported as leaked and not scored.
 """
 
 import argparse
 import json
+import math
 import os
+import re
+import shutil
+import signal
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
 
+from suggested_tests import PLATFORMS
 from utils import REPO, gh_headers
 
 ROOT = Path(__file__).resolve().parent.parent
 CASES_DIR = ROOT / "evals" / "ci_status" / "cases"
+SELECTION_CASES_DIR = ROOT / "evals" / "test_selection" / "cases"
+# One replay: the agent may take CI_STATUS_AGENT_TIMEOUT (2400 s), plus evidence collection.
+CASE_TIMEOUT_SECS = int(os.environ.get("EVAL_CASE_TIMEOUT_SECS", "4200"))
+# Timestamps in what a tool returned (gh JSON, git log) that date the content itself.
+# updated_at is left out: fetching an old object today still shows a recent update. Bare
+# values (jq -r, gh's text tables, "2 days ago") cannot be told apart and are not caught.
+_DATED_FIELD_RE = re.compile(
+    r'"(created_at|createdAt|submitted_at|submittedAt|merged_at|mergedAt|closed_at|closedAt|committedDate|'
+    r'authoredDate|publishedAt|published_at|run_started_at)"\s*:\s*'
+    r'"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))"')
+_GIT_DATE_RE = re.compile(r"^(?:Date|CommitDate|AuthorDate):\s+(\w{3} \w{3} +\d+ [\d:]+ \d{4} [+-]\d{4})", re.M)
+# git log --format=%ci / %ai and --date=iso
+_GIT_ISO_DATE_RE = re.compile(r"\b(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d{4})\b")
 
 
 def load_cases(cases_dir: Path = CASES_DIR) -> list[dict]:
@@ -99,15 +126,176 @@ def format_score(result: dict) -> str:
     return "\n".join(out)
 
 
-def run_missing(cases: list[dict], runs_dir: Path) -> None:
+def run_missing(cases: list[dict], runs_dir: Path, parallel: int = 1, marker: str = "verdicts.json") -> None:
+    """Run ci-status (no posting) for each case whose artifact lacks *marker*; sessions are archived in it.
+
+    With ``parallel`` > 1 each case gets its own sglang clone, so concurrent
+    runs never share a git index.
+    """
+    def run(case: dict) -> None:
+        artifact = runs_dir / case["id"]
+        # Sessions of an earlier attempt would be counted again (leaks, cost).
+        shutil.rmtree(artifact / "sessions", ignore_errors=True)
+        env = {**os.environ, "AGENT_ARCHIVE_DIR": str(artifact / "sessions")}
+        if parallel > 1:
+            env["AGENT_WORKSPACE"] = str(runs_dir / ".workspaces" / case["id"])
+        print(f"Running ci-status for {case['id']} (output in {runs_dir / case['id']}.log)...", flush=True)
+        with open(runs_dir / f"{case['id']}.log", "w") as log:
+            # Its own process group, so a timeout also stops the claude agent it started.
+            proc = subprocess.Popen([sys.executable, "-u", str(ROOT / "scripts" / "check_ci_for_pr.py"),
+                                     str(case["pr"]), "--no-post", "--head-sha", case["head_sha"],
+                                     "--as-of", case["as_of"], "--out-dir", str(artifact)],
+                                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                proc.wait(timeout=CASE_TIMEOUT_SECS)
+            except subprocess.TimeoutExpired:
+                # A hung GitHub request once kept a case running for hours; the case stays missing.
+                if hasattr(os, "killpg"):
+                    os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                else:
+                    proc.kill()
+                proc.wait()
+                log.write(f"\neval: case timed out after {CASE_TIMEOUT_SECS} s\n")
+
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    todo = [c for c in cases if not (runs_dir / c["id"] / marker).exists()]
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
+        list(pool.map(run, todo))
+
+
+def _parse_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _tool_results(session: Path):
+    """``(tool_use_id, text)`` of every tool result in a Claude Code session log."""
+    for line in session.read_text(errors="replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        content = (rec.get("message") or {}).get("content")
+        for item in content if isinstance(content, list) else []:
+            if not isinstance(item, dict) or item.get("type") != "tool_result":
+                continue
+            body = item.get("content")
+            if isinstance(body, list):
+                body = "\n".join(b.get("text", "") for b in body if isinstance(b, dict))
+            yield item.get("tool_use_id", ""), str(body or "")
+
+
+def _read_texts(artifact: Path):
+    """``(file name, text)`` of everything a session read: tool results in the logs (subagents' too)
+    and the large ones Claude Code keeps in ``<session>/tool-results/``."""
+    for path in sorted((artifact / "sessions").glob("**/*")):
+        if path.suffix == ".jsonl":
+            for _, text in _tool_results(path):
+                yield path.name, text
+        elif path.is_file() and path.parent.name == "tool-results":
+            yield path.name, path.read_text(errors="replace")
+
+
+def leaks(artifact: Path, as_of: str) -> list[str] | None:
+    """What the agent read that is dated after ``as_of`` (gh JSON dates, git log dates).
+
+    None when the run has no session log to check (no ``AGENT_ARCHIVE_DIR``, or archiving failed).
+    """
+    if not any((artifact / "sessions").glob("**/*.jsonl")):
+        return None
+    limit = _parse_time(as_of)
+    found = []
+    for name, text in _read_texts(artifact):
+        dates = [(f, _parse_time(t)) for f, t in _DATED_FIELD_RE.findall(text)]
+        for raw in _GIT_DATE_RE.findall(text):
+            try:
+                dates.append(("git date", parsedate_to_datetime(raw)))
+            except (TypeError, ValueError):
+                pass
+        for raw in _GIT_ISO_DATE_RE.findall(text):
+            dates.append(("git date", datetime.strptime(raw, "%Y-%m-%d %H:%M:%S %z")))
+        for field, when in dates:
+            if when > limit:
+                found.append(f"{name}: {field} {when.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}")
+    return found
+
+
+def session_cost(artifact: Path) -> dict:
+    """Wall time (first to last event, summed over sessions) and tokens of the archived sessions."""
+    seconds, tokens = 0.0, 0
+    for session in sorted((artifact / "sessions").glob("**/*.jsonl")):
+        stamps, seen = [], set()
+        for line in session.read_text(errors="replace").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("timestamp"):
+                stamps.append(_parse_time(rec["timestamp"]))
+            msg = rec.get("message") or {}
+            usage = msg.get("usage")
+            if rec.get("type") == "assistant" and isinstance(usage, dict) and msg.get("id") not in seen:
+                seen.add(msg.get("id"))
+                tokens += sum(v for k, v in usage.items() if k.endswith("_tokens") and isinstance(v, int))
+        if stamps and "subagents" not in session.parts:  # subagents run inside the main session's time
+            seconds += (max(stamps) - min(stamps)).total_seconds()
+    return {"seconds": seconds, "tokens": tokens}
+
+
+def score_selection(cases: list[dict], runs_dir: Path) -> dict:
+    """Score ``extra_needed`` per case and platform; leaked or missing runs are not scored."""
+    rows, costs = [], []
     for case in cases:
         artifact = runs_dir / case["id"]
-        if (artifact / "verdicts.json").exists():
-            continue
-        print(f"Running ci-status for {case['id']}...", flush=True)
-        subprocess.run([sys.executable, str(ROOT / "scripts" / "check_ci_for_pr.py"), str(case["pr"]),
-                        "--no-post", "--head-sha", case["head_sha"], "--as-of", case["as_of"], "--out-dir", str(artifact)],
-                       check=False)
+        sel_file = artifact / "selection.json"
+        sel = json.loads(sel_file.read_text()) if sel_file.exists() else None
+        leaked = leaks(artifact, case["as_of"]) if sel else []
+        if sel:
+            costs.append(session_cost(artifact))
+        for key in PLATFORMS:
+            got = (sel or {}).get("platforms", {}).get(key, {})
+            rows.append({
+                "case": case["id"], "platform": key, "status": case.get("status", "proposed"),
+                "run": "missing" if sel is None else "unchecked" if leaked is None else "leaked" if leaked else "ok",
+                "leaks": (leaked or [])[:3],
+                "truth_extra": case["platforms"][key]["extra_needed"], "bot_extra": got.get("extra_needed"),
+                "reason": got.get("reason", ""),
+            })
+    result = {"rows": rows}
+    for scope, selected in (("all", rows), ("confirmed", [r for r in rows if r["status"] == "confirmed"])):
+        ok = [r for r in selected if r["run"] == "ok"]
+        result[scope] = {
+            "scored": len(ok), "of": len(selected),
+            "extra_correct": sum(r["bot_extra"] == r["truth_extra"] for r in ok),
+            "leaked": sum(r["run"] == "leaked" for r in selected), "missing": sum(r["run"] == "missing" for r in selected),
+            "unchecked": sum(r["run"] == "unchecked" for r in selected),
+        }
+    secs = sorted(c["seconds"] for c in costs)
+    result["cost"] = {
+        "runs": len(costs), "p90_seconds": secs[max(0, math.ceil(0.9 * len(secs)) - 1)] if secs else 0.0,
+        "max_seconds": secs[-1] if secs else 0.0, "tokens": sum(c["tokens"] for c in costs),
+    }
+    return result
+
+
+def format_selection_score(result: dict) -> str:
+    out = ["| Case | Platform | Status | Run | Extra (truth / bot) | Bot's reason |", "|---|---|---|---|---|---|"]
+    for r in result["rows"]:
+        mark = "" if r["run"] != "ok" or r["bot_extra"] == r["truth_extra"] else " ✗"
+        reason = r["reason"].replace("|", "\\|")[:200]
+        out.append(f"| {r['case']} | {r['platform']} | {r['status']} | {r['run']} | "
+                   f"{r['truth_extra']} / {r['bot_extra']}{mark} | {reason} |")
+    for r in result["rows"]:
+        if r["leaks"]:
+            out.append(f"\nLeak in {r['case']} ({r['platform']}): " + "; ".join(r["leaks"]))
+    for scope in ("all", "confirmed"):
+        m = result[scope]
+        out += ["", f"**{scope} labels**: scored {m['scored']} of {m['of']} case-platforms "
+                f"(leaked {m['leaked']}, missing {m['missing']}, no session log to check {m['unchecked']})",
+                f"- extra_needed correct: {_rate(m['extra_correct'], m['scored'])}"]
+    c = result["cost"]
+    out.append(f"\n**cost**: {c['runs']} runs, p90 {c['p90_seconds']:.0f} s, max {c['max_seconds']:.0f} s, "
+               f"{c['tokens']:,} tokens")
+    return "\n".join(out)
 
 
 def list_candidates(token: str, limit: int) -> str:
@@ -124,9 +312,11 @@ def list_candidates(token: str, limit: int) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Score ci-status verdicts against labeled cases")
-    parser.add_argument("--cases", default=str(CASES_DIR))
+    parser.add_argument("--cases", help=f"default: {CASES_DIR}, or {SELECTION_CASES_DIR} with --selection")
     parser.add_argument("--runs", help="directory with one ci-status artifact per case ID")
     parser.add_argument("--run-missing", action="store_true", help="run ci-status (no posting) for cases without an artifact")
+    parser.add_argument("--parallel", type=int, default=1, help="cases run at once by --run-missing")
+    parser.add_argument("--selection", action="store_true", help="score the Suggested extra CI section")
     parser.add_argument("--list-candidates", type=int, nargs="?", const=30, metavar="N",
                         help="list N recent PRs with amd-bot ci-status reports")
     args = parser.parse_args()
@@ -135,10 +325,13 @@ def main() -> None:
         return
     if not args.runs:
         sys.exit("--runs is required")
-    cases = load_cases(Path(args.cases))
+    cases = load_cases(Path(args.cases or (SELECTION_CASES_DIR if args.selection else CASES_DIR)))
     if args.run_missing:
-        run_missing(cases, Path(args.runs))
-    print(format_score(score(cases, Path(args.runs))))
+        run_missing(cases, Path(args.runs), args.parallel, "selection.json" if args.selection else "verdicts.json")
+    if args.selection:
+        print(format_selection_score(score_selection(cases, Path(args.runs))))
+    else:
+        print(format_score(score(cases, Path(args.runs))))
 
 
 if __name__ == "__main__":

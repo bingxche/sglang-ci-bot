@@ -1,0 +1,20 @@
+{
+  "id": "44718-67e2eb60",
+  "pr": 44718,
+  "head_sha": "67e2eb60e7f530a291751cb4bfc7775a798666fb",
+  "as_of": "2026-10-28T12:33:00Z",
+  "kind": "feature",
+  "status": "confirmed",
+  "source": "https://github.com/sgl-project/sglang/pull/44718 changed paths (labels run-ci-nv-extra, run-ci-amd-extra)",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
+  "platforms": {
+    "nv": {
+      "extra_needed": true,
+      "basis": "Judged from the changed paths (the user asked for that): the PR changes the mamba component of the unified radix cache (python and rust/sglang-radix-tree), kv_cache_configurator and the KDA kernels. The new path is env-gated, but the shared code runs for every hybrid model; the E2E for that subsystem, test_unified_radix_cache_kl_mamba.py, is extra-b-test-4-gpu-h100, so extra is needed. Plus the PR's changed KDA kernel test and its new load-back test."
+    },
+    "amd": {
+      "extra_needed": false,
+      "basis": "No ROCm-specific path is changed (no is_hip, aiter, amd/ or rocm code), so by the write-sglang-test rule no AMD test is needed; the PR's AMD-registered unit tests run in AMD base anyway. (The author still ran /run-extra-ci amd.)"
+    }
+  }
+}

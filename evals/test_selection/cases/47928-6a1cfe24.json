@@ -1,0 +1,20 @@
+{
+  "id": "47928-6a1cfe24",
+  "pr": 47928,
+  "head_sha": "6a1cfe24224e4b07de2d47aab576e9e31ad38e4f",
+  "as_of": "2026-11-02T13:30:00Z",
+  "kind": "feature",
+  "status": "confirmed",
+  "source": "https://github.com/sgl-project/sglang/pull/47928 comments 13:30-13:31Z",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
+  "platforms": {
+    "nv": {
+      "extra_needed": true,
+      "basis": "The author posted /rerun-test for six files and /run-extra-ci nv. The three CPU-only files of that list (test_hybrid_pool_assembler.py, test_unified_kv_storage.py, test_unified_radix_hicache_dispatch.py) run in base-a-test-cpu on every PR and have no register_cuda_ci, so they are left out."
+    },
+    "amd": {
+      "extra_needed": false,
+      "basis": "Relabelled 2026-11-13 by the same changed-paths rule as #44718 (the user asked to judge by paths): the PR changes shared HiCache host-pool code (python/sglang/srt/mem_cache/hybrid_cache/, memory_pool.py) and no ROCm-specific path, so AMD needs no extra by write-sglang-test's rule. The author still posted /run-extra-ci amd; the first label followed that comment."
+    }
+  }
+}

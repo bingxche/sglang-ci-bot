@@ -45,7 +45,7 @@ Three more things the picture does not show:
 | [Failure Trackers](#53-failure-trackers) | `finalize` job of the CI monitor | [`failure_tracker.py`](scripts/failure_tracker.py) | Failure Tracker Data | One issue per tracked workflow on sgl-project/sglang |
 | [PR commands](#54-pr-commands-the-comment-watcher) | `@amd-bot …` on a sglang PR | runner-1 daemon + [`comment-watcher.yml`](.github/workflows/comment-watcher.yml) → [`watch_comments.py`](scripts/watch_comments.py) | — | Dispatches the two workflows below; help replies |
 | [PR review](#55-pr-review) | `@amd-bot review` | [`pr-review.yml`](.github/workflows/pr-review.yml) → [`review_pr.py`](scripts/review_pr.py) | PR Code Review | One comment on the sglang PR |
-| [PR CI status](#56-pr-ci-status-check) | `@amd-bot ci-status` | [`ci-status-check.yml`](.github/workflows/ci-status-check.yml) → [`check_ci_for_pr.py`](scripts/check_ci_for_pr.py), [`ci_evidence.py`](scripts/ci_evidence.py), [`ci_verdicts.py`](scripts/ci_verdicts.py) | PR CI Status Check | One comment on the sglang PR |
+| [PR CI status](#56-pr-ci-status-check) | `@amd-bot ci-status` | [`ci-status-check.yml`](.github/workflows/ci-status-check.yml) → [`check_ci_for_pr.py`](scripts/check_ci_for_pr.py), [`ci_evidence.py`](scripts/ci_evidence.py), [`ci_verdicts.py`](scripts/ci_verdicts.py), [`suggested_tests.py`](scripts/suggested_tests.py) | PR CI Status Check | One comment on the sglang PR |
 | [On-demand analysis](#57-on-demand-analysis) | Actions tab, paste a run/job URL | [`analyze-ci.yml`](.github/workflows/analyze-ci.yml) → [`analyze_url.py`](scripts/analyze_url.py) | Job Failure Analysis, Cross-Job Summary | An `[Analyze]` issue in this repo |
 | [Coverage audit](#58-coverage-exclusion-audit) | Mondays 16:07 UTC | [`coverage-audit.yml`](.github/workflows/coverage-audit.yml) (code lives in ROCm/sglang-ci) | its own prompt, in ROCm/sglang-ci | A PR merged into ROCm/sglang-ci |
 | [CI autofix](#59-ci-autofix) | after each CI-monitor tick | [`ci-autofix.yml`](.github/workflows/ci-autofix.yml) → [`autofix.py`](scripts/autofix.py) and its `autofix_*.py` modules | CI Autofix, CI Autofix Review | `bingxche/autofix-*` branches and draft PRs on sgl-project/sglang, as bingxche; a log comment on the daily issue |
@@ -186,7 +186,7 @@ Every agent run goes through [`claude_code_analyze()`](scripts/utils.py):
 4. It runs `claude -p` in the worktree:
    - flags: `--setting-sources user --disable-slash-commands --dangerously-skip-permissions`, with a turn limit and a timeout. A task with a tool allowlist (`tools` in its `AgentTask`) runs with `--restricted --permission-mode dontAsk --allowedTools …` instead, so any other tool call is denied and file tools stay in the working directory; every task adds `--effort` (see Models below);
    - environment: no `BOT_PAT`, `AUTOFIX_TOKEN` or `LLM_GATEWAY_KEY`, and `AGENT_GH_TOKEN` in place of `GH_PAT` when set. A task with `github_token=False` gets no GitHub token at all.
-5. The text output is returned. When the final message misses the expected report (empty, or overwritten by a follow-up), the report is recovered from the session log. When `AGENT_ARCHIVE_DIR` is set, the prompt and session are archived with secrets redacted.
+5. The text output is returned. When the final message misses the expected report (empty, or overwritten by a follow-up), the report is recovered from the session log. When `AGENT_ARCHIVE_DIR` is set, the prompt and session (with its subagent logs and the large tool outputs it keeps in separate files) are archived with secrets redacted.
 
 Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sglang_repo()`](scripts/utils.py), [`create_agent_worktree()`](scripts/utils.py)), checked out at the exact commit the CI run or PR used. The clone is re-made if it is broken (an interrupted clone once left runner-7 with no `HEAD`).
 
@@ -351,7 +351,7 @@ It does not meet design rule R2 yet: nothing checks the agent's findings before 
 
 ### 5.6 PR CI status check
 
-**Purpose.** For each CI job that ran and failed on the PR's head, decide whether **this PR** caused it. Also flag when PR CI is incomplete (fast-fail cascades, gates), or when the AMD test that covers the change never ran.
+**Purpose.** For each CI job that ran and failed on the PR's head, decide whether **this PR** caused it. Also flag when PR CI is incomplete (fast-fail cascades, gates), or when the AMD test that covers the change never ran. And say whether the PR should also run extra CI, on NVIDIA and on AMD.
 
 **Flow** ([`check_ci_for_pr()`](scripts/check_ci_for_pr.py)):
 1. **Evidence pack.** [`build_evidence_pack()`](scripts/ci_evidence.py) collects, for every failed job:
@@ -364,8 +364,12 @@ It does not meet design rule R2 yet: nothing checks the agent's findings before 
 2. **Agent.** The agent attributes each failure (🔴 related / 🟡 possibly / 🟢 unrelated / ⚪ unknown) and ends with a hidden verdict block citing evidence IDs.
 3. **Check.** [`validate()`](scripts/ci_verdicts.py) checks every verdict against the pack. For example, `related` needs the full chain: diff → the changed path ran → the failure. A row that fails the check is shown as ⚪ unverified, with a warning.
 4. **Coverage banner.** [`detect_untested_amd_changes()`](scripts/check_ci_for_pr.py) computes, in code, a banner shown when AMD CI did not run, or when the suite covering a changed test file did not run.
+5. **Suggested extra CI.** Base CI does not run the extra tier, so a green PR can still skip the tests of a feature it changes. The same agent says, per platform, whether the PR should run extra CI, with sglang's own rules, not ones of ours:
+   - [`main_context()`](scripts/suggested_tests.py) copies the `write-sglang-test` ("Choosing a Tier") and `rerun-test` skills (`.agents/skills/…/SKILL.md`) from sglang **`main`** into `.ci-context/sglang-skills/` (for a replay, `main` as of its `As of:` time, since a later skill could encode the answer). Never from the PR's checkout: a PR can rewrite its own skill files;
+   - the agent writes, in a hidden `test-selection` block, `extra_needed` and a one-sentence reason that names the changed paths. AMD needs extra only when the change reaches a ROCm-specific path. It lists no test files or commands (the repo owner's choice, 2026-11-12);
+   - [`check()`](scripts/suggested_tests.py) keeps only a yes/no answer and the reason, and [`render()`](scripts/suggested_tests.py) writes the section between two "🤖 AI-generated suggestion — use it with your own judgement." lines, with the comment that runs the extra tier (`/run-extra-ci nv|amd`, [`PLATFORMS`](scripts/suggested_tests.py)) when it is needed. The bot only suggests; it runs nothing ([R3](#r3)). The whole report then goes through `neutralize_mentions()` (outside code blocks, inline code and URLs, where GitHub pings nobody anyway) and, last, `redact_secrets()`.
 
-These checks exist because of sgl-project/sglang#40771. There the bot read the PR head instead of the commit CI tested, judged a feature off from its code default while the image turned it on, and called a PR-caused accuracy drop unrelated. Replays with `--head-sha` / `--as-of` and the hand-labelled cases in [`evals/ci_status/cases/`](evals/ci_status/cases/) are scored by [`eval_ci_status.py`](scripts/eval_ci_status.py).
+These checks exist because of sgl-project/sglang#40771. There the bot read the PR head instead of the commit CI tested, judged a feature off from its code default while the image turned it on, and called a PR-caused accuracy drop unrelated. Replays with `--head-sha` / `--as-of` and the hand-labelled cases in [`evals/ci_status/cases/`](evals/ci_status/cases/) are scored by [`eval_ci_status.py`](scripts/eval_ci_status.py). With `--selection` it scores the Suggested extra CI against [`evals/test_selection/cases/`](evals/test_selection/cases/) instead: per case and platform, whether the PR needs the extra tier. A replay's prompt carries its `As of:` time, and the agent is told not to read anything newer; [`leaks()`](scripts/eval_ci_status.py) still scans the archived session, with its subagent logs and tool-result files, for later dates (a later `/run-extra-ci` comment or fix PR gives the answer away) and leaves such a case unscored, as it does a run with no session log to check. `--run-missing` writes each case's output to `<runs>/<case>.log` and stops a case, agent included, after `EVAL_CASE_TIMEOUT_SECS`.
 
 ### 5.7 On-demand analysis
 
@@ -541,6 +545,9 @@ python3 scripts/validate_live.py monitor|crossrun|daily|tracker|cistatus|review
 # CI-status replay and scoring against hand-labelled cases
 python scripts/check_ci_for_pr.py 40771 --no-post --head-sha <sha> --as-of <time> --out-dir runs/40771
 python scripts/eval_ci_status.py --runs runs
+
+# Suggested extra CI: replay every case (3 at a time, no posting), then score
+python scripts/eval_ci_status.py --selection --runs runs-sel --run-missing --parallel 3
 ```
 
 `validate_live.py` reads `VALIDATE_WORKFLOW`, `VALIDATE_HOURS`, `VALIDATE_JOB_FILTER`, `VALIDATE_PR`, `VALIDATE_DATE`, `VALIDATE_LOOKBACK`. Give each case its own `AGENT_WORKSPACE`, so it does not touch the runner's `/workspace`.
@@ -627,6 +634,7 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 | `SGLANG_CI_TOKEN` | `coverage-audit.yml` | ROCm/sglang-ci token, in place of `GH_PAT` |
 | `COMMENT_AUTHOR` | review, CI status | Set by the watcher; shown as "requested by" |
 | `PR_BODY` | `check_pr_rules.py` | The PR description, passed by `pr-checks.yml` (or `--body-file`) |
+| `EVAL_CASE_TIMEOUT_SECS` | `eval_ci_status.py --run-missing` | Time limit for one replayed case (4200 s); a case over it is left unscored |
 | `VALIDATE_*` | `validate_live.py` | See [Testing and validating a change](#testing-and-validating-a-change) |
 
 ### Repository layout

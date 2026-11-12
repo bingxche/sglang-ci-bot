@@ -1,0 +1,20 @@
+{
+  "id": "37423-248c1495",
+  "pr": 37423,
+  "head_sha": "248c14952d22ca57d9b2d1c022ae168c7b657771",
+  "as_of": "2026-09-04T06:50:00Z",
+  "kind": "broke-after-merge",
+  "status": "confirmed",
+  "source": "https://github.com/sgl-project/sglang/pull/38453",
+  "confirmed": "2026-11-12, user delegated the labels; #44718 judged from its changed paths",
+  "platforms": {
+    "nv": {
+      "extra_needed": false,
+      "basis": "ROCm-only path (deepseek_common/amd/)."
+    },
+    "amd": {
+      "extra_needed": false,
+      "basis": "#38453: the FP8 wo_a path rejected the BF16 wo_a weight of DeepSeek-V4 Flash-FP8 (and Pro-FP8) and the server exited at startup; the 8x MI35x Flash-FP8 test (nightly-amd-8-gpu-mi35x-deepseek-v4-flash) is the one that broke. No AMD extra test covers DSV4."
+    }
+  }
+}

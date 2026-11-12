@@ -18,8 +18,10 @@ from pathlib import Path
 
 import requests
 
+import suggested_tests
 from ci_evidence import build_evidence_pack
 from ci_verdicts import annotate_report, parse_verdict_block, validate
+from suspect_pr_comments import neutralize_mentions
 from utils import (
     CLAUDE_MODEL,
     REPO,
@@ -595,35 +597,46 @@ def _check_ci_with_agent(
     """
     pack = build_evidence_pack(token, pr_number, repo_path, head_sha=head_sha, as_of=as_of)
     checkout = pack["checkout"]
+    # From main, never from this checkout: the PR can change its own skill files.
+    skills = suggested_tests.main_context(token, as_of=as_of)
     prompt = (
         f"Task: PR CI Status Check\n"
         f"PR: #{pr_number} (head {pack['request']['head_sha']})\n"
         f"Repo: sgl-project/sglang\n"
         f"Source: current directory, checked out at {checkout['sha']} ({checkout['what']})\n"
         f"Evidence pack: .ci-context/evidence.md (start here), evidence.json, pr.diff, logs/\n"
-        f"Context files: .ci-context/ci-runtime-env.md\n"
-        f"GitHub API token: $GH_PAT"
+        f"Context files: .ci-context/ci-runtime-env.md; sglang main's skills: "
+        f"{', '.join('.ci-context/' + name for name in skills) or 'none (could not fetch them)'}\n"
+        + (f"As of: {as_of}\n" if as_of else "")
+        + "GitHub API token: $GH_PAT"
     )
     agent_report = _strip_preamble(claude_code_analyze(
         prompt=prompt,
         work_dir=repo_path,
-        context_files={"ci-runtime-env.md": collect_ci_runtime_env(repo_path)},
+        context_files={"ci-runtime-env.md": collect_ci_runtime_env(repo_path), **skills},
         timeout_secs=AGENT_TIMEOUT_SECS,
         output_must_contain="## CI Status for PR",
     ))
     checked, problems = validate(pack, parse_verdict_block(agent_report))
-    report = annotate_report(agent_report, pack, checked, problems)
+    selection = suggested_tests.check(suggested_tests.parse_block(agent_report))
+    report = annotate_report(suggested_tests.strip_block(agent_report), pack, checked, problems)
+    # Redact last: the section adds agent text after annotate_report's own redaction.
+    report = redact_secrets(suggested_tests.neutralize_outside_code(
+        report.rstrip() + "\n\n" + suggested_tests.render(selection), neutralize_mentions))
     print(f"  Verdicts: {len(checked)} checked, "
           f"{sum(bool(v['validation']) for v in checked)} unsupported, {len(problems)} report problems")
+    print("  Extra CI needed: " + ", ".join(f"{k} {p['extra_needed']}" for k, p in selection["platforms"].items()))
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
         shutil.copytree(repo_path / ".ci-context", out_dir / "pack", dirs_exist_ok=True)
-        (out_dir / "agent-report.md").write_text(redact_secrets(agent_report))
-        (out_dir / "report.md").write_text(report)
+        (out_dir / "agent-report.md").write_text(redact_secrets(agent_report), encoding="utf-8")
+        (out_dir / "report.md").write_text(report, encoding="utf-8")
         verdicts = [{**v, "agent_label": v["label"],
                      "label": "unknown" if v["validation"] and v["label"] else v["label"]} for v in checked]
         (out_dir / "verdicts.json").write_text(
             json.dumps({"verdicts": verdicts, "problems": problems}, indent=1))
+        (out_dir / "selection.json").write_text(redact_secrets(json.dumps(
+            {"as_of": as_of, "agent_block": suggested_tests.parse_block(agent_report), **selection}, indent=1)))
     return report
 
 
