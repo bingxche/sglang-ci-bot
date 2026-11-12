@@ -51,7 +51,7 @@ class GitHub:
         self._runs: dict[int, dict] = {}
         self._jobs: dict[int, list[dict]] = {}
         self._logs: dict[int, str] = {}
-        self._scheduled: dict[str, list[dict]] = {}
+        self._scheduled: dict[tuple, list[dict]] = {}
         self._files: dict[int, list[dict]] = {}
         self._artifacts: dict[tuple, dict[str, str]] = {}
         self._dispatched: set[str] = set()  # workflows this process dispatched on main
@@ -83,13 +83,17 @@ class GitHub:
             self._logs[job_id] = text
         return text
 
-    def scheduled_runs(self, workflow: str) -> list[dict]:
-        """Completed scheduled runs of *workflow* on main, newest first."""
-        if workflow not in self._scheduled:
+    def scheduled_runs(self, workflow: str, running: bool = False) -> list[dict]:
+        """Completed scheduled runs of *workflow* on main, newest first; with *running*, also
+        those still running, whose finished jobs count. A PR Test (AMD) run often stays queued
+        for half a day after the job that matters ended (R427's on Nov 11)."""
+        key = (workflow, running)
+        if key not in self._scheduled:
+            status = {} if running else {"status": "completed"}
             data = self._get(f"actions/workflows/{workflow}/runs", event="schedule", branch="main",
-                             status="completed", per_page=30) or {}
-            self._scheduled[workflow] = data.get("workflow_runs") or []
-        return self._scheduled[workflow]
+                             per_page=30, **status) or {}
+            self._scheduled[key] = data.get("workflow_runs") or []
+        return self._scheduled[key]
 
     def search_prs(self, query: str) -> list[dict]:
         resp = gh_get("https://api.github.com/search/issues", headers=gh_headers(self.token),

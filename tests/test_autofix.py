@@ -133,6 +133,16 @@ class JobNameAndRecipeTest(unittest.TestCase):
         self.assertEqual(af_ci.job_family(SMALL), af_ci.job_family(SMALL.replace(", 3)", ", 5)")))
         self.assertNotEqual(af_ci.job_family(SMALL), af_ci.job_family(SMALL.replace("rocm10", "rocm720")))
 
+    def test_one_job_on_two_runner_pools(self):
+        gpu1 = "stage-b-test-1-gpu-small-amd-mi35x (rocm10, linux-mi35x-gpu-1)"
+        self.assertTrue(af_ci.same_job(gpu1, gpu1.replace("linux-mi35x-gpu-1", "linux-sglang-mi35x-spur")))
+        self.assertFalse(af_ci.same_job(gpu1, gpu1.replace("rocm10", "rocm720")))
+        self.assertFalse(af_ci.same_job(SMALL, SMALL.replace(", 3)", ", 5)")))
+        # Another GPU, or another part of a split nightly job, is another job.
+        self.assertFalse(af_ci.same_job(SMALL, SMALL.replace("linux-mi300-", "linux-mi325-")))
+        part1 = "nightly-test-1-gpu-unit (rocm720, linux-mi300-1gpu-sglang) part 1"
+        self.assertFalse(af_ci.same_job(part1, part1.replace("part 1", "part 2")))
+
     def test_pr_test_stage(self):
         r, _ = autofix.recipe_for("pr-test-amd.yml", SMALL, self.yaml)
         self.assertEqual(af_ci.dispatch_inputs([r]), {
@@ -182,6 +192,17 @@ class InfraTest(unittest.TestCase):
             ("401 Client Error: Unauthorized for url: https://huggingface.co/api/models/x", "Hugging Face download"),
             ("requests.exceptions.ReadTimeout: HTTPSConnectionPool(host='huggingface.co', port=443)", "network"),
             ("docker: Error response from daemon: manifest unknown", "image pull or build"),
+            # R422 and R425 (Nov 10): the analysis's error cell, as written.
+            ("`Exception: Server process exited with code -9`. The server-side cause was `RuntimeError: The memory "
+             "capacity is unbalanced. Some GPUs may be occupied by other processes. pre_model_load_memory=5.27`",
+             "GPU memory taken before the job"),
+            # R207 (Nov 10): ffprobe in the rocm724 image loads torch's libtinfo.
+            ("ffprobe: symbol lookup error: /lib/x86_64-linux-gnu/libncursesw.so.6: undefined symbol: _nc_safe_fopen",
+             "image library conflict"),
+            ("ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version `GLIBCXX_3.4.32' not found",
+             "image library conflict"),
+            # The same as an analysis retypes it.
+            ("ImportError: libstdc++.so.6: version 'GLIBCXX_3.4.32' not found", "image library conflict"),
         ):
             self.assertEqual(af_ci.classify_infra([err]), kind, err)
 
@@ -191,7 +212,10 @@ class InfraTest(unittest.TestCase):
                     "AssertionError: 0.61 not greater than 0.65",
                     # The test's own server died: a bug, not the network.
                     "requests.exceptions.ConnectionError: [Errno 111] Connection refused",
-                    "requests.exceptions.ReadTimeout: HTTPConnectionPool(host='127.0.0.1', port=30000)"):
+                    "requests.exceptions.ReadTimeout: HTTPConnectionPool(host='127.0.0.1', port=30000)",
+                    # sglang's own symbols missing from a kernel build is code, not the image.
+                    "ImportError: sgl_kernel/common_ops.so: undefined symbol: _ZN3c104cuda9SetDeviceEi",
+                    "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 2.00 GiB"):
             self.assertIsNone(af_ci.classify_infra([err]), err)
 
     def test_performance(self):
@@ -257,6 +281,17 @@ class HistoryTest(unittest.TestCase):
         self.assertFalse(af_ci.fails_for_sure(["failed", "passed", "failed"]))
         self.assertFalse(af_ci.fails_for_sure(["failed"]))
         self.assertFalse(af_ci.fails_for_sure(["passed", "failed", "failed"]))
+
+    def test_run_history_merges_jobs_by_run(self):
+        def run(i, hour):
+            return {"run_id": i, "at": f"2026-11-11T{hour:02d}:00:00Z"}
+        rocm10 = [("failed", run(2, 13)), ("passed", run(1, 1))]
+        rocm720 = [("failed", run(3, 19)), ("failed", run(2, 13))]
+        self.assertEqual([(s, r["run_id"]) for s, r in af_ci.run_history([rocm10, rocm720])],
+                         [("failed", 3), ("failed", 2), ("passed", 1)])
+        # Run 2's jobs disagree: it is not a failure.
+        mixed = [("passed", run(2, 13))]
+        self.assertEqual([s for s, _ in af_ci.run_history([rocm720, mixed])], ["failed", "passed"])
 
     def test_failure_window(self):
         runs = [("failed", {"date": "11-09"}), ("failed", {"date": "11-08"}), ("passed", {"date": "11-07"})]
@@ -446,7 +481,7 @@ class PrTextTest(unittest.TestCase):
         self.assertTrue(af_pr.check_pr_text(fix_report(modifications="word " * 300)))
         self.assertTrue(af_pr.check_pr_text(fix_report(modifications="Fixes R386, cc @someone.")))
 
-    def body(self, kind: str = "root-cause") -> str:
+    def body(self, kind: str = "root-cause", **plan_extra) -> str:
         fix = fix_report(kind, title="Skip the fp8 prefill test when AITER lacks the kernel",
                          workaround="AITER #900 adds the kernel; remove after the image has it.") \
             if kind == "workaround" else fix_report()
@@ -454,7 +489,7 @@ class PrTextTest(unittest.TestCase):
              "first_fail": {"date": "2026-11-06", "run_url": "https://github.com/sgl-project/sglang/actions/runs/1"},
              "jobs": [{"job_id": 7, "job_name": SMALL, "run_url": "https://github.com/sgl-project/sglang/actions/runs/1",
                        "tests": [[TEST_FILE, TEST_FUNC]]}],
-             "recipe": {"workflow": "pr-test-amd.yml", "families": [af_ci.job_family(SMALL)]}}
+             "recipe": {"workflow": "pr-test-amd.yml", "families": [af_ci.job_family(SMALL)]}, **plan_extra}
         v = {"run_id": 9, "run_url": "https://github.com/sgl-project/sglang/actions/runs/9",
              "results": [{"file": TEST_FILE, "func": TEST_FUNC, "status": "passed",
                           "job_url": "https://github.com/sgl-project/sglang/actions/runs/9/job/10",
@@ -476,6 +511,11 @@ class PrTextTest(unittest.TestCase):
         self.assertIn("`stage-b-test-1-gpu-small-amd (rocm10, 3)`", body)
         self.assertNotIn("R386", body.split("<!-- amd-bot-autofix")[0])
 
+    def test_body_links_a_stalled_fix_pr(self):
+        motivation = self.body(stalled_fix_prs=[48701]).split("## Modifications")[0]
+        self.assertIn("#48701 also changes this test, but was opened before it broke and has not merged in over 24 hours.", motivation)
+        self.assertNotIn("open for over", self.body())
+
     def test_workaround_body_has_its_section(self):
         body = self.body("workaround")
         self.assertIn("### Workaround", body.split("## Test plan")[0])
@@ -484,16 +524,18 @@ class PrTextTest(unittest.TestCase):
 class FakeGitHub:
     """The parts of autofix.GitHub that build_plan and verify_run read."""
 
-    def __init__(self, history: list[str], fix_prs=()):
+    def __init__(self, history: list[str], fix_prs=(), pulls=None, fix_pr_age=timedelta(hours=2)):
         self.history = history  # newest first: "failed" / "passed"
-        self.fix_prs = list(fix_prs)
+        self.fix_prs = list(fix_prs)  # open PRs the search finds, opened *fix_pr_age* before NOW
+        self.fix_pr_age = fix_pr_age
+        self.pulls = pulls or {}
         self.runs_by_id = {}
 
     def run(self, run_id, fresh=False):
         return {"id": run_id, "event": "schedule", "head_branch": "main", "head_sha": f"sha{run_id}",
                 "created_at": "2026-11-09T01:00:00Z", "html_url": f"https://github.com/x/runs/{run_id}"}
 
-    def scheduled_runs(self, workflow):
+    def scheduled_runs(self, workflow, running=False):
         return [{"id": 100 + i, "html_url": f"https://github.com/x/runs/{100 + i}", "head_sha": f"s{i}",
                  "created_at": f"2026-11-{9 - i:02d}T01:00:00Z"} for i in range(len(self.history))]
 
@@ -509,13 +551,56 @@ class FakeGitHub:
         return FAILED_LOG
 
     def search_prs(self, query):
-        return [{"number": n, "state": "open", "pull_request": {}} for n in self.fix_prs]
+        opened = (NOW - self.fix_pr_age).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return [{"number": n, "state": "open", "created_at": opened, "pull_request": {}, "body": ""}
+                for n in self.fix_prs]
+
+    def pr_files(self, number):
+        # Every PR the search finds changes the test file, unless it is listed in `prose_only`.
+        return [] if number in getattr(self, "prose_only", ()) else [{"filename": TEST_FILE}]
+
+    def pull(self, number):
+        return self.pulls.get(number)
 
     def open_prs(self, since):
         return []
 
     def commits_touching(self, path, since):
         return []
+
+
+def open_pr(number: int, opened: datetime) -> dict:
+    return {"number": number, "state": "open", "merged_at": None, "created_at": opened.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+class TimelineGitHub(FakeGitHub):
+    """Scheduled runs that each ran some jobs, newest first: ``[(created_at, {job name: passed})]``,
+    or ``(created_at, jobs, "running")`` for a run not finished yet (a job that has not ended: ``None``)."""
+
+    def __init__(self, runs, **kw):
+        super().__init__([], **kw)
+        self.timeline = runs
+
+    def scheduled_runs(self, workflow, running=False):
+        return [{"id": 200 + i, "html_url": f"https://github.com/x/runs/{200 + i}", "head_sha": f"s{i}",
+                 "created_at": r[0]} for i, r in enumerate(self.timeline) if running or len(r) < 3]
+
+    def jobs(self, run_id, fresh=False):
+        i = run_id - 200
+        if not 0 <= i < len(self.timeline):
+            return super().jobs(run_id)
+        return [{"id": 2000 + 10 * i + k, "name": name,
+                 "conclusion": None if ok is None else "success" if ok else "failure",
+                 "html_url": f"https://github.com/x/job/{2000 + 10 * i + k}", "labels": []}
+                for k, (name, ok) in enumerate(self.timeline[i][1].items())]
+
+
+def two_rocm_problem() -> af_select.Problem:
+    """One failing test in a rocm10 job and a rocm720 job of different scheduled runs."""
+    p = problem()
+    rocm720 = {**p.jobs[0], "job_id": 8, "job_name": SMALL.replace("rocm10", "rocm720"),
+               "run_url": "https://github.com/sgl-project/sglang/actions/runs/43"}
+    return af_select.Problem(p.id, p.name, [p.jobs[0], rocm720], tests=p.tests)
 
 
 def problem(**kw) -> af_select.Problem:
@@ -546,8 +631,114 @@ class SelectionTest(unittest.TestCase):
         self.assertIn("not failing for sure", why)
 
     def test_fix_pr_in_the_report_or_upstream(self):
-        self.assertIn("fix PR", self.build(problem(fix_pr=48978), FakeGitHub(["failed", "failed"]))[1])
+        fresh = {48978: open_pr(48978, NOW - timedelta(hours=3))}
+        self.assertIn("fix PR (#48978)", self.build(problem(fix_pr=48978), FakeGitHub(["failed", "failed"], pulls=fresh))[1])
+        merged = {48978: {**open_pr(48978, NOW - timedelta(days=9)), "state": "closed", "merged_at": "2026-11-09T01:00:00Z"}}
+        self.assertIn("fix PR (#48978)", self.build(problem(fix_pr=48978), FakeGitHub(["failed", "failed"], pulls=merged))[1])
         self.assertIn("fix PR #48999", self.build(problem(), FakeGitHub(["failed", "failed"], fix_prs=[48999]))[1])
+
+    def test_a_stalled_fix_pr_does_not_hold_autofix_back(self):
+        # R427 (Nov 11): the report's fix was a line inside #48701, open since Nov 5 and waiting on AITER.
+        stale = {48701: open_pr(48701, NOW - timedelta(days=6))}
+        plan, why = self.build(problem(fix_pr=48701), FakeGitHub(["failed", "failed", "passed"], pulls=stale))
+        self.assertEqual(why, "")
+        self.assertEqual(plan["stalled_fix_prs"], [48701])
+        # Same for one the search finds; a closed, unmerged one is neither a fix nor worth a link.
+        old = dict(fix_prs=[48999], fix_pr_age=timedelta(days=6))
+        plan, why = self.build(problem(), FakeGitHub(["failed", "failed", "passed"], **old))
+        self.assertEqual((why, plan["stalled_fix_prs"]), ("", [48999]))
+        closed = {48978: {**open_pr(48978, NOW - timedelta(hours=1)), "state": "closed"}}
+        plan, why = self.build(problem(fix_pr=48978), FakeGitHub(["failed", "failed"], pulls=closed))
+        self.assertEqual((why, plan["stalled_fix_prs"]), ("", []))
+        # A search hit that only names the test in prose (a pasted log) is not linked.
+        gh = FakeGitHub(["failed", "failed", "passed"], **old)
+        gh.prose_only = {48999}
+        self.assertEqual(self.build(problem(), gh)[0]["stalled_fix_prs"], [])
+
+    def test_a_fix_made_for_the_failure_waits_for_its_review(self):
+        # R332: #46945 was opened for the failure (after the last pass) and has waited for review for weeks.
+        dedicated = {46945: open_pr(46945, NOW - timedelta(days=1, hours=12))}  # the last pass was 2 days ago
+        why = self.build(problem(fix_pr=46945), FakeGitHub(["failed", "failed", "passed"], pulls=dedicated))[1]
+        self.assertEqual(why, "the report shows a fix PR (#46945), opened after the test last passed")
+        # With no passing run in sight, when it broke is unknown: any open fix PR waits.
+        old = {48701: open_pr(48701, NOW - timedelta(days=6))}
+        why = self.build(problem(fix_pr=48701), FakeGitHub(["failed", "failed"], pulls=old))[1]
+        self.assertEqual(why, "the report shows a fix PR (#48701), and no passing run is known")
+
+    def test_the_bots_own_open_pr_is_never_stalled(self):
+        # Opened before the last pass, so only being the bot's own keeps it a fix.
+        mine = {49001: {**open_pr(49001, NOW - timedelta(days=6)), "head": {"ref": "bingxche/autofix-r386-x"}}}
+        self.assertIn("fix PR (#49001)",
+                      self.build(problem(fix_pr=49001), FakeGitHub(["failed", "failed", "passed"], pulls=mine))[1])
+
+        class Mine(FakeGitHub):
+            def search_prs(self, query):
+                return [{**item, "body": "x\n<!-- amd-bot-autofix: R386 -->"} for item in super().search_prs(query)]
+        self.assertIn("fix PR #49002", self.build(problem(), Mine(["failed", "failed", "passed"], fix_prs=[49002],
+                                                                    fix_pr_age=timedelta(days=6)))[1])
+
+    def test_a_report_fix_pr_that_cannot_be_read_holds_back(self):
+        self.assertIn("fix PR (#48978)", self.build(problem(fix_pr=48978), FakeGitHub(["failed", "failed"]))[1])
+
+    def test_a_fix_in_another_repo_is_a_fix_but_not_an_sglang_number(self):
+        summary = "\n".join([
+            "### <!-- R1 --> AITER kernel missing — pr-test-amd · ❌ no fix",
+            "- **In-flight fix**: ✅ [#2071](https://github.com/ROCm/aiter/pull/2071) (open since Nov 8)",
+            "### <!-- R2 --> Test drift — pr-test-amd · ❌ no fix",
+            "- **In-flight fix**: ✅ [#50036](https://github.com/sgl-project/sglang/pull/50036) (draft)",
+        ])
+        sections = af_select.problem_sections(summary)
+        self.assertEqual((sections["R1"]["fix"], sections["R1"]["fix_pr"]), (True, None))
+        self.assertEqual((sections["R2"]["fix"], sections["R2"]["fix_pr"]), (False, 50036))
+
+    def test_the_window_starts_at_the_first_failure_of_any_job(self):
+        # rocm10 broke at 13:10 the day before, a run where rocm720 still passed.
+        r10, r720 = SMALL, SMALL.replace("rocm10", "rocm720")
+        gh = TimelineGitHub([("2026-11-11T19:05:00Z", {r10: False, r720: False}), ("2026-11-11T13:10:00Z", {r10: False}),
+                             ("2026-11-10T19:05:00Z", {r10: False, r720: True}), ("2026-11-10T13:10:00Z", {r10: True})])
+        plan, why = self.build(two_rocm_problem(), gh)
+        self.assertEqual(why, "")
+        self.assertEqual((plan["first_fail"]["at"], plan["last_pass"]["at"], plan["failing_runs"]),
+                         ("2026-11-10T19:05:00Z", "2026-11-10T13:10:00Z", 3))
+
+    def test_one_failure_in_each_rocm_version_is_sure(self):
+        # R427: rocm10 failed at 13:10 (on another runner pool than before), rocm720 at 19:05; each ran once since.
+        r10, r720 = SMALL, SMALL.replace("rocm10", "rocm720")
+        r10_other_pool = r10.replace("linux-mi300-1gpu-sglang", "linux-mi300-1gpu-other")
+        gh = TimelineGitHub([("2026-11-11T19:05:00Z", {r720: False}), ("2026-11-11T13:10:00Z", {r10_other_pool: False}),
+                             ("2026-11-11T01:10:00Z", {r10: True}), ("2026-11-10T19:05:00Z", {r720: True})])
+        plan, why = self.build(two_rocm_problem(), gh)
+        self.assertEqual(why, "")
+        self.assertEqual((plan["first_fail"]["at"], plan["last_pass"]["at"], plan["failing_runs"]),
+                         ("2026-11-11T13:10:00Z", "2026-11-11T01:10:00Z", 2))
+
+    def test_a_later_pass_in_the_other_rocm_version_is_not_sure(self):
+        r10, r720 = SMALL, SMALL.replace("rocm10", "rocm720")
+        gh = TimelineGitHub([("2026-11-12T01:10:00Z", {r10: True}), ("2026-11-11T19:05:00Z", {r720: False}),
+                             ("2026-11-11T13:10:00Z", {r10: False}), ("2026-11-10T19:05:00Z", {r720: False})])
+        plan, why = self.build(two_rocm_problem(), gh)
+        self.assertIsNone(plan)
+        self.assertIn("not failing for sure: its latest scheduled runs were passed", why)
+
+    def test_runs_still_running_count_for_their_finished_jobs(self):
+        # R427's 19:05 run was still queued at 08:00 the next day; its job had failed at 19:57.
+        gh = af_github.GitHub("t")
+        with mock.patch.object(gh, "_get", return_value={"workflow_runs": []}) as get:
+            gh.scheduled_runs("pr-test-amd.yml", running=True)
+            gh.scheduled_runs("pr-test-amd.yml")
+        self.assertNotIn("status", get.call_args_list[0].kwargs)
+        self.assertEqual(get.call_args_list[1].kwargs["status"], "completed")
+        r10, r720 = SMALL, SMALL.replace("rocm10", "rocm720")
+        # The newest run is still going: its rocm720 job failed, its rocm10 job has not ended.
+        gh = TimelineGitHub([("2026-11-11T19:05:00Z", {r720: False, r10: None}, "running"),
+                             ("2026-11-11T13:10:00Z", {r10: False}), ("2026-11-11T01:10:00Z", {r10: True, r720: True})])
+        self.assertEqual(self.build(two_rocm_problem(), gh)[1], "")
+
+    def test_two_jobs_of_one_run_are_one_failure(self):
+        r10, r720 = SMALL, SMALL.replace("rocm10", "rocm720")
+        gh = TimelineGitHub([("2026-11-11T19:05:00Z", {r10: False, r720: False}),
+                             ("2026-11-11T13:10:00Z", {r10: True, r720: True})])
+        self.assertIsNone(self.build(two_rocm_problem(), gh)[0])
 
     def test_not_scheduled_infra_and_no_recipe(self):
         class Manual(FakeGitHub):
@@ -799,7 +990,7 @@ class TickTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.multiple(autofix, read_state=mock.Mock(return_value=(state, {"id": 1})),
                                     poll_dispatched=mock.Mock(return_value=("verified", verified)),
-                                    find_fix_pr=mock.Mock(return_value=None), **common):
+                                    find_fix_pr=mock.Mock(return_value=(None, [])), **common):
             autofix.publish_phase("t", "o/r", "live", 3, gh, Path(tmp), NOW + timedelta(hours=1))
         state = af_state.load_state(updated[-1])
         self.assertEqual(state["problems"]["R386"]["status"], "opened")
@@ -807,6 +998,58 @@ class TickTest(unittest.TestCase):
         self.assertEqual(branch, "bingxche/autofix-r386-x")
         self.assertIn("## Test plan", body)
         self.assertEqual(start.call_count, 1)
+
+    def test_a_stalled_fix_pr_that_merged_meanwhile_comes_first(self):
+        gh = mock.Mock()
+        gh.pr_for_branch.return_value = None
+        gh.pull.return_value = {"number": 48701, "state": "closed", "merged_at": "2026-11-09T15:00:00Z"}
+        state = autofix.new_day_state({}, "2026-11-09", NOW)
+        entry = {"name": "x", "attempts": 1, "status": "dispatched", "updated": NOW.isoformat(),
+                 "pushed": ["bingxche/autofix-r1-x"], "plan": {"tests": [], "stalled_fix_prs": [48701]},
+                 "attempt": {"branch": "bingxche/autofix-r1-x", "head_sha": "a", "dispatched_at": NOW.isoformat()}}
+        state["problems"]["R1"] = entry
+        verified = {"done": True, "ok": True, "reasons": [], "results": []}
+        opened = mock.Mock()
+        with mock.patch.multiple(autofix, poll_dispatched=mock.Mock(return_value=("verified", verified)),
+                                 find_fix_pr=mock.Mock(return_value=(None, [])), open_pr=opened):
+            autofix.check_dispatched("R1", entry, gh, state, NOW, TEMPLATE)
+        self.assertEqual((entry["status"], entry["reason"]), ("gave-up", "#48701 came first"))
+        opened.assert_not_called()
+        gh.delete_branch.assert_called_once_with("bingxche/autofix-r1-x")
+
+    def test_a_fix_pr_opened_during_the_attempt_comes_first_however_old(self):
+        # Planned 3 days ago; a person's fix PR was opened 2 days ago and is still open.
+        planned = NOW - timedelta(days=3)
+        gh = FakeGitHub([], fix_prs=[49100], fix_pr_age=timedelta(days=2))
+        gh.pr_for_branch = mock.Mock(return_value=None)
+        gh.delete_branch = mock.Mock()
+        state = autofix.new_day_state({}, "2026-11-09", NOW)
+        entry = {"name": "x", "attempts": 1, "status": "dispatched", "updated": NOW.isoformat(),
+                 "pushed": ["bingxche/autofix-r1-x"],
+                 "plan": {"tests": [[TEST_FILE, TEST_FUNC]], "last_pass": {"at": "2026-11-05T01:00:00Z"}},
+                 "attempt": {"branch": "bingxche/autofix-r1-x", "head_sha": "a", "dispatched_at": planned.isoformat()}}
+        state["problems"]["R1"] = entry
+        verified = {"done": True, "ok": True, "reasons": [], "results": []}
+        with mock.patch.multiple(autofix, poll_dispatched=mock.Mock(return_value=("verified", verified)),
+                                 open_pr=mock.Mock()):
+            autofix.check_dispatched("R1", entry, gh, state, NOW, TEMPLATE)
+        self.assertEqual((entry["status"], entry["reason"]), ("gave-up", "#49100 came first"))
+
+    def test_a_stalled_pr_closed_meanwhile_is_not_linked(self):
+        gh = mock.Mock()
+        gh.pr_for_branch.return_value = None
+        gh.pull.side_effect = lambda n: {"number": n, "state": "closed" if n == 48701 else "open", "merged_at": None}
+        state = autofix.new_day_state({}, "2026-11-09", NOW)
+        plan = {"tests": [], "stalled_fix_prs": [48701, 48702]}
+        entry = {"name": "x", "attempts": 1, "status": "dispatched", "updated": NOW.isoformat(), "plan": plan,
+                 "attempt": {"branch": "bingxche/autofix-r1-x", "head_sha": "a", "dispatched_at": NOW.isoformat()}}
+        state["problems"]["R1"] = entry
+        verified = {"done": True, "ok": True, "reasons": [], "results": []}
+        opened = mock.Mock(return_value={"html_url": "https://github.com/sgl-project/sglang/pull/1"})
+        with mock.patch.multiple(autofix, poll_dispatched=mock.Mock(return_value=("verified", verified)),
+                                 find_fix_pr=mock.Mock(return_value=(None, [])), open_pr=opened):
+            autofix.check_dispatched("R1", entry, gh, state, NOW, TEMPLATE)
+        self.assertEqual(opened.call_args.args[0]["stalled_fix_prs"], [48702])
 
     def test_failed_gpu_run_retries_then_gives_up(self):
         gh = mock.Mock()
@@ -870,7 +1113,8 @@ class ReviewFixesTest(unittest.TestCase):
         gh = FakeGitHub(["failed", "failed"])
         culprit = {"commit": {"message": "[Fix] dsa: add indexer RoPE (#48547)\n\nbody"}}
         gh.commits_touching = mock.Mock(return_value=[culprit])
-        self.assertIsNone(af_select.find_fix_pr(gh, [(TEST_FILE, TEST_FUNC)], "2026-11-06T13:10:00Z", exclude={48547}))
+        self.assertEqual(af_select.find_fix_pr(gh, [(TEST_FILE, TEST_FUNC)], "2026-11-06T13:10:00Z", NOW, None,
+                                               exclude={48547}), (None, []))
         # Commits are looked up from the failing run's start time, not from midnight.
         self.assertEqual(gh.commits_touching.call_args.args[1], "2026-11-06T13:10:00Z")
 

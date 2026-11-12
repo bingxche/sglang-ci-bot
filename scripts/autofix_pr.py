@@ -10,7 +10,7 @@ import requests
 
 from autofix_ci import job_label
 from autofix_ci import job_family
-from autofix_config import MAX_BODY_WORDS
+from autofix_config import FIX_PR_STALE_HOURS, MAX_BODY_WORDS
 from autofix_github import GitHub
 from autofix_state import hidden_json
 from utils import SGLANG_REPO_PATH
@@ -217,6 +217,13 @@ def render_pr_body(template: str, plan: dict, fix: dict, verification: dict, che
     since = (f"since [{ff['date']}]({ff['run_url']}), {runs} scheduled run{'s' if runs != 1 else ''} in a row"
              if ff.get("date") else "in the latest scheduled runs")
     motivation = f"{pr['motivation'].strip()}\n\nFailing on `main` {since}: {job_links}."
+    stalled = plan.get("stalled_fix_prs") or []
+    if stalled:
+        links = ", ".join(f"#{n}" for n in stalled)
+        many = len(stalled) > 1
+        motivation += (f"\n\n{links} also {'change' if many else 'changes'} this test, but {'were' if many else 'was'} "
+                       f"opened before it broke and {'have' if many else 'has'} not merged in over "
+                       f"{FIX_PR_STALE_HOURS} hours.")
     modifications = pr["modifications"].strip()
     if fix["fix_kind"] == "workaround":
         modifications += f"\n\n### Workaround\n\n{pr['workaround'].strip()}"

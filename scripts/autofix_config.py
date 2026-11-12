@@ -39,6 +39,11 @@ HISTORY_RUNS = 6
 HISTORY_SCAN = 15
 # Open PRs whose files are scanned for the test file, newest first.
 MAX_OPEN_PRS_SCANNED = 300
+# A fix PR that was already open while the test still passed, and has stayed open this long,
+# no longer holds autofix back: the fix rides in a change made for something else, as in #48701
+# for R427 on Nov 11. Autofix tries anyway and links it. A PR opened after the break always
+# holds autofix back (``holds_back()``).
+FIX_PR_STALE_HOURS = 24
 # Words the PR's prose may have (links and code blocks not counted): the spec's
 # "about 250", with 10% slack so a precise, hedged text is not rejected at 262.
 MAX_BODY_WORDS = 275

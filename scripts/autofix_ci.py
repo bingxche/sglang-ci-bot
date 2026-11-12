@@ -56,6 +56,14 @@ def job_family(name: str) -> str:
     return f"{j.base}|{j.rocm}"
 
 
+def same_job(a: str, b: str) -> bool:
+    """Two names of one job that may have run on different pools of one GPU: ``x (rocm10, linux-mi35x-gpu-1)``
+    is ``x (rocm10, linux-sglang-mi35x-spur)``. GPUs, partitions, parts and ROCm versions still differ."""
+    def key(name: str) -> str:
+        return re.sub(r"linux-[\w.-]+", lambda m: (re.search(r"mi\d+x?", m.group()) or m).group(), name or "")
+    return key(a) == key(b)
+
+
 @dataclass(frozen=True)
 class Recipe:
     workflow: str        # workflow file to dispatch
@@ -155,6 +163,14 @@ INFRA_PATTERNS = (
     ("image pull or build",
      r"failed to (?:pull|resolve) image|manifest unknown|toomanyrequests|pull access denied"
      r"|Error response from daemon|ERROR: failed to solve"),
+    # sglang's startup check: other processes already hold most of a GPU's memory (R422, R425).
+    # A server an earlier test leaked would also trip it; that is rare next to busy runners.
+    ("GPU memory taken before the job", r"memory capacity is unbalanced"),
+    # A system binary loads a library the image shadows, e.g. ffmpeg picking up torch's
+    # libtinfo (R207); the fix is in docker/, which autofix may not change. The analyses
+    # retype quotes, so the GLIBC one allows any.
+    ("image library conflict",
+     r"undefined symbol: _nc_\w+|version\W{1,3}GLIBC(?:XX)?_[\d.]+\W{1,3}not found"),
 )
 _INFRA_RES = tuple((kind, re.compile(p, re.IGNORECASE)) for kind, p in INFRA_PATTERNS)
 PERF_RE = re.compile(
@@ -385,6 +401,22 @@ def segment_text(raw_log: str, test_file: str, max_lines: int = 300) -> str:
 def fails_for_sure(history: list[str]) -> bool:
     """*history*: the test's status in the latest completed scheduled runs, newest first."""
     return len(history) >= 2 and history[0] == "failed" and history[1] == "failed"
+
+
+def run_history(histories: list[list[tuple[str, dict]]]) -> list[tuple[str, dict]]:
+    """One history out of several jobs' (one per family, e.g. rocm10 and rocm720), newest run first.
+
+    Each family runs only in some scheduled runs (PR Test runs rocm720 once a day), so two
+    failed runs of any of the problem's jobs make it sure, as long as no later run of another
+    passed. A run where its jobs disagree counts as its first status that is not ``failed``.
+    """
+    runs: dict = {}
+    for history in histories:
+        for status, run in history:
+            prev = runs.get(run["run_id"])
+            if prev is None or (prev[0] == "failed" and status != "failed"):
+                runs[run["run_id"]] = (status, run)
+    return sorted(runs.values(), key=lambda x: x[1]["at"], reverse=True)
 
 
 def failure_window(history: list[tuple[str, dict]]) -> tuple[dict | None, dict | None, int]:
