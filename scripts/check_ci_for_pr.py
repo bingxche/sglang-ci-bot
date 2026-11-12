@@ -623,7 +623,8 @@ def _check_ci_with_agent(
     except (json.JSONDecodeError, TypeError):
         groups = set()
     try:
-        selection = suggested_tests.check(suggested_tests.parse_block(agent_report), repo_path, groups, amd_rerun)
+        selection = suggested_tests.check(suggested_tests.parse_block(agent_report), repo_path, groups, amd_rerun,
+                                          ref=pack["request"]["head_sha"])
     except Exception as exc:  # the attribution above must still be posted
         print(f"  WARNING: could not check the suggested tests ({exc})")
         selection = {"amd_rerun": amd_rerun, "valid": False, "platforms": {}, "error": str(exc)}

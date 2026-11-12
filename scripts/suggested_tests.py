@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import requests
@@ -145,11 +146,21 @@ def _items(value) -> list:
     return value if isinstance(value, list) else []
 
 
-def check(block: dict | None, repo_path: Path, groups: set[str], amd_rerun: bool) -> dict:
+def _at(repo_path: Path, ref: str, path: str, kind: str = "blob") -> str | None:
+    """*path* at *ref* in the clone: the file text (``blob``), or "" for a directory (``tree``); None if absent."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo_path), *args], capture_output=True, text=True, errors="replace")
+    if git("cat-file", "-t", f"{ref}:{path}").stdout.strip() != kind:
+        return None
+    return git("show", f"{ref}:{path}").stdout if kind == "blob" else ""
+
+
+def check(block: dict | None, repo_path: Path, groups: set[str], amd_rerun: bool, ref: str = "HEAD") -> dict:
     """Keep the suggested files that exist, are registered for the platform and are not disabled.
 
-    Files are read from the checkout CI tested, so a PR's new tests count and a
-    test it deletes does not. At most ``MAX_FILES`` per platform are kept.
+    Files are read at *ref*, the PR head: ``/rerun-test`` checks out the PR head
+    (not the merge commit CI tested), so a PR's new tests count, and a test it
+    deletes, or that only main has, does not. At most ``MAX_FILES`` per platform are kept.
     Returns, per platform, what is kept, what was dropped and why, and the commands.
     """
     result = {"amd_rerun": amd_rerun, "valid": block is not None, "platforms": {}}
@@ -171,11 +182,11 @@ def check(block: dict | None, repo_path: Path, groups: set[str], amd_rerun: bool
             if len(kept) >= MAX_FILES:
                 dropped.append({"file": path, "reason": f"over the limit of {MAX_FILES} files"})
                 continue
-            local = repo_path / path
-            if not local.is_file():
-                dropped.append({"file": path, "reason": "not in the checkout CI tested"})
+            text = _at(repo_path, ref, path)
+            if text is None:
+                dropped.append({"file": path, "reason": "not in the PR head"})
                 continue
-            regs = [r for r in registrations(local.read_text(errors="replace")) if r["backend"] == backend]
+            regs = [r for r in registrations(text) if r["backend"] == backend]
             live = [r for r in regs if not r["disabled"]]
             if not live:
                 dropped.append({"file": path, "reason": f"no enabled register_{backend}_ci"
@@ -193,7 +204,7 @@ def check(block: dict | None, repo_path: Path, groups: set[str], amd_rerun: bool
             g = g if isinstance(g, dict) else {"group": g}
             name = str(g.get("group") or "")
             # /rerun-group takes a rerun_test_groups.json key or a test/registered/<dir> name.
-            known = name in groups or (_GROUP_RE.match(name) and (repo_path / "test" / "registered" / name).is_dir())
+            known = name in groups or (_GROUP_RE.match(name) and _at(repo_path, ref, f"test/registered/{name}", "tree") is not None)
             if not known:
                 dropped.append({"group": name[:200], "reason": "not a group /rerun-group knows"})
             elif key == "amd" and not amd_rerun:

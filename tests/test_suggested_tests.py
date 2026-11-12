@@ -1,6 +1,7 @@
 """Suggested tests: skills from main, the file gate, the limits, the commands, mention cleanup."""
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -21,12 +22,23 @@ AMD_EXTRA = 'register_amd_ci(est_time=300, suite="extra-a-test-1-gpu-small-amd")
 AMD_NIGHTLY = 'register_amd_ci(est_time=300, suite="nightly-amd-1-gpu", nightly=True)\n'
 
 
-def checkout(files: dict[str, str]) -> tempfile.TemporaryDirectory:
+def checkout(files: dict[str, str], not_in_head: dict[str, str] | None = None) -> tempfile.TemporaryDirectory:
+    """A git clone whose HEAD (the PR head) holds *files*; *not_in_head* is only in the working tree
+    (like the merge commit CI tested)."""
     tmp = tempfile.TemporaryDirectory()
-    for path, text in files.items():
-        p = Path(tmp.name) / path
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("from sglang.test.ci.ci_register import register_cuda_ci\n" + text)
+
+    def write(group):
+        for path, text in group.items():
+            p = Path(tmp.name) / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("from sglang.test.ci.ci_register import register_cuda_ci\n" + text)
+
+    git = ["git", "-C", tmp.name, "-c", "user.name=t", "-c", "user.email=t@t"]
+    write(files)
+    subprocess.run([*git[:3], "init", "-q"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "head", "--allow-empty"], check=True)
+    write(not_in_head or {})
     return tmp
 
 
@@ -115,12 +127,15 @@ class GateTest(unittest.TestCase):
             "test/registered/a/test_made_up.py", "test/registered/a/test_disabled.py", "test/registered/a/test_amd.py"])
         self.assertIn("disabled", nv["dropped"][1]["reason"])
 
-    def test_a_file_missing_from_the_tested_checkout_is_dropped(self):
-        # /rerun-test runs the PR's code: a test the PR deleted or renamed cannot run.
-        block = {"nv": {"files": [{"file": "registered/b/test_deleted_by_pr.py"}]}}
-        nv = self.run_check(block)["platforms"]["nv"]
+    def test_a_file_missing_from_the_pr_head_is_dropped(self):
+        # /rerun-test checks out the PR head: a test the PR deleted, or one only in the
+        # merge commit CI tested (newer main), cannot run there.
+        block = {"nv": {"files": [{"file": "registered/b/test_deleted_by_pr.py"},
+                                  {"file": "registered/b/test_only_on_newer_main.py"}]}}
+        with checkout(self.FILES, not_in_head={"test/registered/b/test_only_on_newer_main.py": CUDA_BASE}) as tmp:
+            nv = ts.check(block, Path(tmp), set(), False)["platforms"]["nv"]
         self.assertEqual(nv["files"], [])
-        self.assertIn("not in the checkout", nv["dropped"][0]["reason"])
+        self.assertEqual([d["reason"] for d in nv["dropped"]], ["not in the PR head"] * 2)
 
     def test_malformed_agent_values_do_not_crash(self):
         for block in ({"nv": {"files": 5, "groups": 7}}, {"nv": {"files": "test_x.py"}}, {"nv": []}, {"amd": None}):
@@ -250,7 +265,7 @@ class CiStatusIntegrationTest(unittest.TestCase):
         main_files["scripts/ci/rerun_test_groups.json"] = json.dumps({"hicache-all": []})
         with checkout({"test/registered/a/test_extra.py": CUDA_EXTRA, ".ci-context/evidence.md": ""}) as tmp, \
                 mock.patch.object(check_ci_for_pr, "build_evidence_pack", return_value={
-                    "checkout": {"sha": "abc", "what": "PR head"}, "request": {"head_sha": "abc"},
+                    "checkout": {"sha": "abc", "what": "PR head"}, "request": {"head_sha": "HEAD"},
                     "failures": [], "evidence": {}, "pr": {"files": []}}), \
                 mock.patch.object(check_ci_for_pr, "collect_ci_runtime_env", return_value=""), \
                 mock.patch.object(check_ci_for_pr, "claude_code_analyze", side_effect=fake_analyze), \
