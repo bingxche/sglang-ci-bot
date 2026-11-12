@@ -10,7 +10,7 @@ This README is the map of the repo: what each part does and why. Implementation 
 2. [Feature map](#2-feature-map)
 3. [Design rules](#3-design-rules) · [Hidden markers](#hidden-markers-where-the-state-lives) · [Changing this repo](#changing-this-repo)
 4. [How an agent runs](#4-how-an-agent-runs)
-5. [Features](#5-features): [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) · [Suspect PR comments](#52-suspect-pr-comments) · [Failure Trackers](#53-failure-trackers) · [PR commands](#54-pr-commands-the-comment-watcher) · [PR review](#55-pr-review) · [PR CI status](#56-pr-ci-status-check) · [On-demand analysis](#57-on-demand-analysis) · [Notion staging](#58-notion-staging) · [Coverage audit](#59-coverage-exclusion-audit) · [CI autofix](#510-ci-autofix)
+5. [Features](#5-features): [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) · [Suspect PR comments](#52-suspect-pr-comments) · [Failure Trackers](#53-failure-trackers) · [PR commands](#54-pr-commands-the-comment-watcher) · [PR review](#55-pr-review) · [PR CI status](#56-pr-ci-status-check) · [On-demand analysis](#57-on-demand-analysis) · [Coverage audit](#58-coverage-exclusion-audit) · [CI autofix](#59-ci-autofix)
 6. [Operations](#6-operations)
 7. [Reference](#7-reference)
 
@@ -26,13 +26,13 @@ Each feature is one lane. The bold box on the left says what it is for; the rest
 
 **Colors.** 🔵 trigger · ⬜ GitHub Actions workflow · 🟧 LLM agents · 🟩 deterministic code · 🟪 where results go.
 
-**The one pattern to notice.** Wherever a result leaves this repo, a green box stands between the orange LLM and the purple output: the LLM proposes, and code decides what gets out. That is design rules [R2](#r2) and [R4](#r4) in picture form. Lane ⑦ has two: code picks what the agents work on, and code checks the patch and the GPU re-run before anything is published. Lanes ① and ④ write straight from an agent, but only into this repo's own issues. **Lane ② is the known exception:** the PR review posts the agent's text without a code gate (see R2).
+**The one pattern to notice.** Wherever a result leaves this repo, a green box stands between the orange LLM and the purple output: the LLM proposes, and code decides what gets out. That is design rules [R2](#r2) and [R4](#r4) in picture form. Lane ⑥ has two: code picks what the agents work on, and code checks the patch and the GPU re-run before anything is published. Lanes ① and ④ write straight from an agent, but only into this repo's own issues. **Lane ② is the known exception:** the PR review posts the agent's text without a code gate (see R2).
 
 Three more things the picture does not show:
 
 - **Everything runs on the self-hosted runner containers** (`runner/`), because only they can reach the LLM gateway. The work runs as GitHub Actions jobs of this repo, plus two loops on runner-1: the hourly CI-monitor timer, and the comment watcher behind lanes ② and ③.
 - **Every agent goes through one function**, [`claude_code_analyze()`](scripts/utils.py). Agents get their instructions from files under [`agent/`](agent/), never from strings in Python ([§4](#4-how-an-agent-runs)).
-- **The daily issue is also state.** The summary and the `finalize` steps of lane ①, and lanes ⑤ and ⑦, read the analyses back from it; lane ⑦ also keeps its own state there. Runners keep nothing that matters.
+- **The daily issue is also state.** The summary and the `finalize` steps of lane ①, and lane ⑥, read the analyses back from it; lane ⑥ also keeps its own state there. Runners keep nothing that matters.
 
 ---
 
@@ -47,9 +47,8 @@ Three more things the picture does not show:
 | [PR review](#55-pr-review) | `@amd-bot review` | [`pr-review.yml`](.github/workflows/pr-review.yml) → [`review_pr.py`](scripts/review_pr.py) | PR Code Review | One comment on the sglang PR |
 | [PR CI status](#56-pr-ci-status-check) | `@amd-bot ci-status` | [`ci-status-check.yml`](.github/workflows/ci-status-check.yml) → [`check_ci_for_pr.py`](scripts/check_ci_for_pr.py), [`ci_evidence.py`](scripts/ci_evidence.py), [`ci_verdicts.py`](scripts/ci_verdicts.py) | PR CI Status Check | One comment on the sglang PR |
 | [On-demand analysis](#57-on-demand-analysis) | Actions tab, paste a run/job URL | [`analyze-ci.yml`](.github/workflows/analyze-ci.yml) → [`analyze_url.py`](scripts/analyze_url.py) | Job Failure Analysis, Cross-Job Summary | An `[Analyze]` issue in this repo |
-| [Notion staging](#58-notion-staging) | 12:00 UTC daily | [`notion-staging.yml`](.github/workflows/notion-staging.yml) → [`stage_notion.py`](scripts/stage_notion.py) | SGLang AMD CI Staging Candidates | Notion staging database |
-| [Coverage audit](#59-coverage-exclusion-audit) | Mondays 16:07 UTC | [`coverage-audit.yml`](.github/workflows/coverage-audit.yml) (code lives in ROCm/sglang-ci) | its own prompt, in ROCm/sglang-ci | A PR merged into ROCm/sglang-ci |
-| [CI autofix](#510-ci-autofix) | after each CI-monitor tick | [`ci-autofix.yml`](.github/workflows/ci-autofix.yml) → [`autofix.py`](scripts/autofix.py) and its `autofix_*.py` modules | CI Autofix, CI Autofix Review | `bingxche/autofix-*` branches and draft PRs on sgl-project/sglang, as bingxche; a log comment on the daily issue |
+| [Coverage audit](#58-coverage-exclusion-audit) | Mondays 16:07 UTC | [`coverage-audit.yml`](.github/workflows/coverage-audit.yml) (code lives in ROCm/sglang-ci) | its own prompt, in ROCm/sglang-ci | A PR merged into ROCm/sglang-ci |
+| [CI autofix](#59-ci-autofix) | after each CI-monitor tick | [`ci-autofix.yml`](.github/workflows/ci-autofix.yml) → [`autofix.py`](scripts/autofix.py) and its `autofix_*.py` modules | CI Autofix, CI Autofix Review | `bingxche/autofix-*` branches and draft PRs on sgl-project/sglang, as bingxche; a log comment on the daily issue |
 
 Supporting code:
 - [`utils.py`](scripts/utils.py): GitHub helpers, the agent harness, worktrees, log parsing.
@@ -70,7 +69,7 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 <a id="r1"></a>**R1. Agents read; code writes.**
 - Every agent works in its own git worktree, at the exact commit under study, and loads no settings from that checkout (`--setting-sources user`). Developer skills are disabled.
 - Its environment carries no posting token, and only a read-only one when `AGENT_GH_TOKEN` is set. The two CI autofix agents get no GitHub token at all.
-- Only Python code writes to GitHub or Notion.
+- Only Python code writes to GitHub.
 - One agent edits files: the CI Autofix agent changes its own worktree, with an allowlist of tools (read, edit, `pytest`, `pre-commit`, read-only git) and every other tool call denied. Code commits that change, pushes the branch, re-runs the job and opens the PR, in a separate job that runs no agent and is the only one holding `AUTOFIX_TOKEN`: code an agent runs (a test it wrote) can read its parent processes' environment, so stripping a token from the agent's own environment is not enough.
 
 *Why:* agents read text anyone can write (PR diffs, logs, a PR's own `.claude/settings.json`, whose hooks once could run on our runners). *Kept by:* [`tests/test_agent_tasks.py`](tests/test_agent_tasks.py) (CLI flags), [`tests/test_ci_verdicts.py`](tests/test_ci_verdicts.py) (agent environment), [`tests/test_autofix.py`](tests/test_autofix.py) (autofix tools and environment).
@@ -198,7 +197,6 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 | Cross-Run Pattern Analysis | [`cross-run-pattern-analysis.md`](agent/tasks/cross-run-pattern-analysis.md) | default | [`maybe_publish_cross_run_summary()`](scripts/monitor_ci.py) |
 | Daily Cross-Workflow Summary | [`daily-cross-workflow-summary.md`](agent/tasks/daily-cross-workflow-summary.md) | default | [`build_and_publish_summary()`](scripts/daily_cross_workflow_summary.py) |
 | Failure Tracker Data | [`failure-tracker-data.md`](agent/tasks/failure-tracker-data.md) | default | [`run_agent_extraction()`](scripts/failure_tracker.py) |
-| SGLang AMD CI Staging Candidates | [`staging-candidates.md`](agent/tasks/staging-candidates.md) | default | [`analyze()`](scripts/stage_notion.py) |
 | PR CI Status Check | [`pr-ci-status-check.md`](agent/tasks/pr-ci-status-check.md) | default | [`check_ci_for_pr()`](scripts/check_ci_for_pr.py) |
 | PR Code Review | [`pr-code-review.md`](agent/tasks/pr-code-review.md) | default | [`review_pr_with_agent()`](scripts/review_pr.py) |
 | CI Autofix | [`ci-autofix.md`](agent/tasks/ci-autofix.md) | `Claude-Opus-5.5[1m]`, effort max, pinned | [`run_fix_agent()`](scripts/autofix_agents.py) |
@@ -257,8 +255,8 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 - **The report date is pinned when a run starts**, so an agent that runs past midnight cannot write into the next day's issue.
 - **Analyses are kept for 4 days** (`STATE_DAYS_KEPT`), longer than the oldest run in view. A job of a long run that appears in a new day's report is therefore copied from the cache, not analysed again.
 - **GitHub reads are retried.** A 5xx or connection error from the GitHub API is retried 3 times, after 5, 15 and 45 s ([`gh_get()`](scripts/utils.py)), so a transient 502 no longer fails a whole monitor job. Writes are not retried: a write that seemed to fail may have succeeded, and a retry would post a duplicate.
-- **Miles workflows** test radixark/miles images. They appear in the report and summary, but not in Notion staging or the Failure Trackers; their failures are radixark/miles' to triage. radixark/miles' own scheduled PR test, `radixark/miles/pr-test-rocm.yml`, is another repo's workflow (next point): its agents work in the radixark/miles clone the Miles workflows use, at the run's commit.
-- **Other repos' workflows** are named `owner/repo/<file>`, e.g. `sgl-project/sgl-amd-mono/nightly-amd.yml` or `radixark/miles/pr-test-rocm.yml` ([`workflow_repo()`](scripts/utils.py)); sglang's go by their file name alone. Their runs, jobs and logs are read from that repo, and their agents work in a full clone of it at the run's commit ([`ensure_source_repo()`](scripts/utils.py)), with a `Repo:` line in the prompt that the Ground Rules turn into that repo's links. Like Miles, they appear in the report, the summary and Runner health, but not in Notion staging, the Failure Trackers or Suspect PR comments.
+- **Miles workflows** test radixark/miles images. They appear in the report and summary, but not in the Failure Trackers; their failures are radixark/miles' to triage. radixark/miles' own scheduled PR test, `radixark/miles/pr-test-rocm.yml`, is another repo's workflow (next point): its agents work in the radixark/miles clone the Miles workflows use, at the run's commit.
+- **Other repos' workflows** are named `owner/repo/<file>`, e.g. `sgl-project/sgl-amd-mono/nightly-amd.yml` or `radixark/miles/pr-test-rocm.yml` ([`workflow_repo()`](scripts/utils.py)); sglang's go by their file name alone. Their runs, jobs and logs are read from that repo, and their agents work in a full clone of it at the run's commit ([`ensure_source_repo()`](scripts/utils.py)), with a `Repo:` line in the prompt that the Ground Rules turn into that repo's links. Like Miles, they appear in the report, the summary and Runner health, but not in the Failure Trackers or Suspect PR comments.
 
 #### Auto-rerun
 
@@ -373,26 +371,7 @@ These checks exist because of sgl-project/sglang#40771. There the bot read the P
 
 Paste a run or job URL into **Actions → Analyze CI**. [`run_analysis()`](scripts/analyze_url.py) analyses every failed job of the run (or the one job), adds a Cross-Job Summary when there are several, and writes it all into an `[Analyze] <workflow> run #<id>` issue in this repo. Use it for manual or PR runs, which the daily monitor ignores.
 
-### 5.8 Notion staging
-
-**Purpose.** Propose new entries for the team's Notion table of known AMD CI errors. Only failures that are clearly stable qualify, and they go to a separate staging table that a person reviews.
-
-**Flow** ([`stage_notion.py`](scripts/stage_notion.py), 12:00 UTC daily):
-1. **`analyze`.** An agent reads the last 7 daily reports and proposes canonical failures. Code keeps a candidate only if the same signature appears in two or more completed comparable runs with no later pass ([`validate_candidate()`](scripts/stage_notion.py)).
-2. **`sync`.** Plain code with no agent:
-   - reads the official known-errors table and the staging table, and skips matches;
-   - writes new rows only to the staging table, with `Status` left blank;
-   - verifies the rows it created, and that the official table is unchanged.
-
-The agent never receives the Notion token. Manual runs default to `dry-run`.
-
-**Status: paused since 2026-11-12.** `notion-staging.yml` is disabled in the Actions settings, so neither the schedule nor the button runs it. To resume, enable it there. It was paused for two reasons:
-- **Nobody owns the staging table.** The official table stayed at 44 rows while staging grew past 660.
-- **The duplicate check does not hold across days.** Each daily run re-reads 7 days of reports, so the same stable failure is proposed again every day. [`is_duplicate()`](scripts/stage_notion.py) matches on the agent's wording, which changes from day to day. From 2026-11-03 to 2026-11-11 the check caught only 0–7 candidates per day, and 8–16 new rows were written each day.
-
-Before resuming, someone needs to own the review, the duplicate check needs a key that does not depend on wording (test file, test function, error class), and the duplicate rows need to be cleaned up.
-
-### 5.9 Coverage exclusion audit
+### 5.8 Coverage exclusion audit
 
 **Purpose.** Keep the AMD test-coverage number honest.
 - ROCm/sglang-ci's `/coverage` page lists the sglang tests that run on NVIDIA CI but not on AMD CI, and computes AMD coverage from that list.
@@ -414,7 +393,7 @@ It is the most isolated job in this repo:
 
 It acts as the owner of `SGLANG_CI_TOKEN` (or `GH_PAT`), who must be an admin on ROCm/sglang-ci with ROCm SSO authorized. For a manual dry run, use Actions → Coverage Exclusion Audit → `dry_run`.
 
-### 5.10 CI autofix
+### 5.9 CI autofix
 
 **Purpose.** When a scheduled AMD run on sglang `main` fails for sure and nobody has a fix, write the fix, prove on AMD GPUs that it works, and open a **draft** PR for people to review. The fix is the smallest change that fixes the root cause; a skip or a looser threshold is used only when the cause is outside sglang (AITER, the image, the driver, an upstream model) and is then labelled a workaround. It replaces what was done by hand: an agent fixes it, the failing job is re-run on a branch, and a PR is opened with the run linked.
 
@@ -492,7 +471,6 @@ Settings → Secrets and variables → Actions.
 | `GH_PAT` | amd-bot's GitHub PAT |
 | `LLM_GATEWAY_KEY` / `LLM_GATEWAY_URL` | AMD LLM Gateway key and endpoint (e.g. `https://llm-api.amd.com/Anthropic`) |
 | `AGENT_GH_TOKEN` | Recommended: a read-only token for the CI-status agents, which read content anyone can write |
-| `NOTION_TOKEN` | Notion connection with Read + Insert, no Update, shared only with the two databases |
 | `SGLANG_CI_TOKEN` | Optional: another ROCm/sglang-ci admin's PAT for the coverage audit |
 | `RUNNER_STATUS_TOKEN` | Optional: a token that can list the monitored repos' self-hosted runners (e.g. `GET /repos/sgl-project/sglang/actions/runners`), for the runner health check. Read only; never given to an agent |
 | `AUTOFIX_TOKEN` | Optional: a token for CI autofix's writes in place of the runners' `GH_PAT` (see above) |
@@ -506,7 +484,6 @@ Settings → Secrets and variables → Actions.
 | `AUTOFIX_MODE` | CI autofix's switch: `off` (default, also when unset), `live` |
 | `AUTOFIX_MAX_PER_HOUR` | Optional: problems CI autofix may start per hour (default 3) |
 | `COVERAGE_AUDIT_MODEL` | Optional `--model` for the coverage audit (default `opus`) |
-| `NOTION_KNOWN_DATA_SOURCE_ID` / `NOTION_STAGING_DATA_SOURCE_ID` | The official (read-only) and staging (write) Notion data sources; they must differ |
 
 ### Runners
 
@@ -554,7 +531,7 @@ Logs: `docker logs -f amd-ci-bot-runner-1`. Restart all: `for i in $(seq 1 10); 
 PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py'
 
 # Any use case on a runner, with every GitHub write blocked (run inside a runner container)
-python3 scripts/validate_live.py monitor|crossrun|daily|tracker|staging|cistatus|review
+python3 scripts/validate_live.py monitor|crossrun|daily|tracker|cistatus|review
 
 # CI-status replay and scoring against hand-labelled cases
 python scripts/check_ci_for_pr.py 40771 --no-post --head-sha <sha> --as-of <time> --out-dir runs/40771
@@ -607,8 +584,6 @@ python scripts/failure_tracker.py --bot-repo bingxche/sglang-ci-bot [--no-use-ag
 python scripts/review_pr.py 1234 --no-post [--focus "..."]
 python scripts/check_ci_for_pr.py 1234 --no-post
 python scripts/analyze_url.py --url <run or job URL> [--bot-repo bingxche/sglang-ci-bot]
-python scripts/stage_notion.py analyze --bot-repo bingxche/sglang-ci-bot --output out.json
-python scripts/stage_notion.py sync --input out.json --dry-run
 python scripts/autofix.py fix|publish --bot-repo bingxche/sglang-ci-bot [--handoff dir] [--mode live] [--smoke-problem R386 --smoke-date 2026-11-08 --smoke-base <sha> [--smoke-job <name part>]]
 python scripts/autofix_audit.py --bot-repo bingxche/sglang-ci-bot [--days 14] recipes|prs
 ```
@@ -644,8 +619,6 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 | `AUTOFIX_AGENT_TIMEOUT_SECS` / `AUTOFIX_AGENT_MAX_TURNS` | `autofix_config.py` | Fix agent budget (7200 s, 400 turns; effort max is slow) |
 | `AUTOFIX_REVIEW_TIMEOUT_SECS` / `AUTOFIX_REVIEW_MAX_TURNS` | `autofix_config.py` | Review agent budget (3600 s, 150 turns) |
 | `CI_STATUS_AGENT_TIMEOUT` / `CI_STATUS_OUT_DIR` | `check_ci_for_pr.py` | Agent timeout (2400 s); where to save the evidence pack and verdicts |
-| `STAGING_AGENT_TIMEOUT_SECS` / `STAGING_AGENT_MAX_TURNS` | `stage_notion.py analyze` | Staging agent budget (1200 s, 120 turns) |
-| `NOTION_TOKEN` / `NOTION_KNOWN_DATA_SOURCE_ID` / `NOTION_STAGING_DATA_SOURCE_ID` | `stage_notion.py sync` | Notion access; never present in the agent step |
 | `SGLANG_CI_TOKEN` | `coverage-audit.yml` | ROCm/sglang-ci token, in place of `GH_PAT` |
 | `COMMENT_AUTHOR` | review, CI status | Set by the watcher; shown as "requested by" |
 | `PR_BODY` | `check_pr_rules.py` | The PR description, passed by `pr-checks.yml` (or `--body-file`) |
