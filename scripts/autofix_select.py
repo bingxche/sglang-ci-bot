@@ -20,6 +20,7 @@ from autofix_ci import (
     dispatch_inputs,
     fails_for_sure,
     failure_window,
+    find_outcome,
     is_perf,
     job_family,
     job_label,
@@ -27,7 +28,6 @@ from autofix_ci import (
     recipe_for,
     run_history,
     same_job,
-    test_outcome,
 )
 from autofix_config import (
     AUTOFIX_WORKFLOWS,
@@ -396,34 +396,31 @@ def job_history(gh: GitHub, workflow: str, j: dict, job_tests: list) -> list[tup
 def run_status(gh: GitHub, run_jobs: list[dict], j: dict, job_tests: list,
                read_logs: bool = True) -> tuple[str | None, dict | None]:
     """How *job_tests* ended in one run, and the job that says so: ``failed`` (all failed),
-    ``other`` (some failed), ``passed``, or ``(None, None)`` when no job of the run ran them.
+    ``other`` (some failed, or one ran with no clear result), ``passed`` (a log shows each
+    pass), or ``(None, None)`` when the run says nothing: no partition shows the tests ran.
 
-    The tests are looked for in every partition and runner pool of job *j*, its own first:
-    suites that place tests by time move a file between partitions (R317's on Nov 9), and a
-    run may list the job once per pool. A test no failed partition ran is taken to have passed
-    in one that succeeded. Without *read_logs* (past ``HISTORY_RUNS``) a failed partition
-    counts as ``failed`` unread.
+    The tests are looked for in every finished partition and runner pool of job *j*
+    (``find_outcome()``), its own and the failed ones first: suites that place tests by time
+    move a file between partitions (R317's on Nov 9), and a run may list the job once per
+    pool. Without *read_logs* (past ``HISTORY_RUNS``) only the job's own partition decides,
+    by its conclusion.
     """
-    jobs = [x for x in run_jobs if same_job(x["name"], j["job_name"], any_partition=True)
-            and x.get("conclusion") not in (None, "skipped", "cancelled")]
-    jobs.sort(key=lambda x: (not same_job(x["name"], j["job_name"]), x["conclusion"] == "success"))
-    failed = [x for x in jobs if x["conclusion"] != "success"]
-    passed = [x for x in jobs if x["conclusion"] == "success"]
+    done = [x for x in run_jobs if x.get("conclusion") not in (None, "skipped", "cancelled")]
     if not read_logs:
-        return ("failed", failed[0]) if failed else ("passed", passed[0]) if passed else (None, None)
-    results: dict[tuple, tuple[str, dict]] = {}
-    for x in failed:
-        log = gh.job_log(x["id"])
-        for t in job_tests:
-            if t not in results and (o := test_outcome(log, *t)).status in ("passed", "failed"):
-                results[t] = (o.status, x)
-    found = [s for s, _ in results.values()]
-    if "failed" in found:
-        status = "failed" if len(results) == len(job_tests) and set(found) == {"failed"} else "other"
-        return status, next(x for s, x in results.values() if s == "failed")
-    if found or passed:
-        return "passed", (passed or [x for _, x in results.values()])[0]
-    return None, None
+        own = next((x for x in done if same_job(x["name"], j["job_name"])), None)
+        return ((("passed" if own["conclusion"] == "success" else "failed"), own) if own else (None, None))
+    jobs = sorted((x for x in done if same_job(x["name"], j["job_name"], any_partition=True)),
+                  key=lambda x: (x["conclusion"] == "success", not same_job(x["name"], j["job_name"])))
+    found = [r for t in job_tests if (r := find_outcome(jobs, gh.job_log, *t, first_known=True))]
+    statuses = [o.status for o, _ in found]
+    if "failed" in statuses:
+        status = "failed" if len(found) == len(job_tests) and set(statuses) == {"failed"} else "other"
+        return status, next(x for o, x in found if o.status == "failed")
+    if not found:
+        return None, None
+    # Every test that ran passed; one that ran with no clear result (a timeout, a log that
+    # could not be read) leaves the run undecided, which stops the history.
+    return ("passed" if set(statuses) == {"passed"} else "other"), found[0][1]
 
 
 def blocks_now(pr: dict, now: datetime) -> bool:

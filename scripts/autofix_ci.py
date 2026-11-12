@@ -77,11 +77,16 @@ def same_job(a: str, b: str, any_partition: bool = False) -> bool:
     ROCm versions still differ; partitions (``…, 3)``) and parts (``part 2``) too, unless *any_partition*:
     suites that place tests by time move a file from one partition to another between runs."""
     if any_partition:
-        ja, jb = parse_job_name(a), parse_job_name(b)
-
-        def rest(j: JobName) -> tuple:
-            return j.caller, j.base, tuple(p for p in j.params if p != j.runner and not p.isdigit())
-        return rest(ja) == rest(jb) and bool(ja.runner) == bool(jb.runner) and _same_gpu(ja.runner, jb.runner)
+        def rest(name: str) -> tuple:
+            # The caller as written (with its own parameters), and the job's last parameter
+            # when it is a partition number.
+            j = parse_job_name(name)
+            params = [p for p in j.params if p != j.runner]
+            if params and params[-1].isdigit():
+                params.pop()
+            return (name or "").split(" / ")[0] if " / " in (name or "") else "", j.base, tuple(params), j.runner
+        ra, rb = rest(a), rest(b)
+        return ra[:3] == rb[:3] and bool(ra[3]) == bool(rb[3]) and _same_gpu(ra[3], rb[3])
     ra, rb = _RUNNER_LABEL_RE.findall(a or ""), _RUNNER_LABEL_RE.findall(b or "")
     if _RUNNER_LABEL_RE.sub("", a or "") != _RUNNER_LABEL_RE.sub("", b or "") or len(ra) != len(rb):
         return False
@@ -388,6 +393,10 @@ def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
         return Outcome("not-run", note=f"{test_file} did not run in this job")
     whole_log = not segments
     if whole_log:
+        # A pytest log lists every file it ran: one listing others but not this one did not run it.
+        files = {m.group(2) for m in (_PYTEST_RE.match(line.strip()) for line in lines) if m}
+        if files and not any(same_file(f, test_file) for f in files):
+            return Outcome("not-run", note=f"{test_file} did not run in this job")
         mine = [Segment(None, lines)]
     retried = len(mine) > 1 or any(
         (m := _RETRY_RE.match(line.strip())) and same_file(m.group(1) or m.group(2), test_file)
@@ -408,6 +417,24 @@ def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
         return Outcome("unknown", retried, note="file passed with skipped tests; this one may be among them",
                        ran_file=ran)
     return Outcome("unknown", retried, note=f"no result for {test_func} in the log", ran_file=ran)
+
+
+def find_outcome(jobs: list[dict], job_log, test_file: str, test_func: str,
+                 first_known: bool = False) -> tuple[Outcome, dict] | None:
+    """The job of *jobs* that ran *test_file* and says how *test_func* ended, with that outcome;
+    None when none ran it. A known result beats ``unknown``, and a run_suite file beats a log
+    read whole. With *first_known* the first passed or failed result is taken, reading no
+    more logs (they are downloaded one by one)."""
+    best = None
+    for j in jobs:
+        o = test_outcome(job_log(j["id"]), test_file, test_func)
+        if o.status == "not-run":
+            continue
+        if first_known and o.status in ("passed", "failed"):
+            return o, j
+        if best is None or (o.status == "unknown", not o.ran_file) < (best[0].status == "unknown", not best[0].ran_file):
+            best = (o, j)
+    return best
 
 
 def ran_first(raw_log: str, files) -> bool:
@@ -551,9 +578,7 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
     for f, fn in plan["tests"]:
         # The job that ran the file and says how the test ended; a job that died before running
         # any file, or does not name the test, says nothing.
-        outcomes = [(test_outcome(job_log(j["id"]), f, fn), j) for j in mine]
-        ran = [x for x in outcomes if x[0].status != "not-run"]
-        best = min(ran, key=lambda x: (x[0].status == "unknown", not x[0].ran_file), default=None)
+        best = find_outcome(mine, job_log, f, fn)
         if not best:
             out["reasons"].append(f"`{f}` did not run")
             continue
