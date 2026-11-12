@@ -10,14 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": true,
-      "must_run": [
-        "test/registered/e2e/models/test_dsa_glm52_hisparse.py"
-      ],
       "basis": "#47994 reverts it: the JIT rewrite of moe_finalize_fuse_shared drops GSM8K of test_dsa_glm52_hisparse.py (nightly-test-8-gpu-b200) from ~0.95 to ~0.90; the test is nightly-only, so the PR's CI did not run it. extra_needed: the kernel sits in the FlashInfer TRT-LLM MoE finalize path every Blackwell MoE model uses, which extra-b covers."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "CUDA JIT kernel only (python/sglang/kernels/jit/csrc/moe/*.cu[h])."
     }
   }

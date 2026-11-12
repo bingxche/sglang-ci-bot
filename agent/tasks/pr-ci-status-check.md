@@ -39,28 +39,23 @@ Secondary, briefly: if upstream stages failed and later jobs were skipped, say P
 
 **Replays.** When the prompt has an `As of:` time, judge with what existed then. Do not read PR comments, reviews, commits, workflow runs or other PRs created after it (on this PR or on `main`); filter `gh` queries by date.
 
-### Suggested tests
+### Does this PR need extra CI?
 
-Base CI does not cover every path a PR touches: other features' tests run in the extra, nightly and weekly tiers. Besides attributing failures, say which tests this PR should still run, on NVIDIA and on AMD. Use sglang's own method, copied from sglang `main` into `.ci-context/sglang-skills/`:
+Base CI does not cover every path a PR touches: the tests of features off the default path run only in the **extra** tier, which a PR runs only on request. Besides attributing failures, say for NVIDIA and for AMD whether this PR should run extra CI. Decide with sglang's own rules, copied from sglang `main` into `.ci-context/sglang-skills/`:
 
-- pick tests the way `rerun-test.md` says ("Pick the tests": the PR's own changed tests, tests that exercise the changed modules, functions and flags, one end-to-end test per touched subsystem), within its "Limits";
-- use a group from `rerun_test_groups.json` when a whole group fits the change better than single files;
-- decide whether the PR needs the **extra** tier with `write-sglang-test.md`'s "Choosing a Tier": does the change reach a feature whose tests live in extra?
+- `write-sglang-test.md`, "Choosing a Tier": what belongs in extra (features with real users that are off the default path, the current flagship models, important accuracy gates);
+- `rerun-test.md`, "Pick the tests": which tests exercise a change (the modules, functions and server flags it touches, one end-to-end test per touched subsystem). Grep `test/registered/` for them and look at their registration (`stage="extra-…"` / `suite="extra-…"` is extra).
 
-AMD needs one more check:
-- suggest AMD tests only when the change reaches a ROCm-specific path (`is_hip()`, aiter, `amd/` or `rocm` code, HIP kernels, AMD CI files); `write-sglang-test.md` registers a test on AMD only in that case;
-- pick only files with a `register_amd_ci(...)`; their suite says the tier (`extra-…` is extra, `nightly…` or `nightly=True` is nightly).
+Extra is needed when the change reaches code that those extra tests exercise and base CI does not. AMD needs it only when the change reaches a ROCm-specific path (`is_hip()`, aiter, `amd/` or `rocm` code, HIP kernels, AMD CI files); `write-sglang-test.md` registers tests on AMD only in that case. Docs-only and CPU-only changes need no extra.
 
-Every reason cites the changed paths (`python/sglang/srt/…`), not "this PR touches X". Give at most 8 files per platform, most important first, as repo paths (`test/registered/…/test_x.py`, optionally `::TestClass`). Say whether each one ran in this CI (`passed`, `failed`, `not_run`, `pending`). Docs-only or CPU-only changes need nothing: say so with `extra_needed: false` and no files.
+The reason is one sentence that names the changed paths (`python/sglang/srt/…`) and, when extra is needed, the feature its extra tests cover. Do not list test files or commands.
 
-Do not write a visible section for this. After the verdict block, end the report with one hidden block; the harness checks every file (it exists, is registered for that platform, is not disabled), drops the rest, and renders the section and its commands:
+Do not write a visible section for this. After the verdict block, end the report with one hidden block; the harness renders it:
 
 ```
 <!-- test-selection
-{"nv": {"extra_needed": true, "reason": "python/sglang/srt/mem_cache/hiradix_cache.py changes HiCache write-back, which only extra tests cover",
-        "files": [{"file": "test/registered/hicache/test_hicache_storage.py", "why": "…", "ci": "not_run"}],
-        "groups": [{"group": "hicache-all", "why": "…"}]},
- "amd": {"extra_needed": false, "reason": "no ROCm-specific path changed", "files": [], "groups": []}}
+{"nv": {"extra_needed": true, "reason": "python/sglang/srt/mem_cache/hiradix_cache.py changes HiCache write-back, which only the extra-tier HiCache tests exercise"},
+ "amd": {"extra_needed": false, "reason": "no ROCm-specific path changed"}}
 -->
 ```
 

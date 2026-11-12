@@ -10,14 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "ROCm-only path (deepseek_common/amd/)."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [
-        "test/registered/amd/test_deepseek_v4_flash_fp8.py"
-      ],
       "basis": "#38453: the FP8 wo_a path rejected the BF16 wo_a weight of DeepSeek-V4 Flash-FP8 (and Pro-FP8) and the server exited at startup; the 8x MI35x Flash-FP8 test (nightly-amd-8-gpu-mi35x-deepseek-v4-flash) is the one that broke. No AMD extra test covers DSV4."
     }
   }

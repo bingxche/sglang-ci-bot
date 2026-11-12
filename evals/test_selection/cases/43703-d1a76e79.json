@@ -10,16 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": true,
-      "must_run": [
-        "test/registered/e2e/disaggregation/test_qwen4_exp_pd_prefill_cp.py",
-        "test/registered/cuda_graph/full_prefill/test_full_cuda_graph_prefill.py",
-        "test/registered/e2e/models/test_qwen4_exp_models.py"
-      ],
       "basis": "#49118: autotuned low-M BF16 GEMMs pick FlashInfer's TGV kernel that faults under CUDA graph + PDL: test_qwen4_exp_pd_prefill_cp.py (nightly 8-gpu-b200) failed, test_qwen4_exp_models.py (extra-b 4-gpu-b200) intermittently. #49092: it also broke test_full_cuda_graph_prefill.py (extra-b-test-4-gpu-b200). as_of is before BBuf's /rerun-test at 00:44:51Z."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "FlashInfer mm_bf16 path is NVIDIA-only."
     }
   }

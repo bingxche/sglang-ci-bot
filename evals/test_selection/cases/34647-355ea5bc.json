@@ -10,16 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "AITER Gluon MLA on ROCm only."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [
-        "test/registered/amd/accuracy/mi35x/test_deepseek_r1_mxfp4_tp2_mi35x.py",
-        "test/registered/amd/accuracy/mi35x/test_deepseek_r1_mxfp4_tp4_mi35x.py",
-        "test/registered/amd/accuracy/mi35x/test_deepseek_r1_mxfp4_tp4_mtp_mi35x.py"
-      ],
       "basis": "#37762: the BF16-query exception meant for Kimi-K3's 12 heads applied to every AITER + FP8 MLA model; DeepSeek-R1-MXFP4 TP2 / TP4 / TP4-MTP lost nearly all GSM8K accuracy in the MI355X nightly (these three files)."
     }
   }

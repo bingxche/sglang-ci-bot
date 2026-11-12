@@ -10,16 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": true,
-      "must_run": [
-        "test/registered/kernels/ops/kvcache/test_minimax_m31_hicache.py",
-        "test/registered/kernels/ops/mamba/test_mtp_hicache.py",
-        "test/registered/unit/mem_cache/test_unified_hicache_regressions.py"
-      ],
       "basis": "The author posted /rerun-test for six files and /run-extra-ci nv. The three CPU-only files of that list (test_hybrid_pool_assembler.py, test_unified_kv_storage.py, test_unified_radix_hicache_dispatch.py) run in base-a-test-cpu on every PR and have no register_cuda_ci, so they are left out."
     },
     "amd": {
       "extra_needed": true,
-      "must_run": [],
       "basis": "The author posted /run-extra-ci amd: HiCache host-pool assembly is shared code that AMD runs too. No AMD-registered file was named."
     }
   }

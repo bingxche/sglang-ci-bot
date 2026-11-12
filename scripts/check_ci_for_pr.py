@@ -598,7 +598,7 @@ def _check_ci_with_agent(
     pack = build_evidence_pack(token, pr_number, repo_path, head_sha=head_sha, as_of=as_of)
     checkout = pack["checkout"]
     # From main, never from this checkout: the PR can change its own skill files.
-    skills, amd_rerun = suggested_tests.main_context(token)
+    skills = suggested_tests.main_context(token)
     prompt = (
         f"Task: PR CI Status Check\n"
         f"PR: #{pr_number} (head {pack['request']['head_sha']})\n"
@@ -618,23 +618,13 @@ def _check_ci_with_agent(
         output_must_contain="## CI Status for PR",
     ))
     checked, problems = validate(pack, parse_verdict_block(agent_report))
-    try:
-        groups = set(json.loads(skills.get("sglang-skills/rerun_test_groups.json") or "{}"))
-    except (json.JSONDecodeError, TypeError):
-        groups = set()
-    try:
-        selection = suggested_tests.check(suggested_tests.parse_block(agent_report), repo_path, groups, amd_rerun,
-                                          ref=pack["request"]["head_sha"])
-    except Exception as exc:  # the attribution above must still be posted
-        print(f"  WARNING: could not check the suggested tests ({exc})")
-        selection = {"amd_rerun": amd_rerun, "valid": False, "platforms": {}, "error": str(exc)}
+    selection = suggested_tests.check(suggested_tests.parse_block(agent_report))
     report = annotate_report(suggested_tests.strip_block(agent_report), pack, checked, problems)
     report = suggested_tests.neutralize_outside_code(
         report.rstrip() + "\n\n" + suggested_tests.render(selection), neutralize_mentions)
     print(f"  Verdicts: {len(checked)} checked, "
           f"{sum(bool(v['validation']) for v in checked)} unsupported, {len(problems)} report problems")
-    print("  Suggested tests: " + ", ".join(
-        f"{k} {len(p['files'])} kept, {len(p['dropped'])} dropped" for k, p in selection["platforms"].items()))
+    print("  Extra CI needed: " + ", ".join(f"{k} {p['extra_needed']}" for k, p in selection["platforms"].items()))
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
         shutil.copytree(repo_path / ".ci-context", out_dir / "pack", dirs_exist_ok=True)

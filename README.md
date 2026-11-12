@@ -347,7 +347,7 @@ It does not meet design rule R2 yet: nothing checks the agent's findings before 
 
 ### 5.6 PR CI status check
 
-**Purpose.** For each CI job that ran and failed on the PR's head, decide whether **this PR** caused it. Also flag when PR CI is incomplete (fast-fail cascades, gates), or when the AMD test that covers the change never ran. And suggest which tests the PR should still run, on NVIDIA and on AMD.
+**Purpose.** For each CI job that ran and failed on the PR's head, decide whether **this PR** caused it. Also flag when PR CI is incomplete (fast-fail cascades, gates), or when the AMD test that covers the change never ran. And say whether the PR should also run extra CI, on NVIDIA and on AMD.
 
 **Flow** ([`check_ci_for_pr()`](scripts/check_ci_for_pr.py)):
 1. **Evidence pack.** [`build_evidence_pack()`](scripts/ci_evidence.py) collects, for every failed job:
@@ -360,14 +360,12 @@ It does not meet design rule R2 yet: nothing checks the agent's findings before 
 2. **Agent.** The agent attributes each failure (🔴 related / 🟡 possibly / 🟢 unrelated / ⚪ unknown) and ends with a hidden verdict block citing evidence IDs.
 3. **Check.** [`validate()`](scripts/ci_verdicts.py) checks every verdict against the pack. For example, `related` needs the full chain: diff → the changed path ran → the failure. A row that fails the check is shown as ⚪ unverified, with a warning.
 4. **Coverage banner.** [`detect_untested_amd_changes()`](scripts/check_ci_for_pr.py) computes, in code, a banner shown when AMD CI did not run, or when the suite covering a changed test file did not run.
-5. **Suggested tests.** Base CI does not run the extra, nightly and weekly tests, so a green PR can still miss the tests of the feature it changes. The same agent picks those tests with sglang's own method, not one of ours:
-   - [`main_context()`](scripts/suggested_tests.py) copies `rerun-test` and `write-sglang-test` (`.agents/skills/…/SKILL.md`) and `scripts/ci/rerun_test_groups.json` from sglang **`main`** into `.ci-context/sglang-skills/`. Never from the PR's checkout: a PR can rewrite its own skill files;
-   - the agent says, per platform, whether the PR needs the extra tier and why (citing changed paths), and which files or `/rerun-group` groups to run, in a hidden `test-selection` block. AMD tests only when the change reaches a ROCm-specific path;
-   - [`check()`](scripts/suggested_tests.py) keeps a file only if it exists at the PR head (the commit `/rerun-test` checks out, while CI usually tests a merge with a newer `main`; so a PR's new test counts, and a test it deletes or only newer `main` has does not), is a plain path (agent text never reaches a command), has an enabled `register_cuda_ci` / `register_amd_ci`, and is within the first [`MAX_FILES`](scripts/suggested_tests.py); every dropped file and its reason go to `selection.json` in the artifact;
-   - [`commands()`](scripts/suggested_tests.py) writes the commands: `/rerun-test` for the kept files that did not already pass in this CI, but `/run-extra-ci <hw>` when a platform has more than [`MAX_EXTRA_FILES`](scripts/suggested_tests.py) extra-tier files (nightly and weekly files are still listed one by one; `/run-extra-ci` does not run them). A file `/rerun-test` cannot take (over [`MAX_RERUN_SECS`](scripts/suggested_tests.py), or a CUDA file registered with a legacy `suite=` string) is listed without a command. Until `/rerun-test --amd` (sgl-project/sglang#48190) is on `main`, which `main_context()` checks in main's `slash_command_handler.py`, any AMD extra test means `/run-extra-ci amd`;
-   - [`render()`](scripts/suggested_tests.py) writes the section between two "🤖 AI-generated suggestion — use it with your own judgement." lines. The bot only suggests; it runs nothing ([R3](#r3)). The whole report then goes through `neutralize_mentions()` (outside code blocks), so it pings nobody.
+5. **Suggested extra CI.** Base CI does not run the extra tier, so a green PR can still skip the tests of a feature it changes. The same agent says, per platform, whether the PR should run extra CI, with sglang's own rules, not ones of ours:
+   - [`main_context()`](scripts/suggested_tests.py) copies the `write-sglang-test` ("Choosing a Tier") and `rerun-test` skills (`.agents/skills/…/SKILL.md`) from sglang **`main`** into `.ci-context/sglang-skills/`. Never from the PR's checkout: a PR can rewrite its own skill files;
+   - the agent writes, in a hidden `test-selection` block, `extra_needed` and a one-sentence reason that names the changed paths. AMD needs extra only when the change reaches a ROCm-specific path. It lists no test files or commands (the repo owner's choice, 2026-11-12);
+   - [`check()`](scripts/suggested_tests.py) keeps only a yes/no answer and the reason, and [`render()`](scripts/suggested_tests.py) writes the section between two "🤖 AI-generated suggestion — use it with your own judgement." lines, with the comment that runs the extra tier (`/run-extra-ci nv|amd`, [`PLATFORMS`](scripts/suggested_tests.py)) when it is needed. The bot only suggests; it runs nothing ([R3](#r3)). The whole report then goes through `neutralize_mentions()` (outside code blocks), so it pings nobody.
 
-These checks exist because of sgl-project/sglang#40771. There the bot read the PR head instead of the commit CI tested, judged a feature off from its code default while the image turned it on, and called a PR-caused accuracy drop unrelated. Replays with `--head-sha` / `--as-of` and the hand-labelled cases in [`evals/ci_status/cases/`](evals/ci_status/cases/) are scored by [`eval_ci_status.py`](scripts/eval_ci_status.py). With `--selection` it scores the Suggested tests against [`evals/test_selection/cases/`](evals/test_selection/cases/) instead: per case and platform, whether the PR needs the extra tier and which files it must run. A replay's prompt carries its `As of:` time, and the agent is told not to read anything newer; [`leaks()`](scripts/eval_ci_status.py) still scans the archived session for later dates (a later `/rerun-test` comment or fix PR gives the answer away) and leaves such a case unscored.
+These checks exist because of sgl-project/sglang#40771. There the bot read the PR head instead of the commit CI tested, judged a feature off from its code default while the image turned it on, and called a PR-caused accuracy drop unrelated. Replays with `--head-sha` / `--as-of` and the hand-labelled cases in [`evals/ci_status/cases/`](evals/ci_status/cases/) are scored by [`eval_ci_status.py`](scripts/eval_ci_status.py). With `--selection` it scores the Suggested extra CI against [`evals/test_selection/cases/`](evals/test_selection/cases/) instead: per case and platform, whether the PR needs the extra tier. A replay's prompt carries its `As of:` time, and the agent is told not to read anything newer; [`leaks()`](scripts/eval_ci_status.py) still scans the archived session for later dates (a later `/run-extra-ci` comment or fix PR gives the answer away) and leaves such a case unscored.
 
 ### 5.7 On-demand analysis
 
@@ -554,8 +552,8 @@ python3 scripts/validate_live.py monitor|crossrun|daily|tracker|staging|cistatus
 python scripts/check_ci_for_pr.py 40771 --no-post --head-sha <sha> --as-of <time> --out-dir runs/40771
 python scripts/eval_ci_status.py --runs runs
 
-# Suggested tests: replay every case (3 at a time, no posting), then score
-python scripts/eval_ci_status.py --selection --runs runs-sel --run-missing --parallel 3 --sglang <clone with the cases' PR heads fetched>
+# Suggested extra CI: replay every case (3 at a time, no posting), then score
+python scripts/eval_ci_status.py --selection --runs runs-sel --run-missing --parallel 3
 ```
 
 `validate_live.py` reads `VALIDATE_WORKFLOW`, `VALIDATE_HOURS`, `VALIDATE_JOB_FILTER`, `VALIDATE_PR`, `VALIDATE_DATE`, `VALIDATE_LOOKBACK`. Give each case its own `AGENT_WORKSPACE`, so it does not touch the runner's `/workspace`.

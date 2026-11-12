@@ -10,18 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": true,
-      "must_run": [
-        "test/registered/kernels/ops/attention/test_flashmla_sched_meta.py",
-        "test/registered/attention/unittests/dsa/test_dsa.py",
-        "test/registered/e2e/models/test_dsa_glm52_tp_mtp.py",
-        "test/registered/e2e/models/test_dsa_glm52_hisparse.py",
-        "test/registered/e2e/disaggregation/test_glm53_cp_bcg_dflash.py"
-      ],
       "basis": "Files the author and a reviewer passed to /rerun-test. test_glm53_cp_bcg_dflash.py is extra-b-test-8-gpu-b300, so extra_needed is true."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "FlashMLA decode scheduling is CUDA-only."
     }
   }

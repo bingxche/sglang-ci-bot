@@ -69,22 +69,20 @@ class TestRunMissing(unittest.TestCase):
 class TestSelectionScore(unittest.TestCase):
     AS_OF = "2026-11-01T00:00:00Z"
 
-    def artifact(self, root: Path, case_id: str, nv_files: list[str], nv_extra: bool, session: list[dict]):
+    def artifact(self, root: Path, case_id: str, nv_extra: bool, session: list[dict]):
         artifact = root / case_id
         (artifact / "sessions" / "s1").mkdir(parents=True)
         (artifact / "selection.json").write_text(json.dumps({"platforms": {
-            "nv": {"extra_needed": nv_extra, "files": [{"file": f} for f in nv_files], "commands": ["/run-extra-ci nv"]},
-            "amd": {"extra_needed": False, "files": [], "commands": []}}}))
+            "nv": {"extra_needed": nv_extra, "reason": "r"}, "amd": {"extra_needed": None, "reason": ""}}}))
         (artifact / "sessions" / "s1" / "a.jsonl").write_text(_session(session))
 
     def case(self, case_id: str, status: str = "confirmed") -> dict:
         return {"id": case_id, "as_of": self.AS_OF, "status": status, "head_sha": "HEAD", "platforms": {
-            "nv": {"extra_needed": True, "must_run": ["test/registered/a/test_a.py", "test/registered/a/test_b.py"]},
-            "amd": {"extra_needed": False, "must_run": []}}}
+            "nv": {"extra_needed": True}, "amd": {"extra_needed": False}}}
 
     def test_leaks_find_later_dates_only(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.artifact(Path(tmp), "c1", [], True, [
+            self.artifact(Path(tmp), "c1", True, [
                 _tool_result('[{"created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-11-09T00:00:00Z"}]'),
                 _tool_result('{"createdAt":"2026-11-03T08:00:00Z","body":"/rerun-test x.py"}'),
                 _tool_result("commit abc\nDate:   Mon Nov 2 10:00:00 2026 -0800\n"),
@@ -105,27 +103,19 @@ class TestSelectionScore(unittest.TestCase):
         leaked = [_tool_result('{"mergedAt": "2026-11-05T00:00:00Z"}')]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.artifact(root, "c1", ["test/registered/a/test_a.py", "test/registered/a/test_c.py"], True, clean)
-            self.artifact(root, "c2", ["test/registered/a/test_a.py"], True, leaked)
-            sglang = root / "sglang"
-            (sglang / "test/registered/a").mkdir(parents=True)
-            (sglang / "test/registered/a/test_a.py").write_text(
-                'register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")\n')
-            git = ["git", "-C", str(sglang), "-c", "user.name=t", "-c", "user.email=t@t"]
-            subprocess.run([*git[:3], "init", "-q"], check=True)
-            subprocess.run([*git, "add", "-A"], check=True)
-            subprocess.run([*git, "commit", "-qm", "pr head"], check=True)
-            # The checkout moved on (a revert removed the file); the PR head still has it.
-            (sglang / "test/registered/a/test_a.py").unlink()
-            result = ev.score_selection([self.case("c1"), self.case("c2"), self.case("c3", "proposed")], root, sglang)
+            self.artifact(root, "c1", True, clean)
+            self.artifact(root, "c2", True, leaked)
+            self.artifact(root, "c4", False, clean)
+            cases = [self.case("c1"), self.case("c2"), self.case("c3", "proposed"), self.case("c4")]
+            result = ev.score_selection(cases, root)
+            text = ev.format_selection_score(result)
         m = result["confirmed"]
-        self.assertEqual((m["scored"], m["of"], m["leaked"]), (2, 4, 2))
-        self.assertEqual(m["extra_correct"], 2)
-        self.assertEqual((m["must_run_hits"], m["must_run"]), (1, 2))
-        self.assertEqual(m["invalid_files"], 1)  # test_c.py is not in the checkout
+        # c1 nv right, c1 amd wrong (None), c4 nv wrong, c4 amd wrong; c2 leaked; c3 missing (proposed).
+        self.assertEqual((m["scored"], m["of"], m["leaked"]), (4, 6, 2))
+        self.assertEqual(m["extra_correct"], 1)
         self.assertEqual(result["all"]["missing"], 2)
-        self.assertEqual(result["cost"], {"runs": 2, "p90_seconds": 600.0, "max_seconds": 600.0, "tokens": 15})
-        self.assertIn("must_run recall: 1/2 (50%)", ev.format_selection_score(result))
+        self.assertEqual(result["cost"], {"runs": 3, "p90_seconds": 600.0, "max_seconds": 600.0, "tokens": 30})
+        self.assertIn("extra_needed correct: 1/4 (25%)", text)
 
 
 if __name__ == "__main__":

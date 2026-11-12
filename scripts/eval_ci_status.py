@@ -14,9 +14,9 @@ A runs directory holds one ci-status artifact per case (written by
     python scripts/eval_ci_status.py --runs RUNS --run-missing  # run the bot (no posting) for cases without one
     python scripts/eval_ci_status.py --list-candidates          # past bot reports to label
 
-``--selection`` scores the "Suggested tests" section instead, against
+``--selection`` scores the "Suggested extra CI" section instead, against
 ``evals/test_selection/cases/*.json``: per platform, whether the PR needs the
-extra tier (``extra_needed``) and the files it must run (``must_run``). A case
+extra tier (``extra_needed``). A case
 whose agent session read anything dated after the case's ``as_of`` (a later
 comment, run or commit could give the answer away) is reported as leaked and
 not scored.
@@ -36,7 +36,7 @@ from pathlib import Path
 
 import requests
 
-from suggested_tests import PLATFORMS, registrations
+from suggested_tests import PLATFORMS
 from utils import REPO, gh_headers
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -220,19 +220,8 @@ def session_cost(artifact: Path) -> dict:
     return {"seconds": seconds, "tokens": tokens}
 
 
-def _registered(sglang: Path, commit: str, path: str, backend: str) -> bool:
-    """Whether *path* has an enabled registration for *backend* at *commit* of the sglang clone.
-
-    The PR's head, not main: a PR's own new test may be gone from main (a revert).
-    """
-    shown = subprocess.run(["git", "-C", str(sglang), "show", f"{commit}:{path}"],
-                           capture_output=True, text=True, errors="replace")
-    return shown.returncode == 0 and any(r["backend"] == backend and not r["disabled"]
-                                         for r in registrations(shown.stdout))
-
-
-def score_selection(cases: list[dict], runs_dir: Path, sglang: Path | None = None) -> dict:
-    """Score the suggested tests per case and platform; leaked or missing runs are not scored."""
+def score_selection(cases: list[dict], runs_dir: Path) -> dict:
+    """Score ``extra_needed`` per case and platform; leaked or missing runs are not scored."""
     rows, costs = [], []
     for case in cases:
         artifact = runs_dir / case["id"]
@@ -241,30 +230,20 @@ def score_selection(cases: list[dict], runs_dir: Path, sglang: Path | None = Non
         leaked = leaks(artifact, case["as_of"]) if sel else []
         if sel:
             costs.append(session_cost(artifact))
-        for key, (_, backend) in PLATFORMS.items():
-            truth = case["platforms"][key]
+        for key in PLATFORMS:
             got = (sel or {}).get("platforms", {}).get(key, {})
-            files = [f["file"] for f in got.get("files", [])]
-            must = truth.get("must_run", [])
             rows.append({
                 "case": case["id"], "platform": key, "status": case.get("status", "proposed"),
                 "run": "missing" if sel is None else "leaked" if leaked else "ok", "leaks": leaked[:3],
-                "truth_extra": truth["extra_needed"], "bot_extra": got.get("extra_needed"),
-                "must_run": must, "hits": [f for f in must if f in files], "suggested": files,
-                "commands": got.get("commands", []),
-                "invalid": None if sglang is None else [
-                    f for f in files if not _registered(sglang, case["head_sha"], f, backend)],
+                "truth_extra": case["platforms"][key]["extra_needed"], "bot_extra": got.get("extra_needed"),
+                "reason": got.get("reason", ""),
             })
     result = {"rows": rows}
     for scope, selected in (("all", rows), ("confirmed", [r for r in rows if r["status"] == "confirmed"])):
         ok = [r for r in selected if r["run"] == "ok"]
-        must = sum(len(r["must_run"]) for r in ok)
         result[scope] = {
             "scored": len(ok), "of": len(selected),
             "extra_correct": sum(r["bot_extra"] == r["truth_extra"] for r in ok),
-            "must_run": must, "must_run_hits": sum(len(r["hits"]) for r in ok),
-            "invalid_files": None if sglang is None else sum(len(r["invalid"]) for r in ok),
-            "avg_files": sum(len(r["suggested"]) for r in ok) / len(ok) if ok else 0.0,
             "leaked": sum(r["run"] == "leaked" for r in selected), "missing": sum(r["run"] == "missing" for r in selected),
         }
     secs = sorted(c["seconds"] for c in costs)
@@ -276,26 +255,20 @@ def score_selection(cases: list[dict], runs_dir: Path, sglang: Path | None = Non
 
 
 def format_selection_score(result: dict) -> str:
-    out = ["| Case | Platform | Status | Run | Extra (truth / bot) | must_run hit | Suggested | Commands |",
-           "|---|---|---|---|---|---|---|---|"]
+    out = ["| Case | Platform | Status | Run | Extra (truth / bot) | Bot's reason |", "|---|---|---|---|---|---|"]
     for r in result["rows"]:
-        hit = f"{len(r['hits'])}/{len(r['must_run'])}"
-        missed = [f for f in r["must_run"] if f not in r["hits"]]
-        out.append(f"| {r['case']} | {r['platform']} | {r['status']} | {r['run']} | {r['truth_extra']} / "
-                   f"{r['bot_extra']} | {hit}{' missed: ' + ', '.join(missed) if missed else ''} | "
-                   f"{len(r['suggested'])} | {'<br>'.join(r['commands'])} |")
+        mark = "" if r["run"] != "ok" or r["bot_extra"] == r["truth_extra"] else " ✗"
+        reason = r["reason"].replace("|", "\\|")[:200]
+        out.append(f"| {r['case']} | {r['platform']} | {r['status']} | {r['run']} | "
+                   f"{r['truth_extra']} / {r['bot_extra']}{mark} | {reason} |")
     for r in result["rows"]:
         if r["leaks"]:
             out.append(f"\nLeak in {r['case']} ({r['platform']}): " + "; ".join(r["leaks"]))
     for scope in ("all", "confirmed"):
         m = result[scope]
-        invalid = "not checked (no --sglang)" if m["invalid_files"] is None else m["invalid_files"]
         out += ["", f"**{scope} labels**: scored {m['scored']} of {m['of']} case-platforms "
                 f"(leaked {m['leaked']}, missing {m['missing']})",
-                f"- extra_needed correct: {_rate(m['extra_correct'], m['scored'])}",
-                f"- must_run recall: {_rate(m['must_run_hits'], m['must_run'])}",
-                f"- suggested files that do not exist or are not registered: {invalid}",
-                f"- average files suggested per platform: {m['avg_files']:.1f}"]
+                f"- extra_needed correct: {_rate(m['extra_correct'], m['scored'])}"]
     c = result["cost"]
     out.append(f"\n**cost**: {c['runs']} runs, p90 {c['p90_seconds']:.0f} s, max {c['max_seconds']:.0f} s, "
                f"{c['tokens']:,} tokens")
@@ -320,9 +293,7 @@ def main() -> None:
     parser.add_argument("--runs", help="directory with one ci-status artifact per case ID")
     parser.add_argument("--run-missing", action="store_true", help="run ci-status (no posting) for cases without an artifact")
     parser.add_argument("--parallel", type=int, default=1, help="cases run at once by --run-missing")
-    parser.add_argument("--selection", action="store_true", help="score the Suggested tests section")
-    parser.add_argument("--sglang", type=Path, help="sglang clone with the cases' head commits, to re-check every "
-                        "suggested file at the PR head (--selection)")
+    parser.add_argument("--selection", action="store_true", help="score the Suggested extra CI section")
     parser.add_argument("--list-candidates", type=int, nargs="?", const=30, metavar="N",
                         help="list N recent PRs with amd-bot ci-status reports")
     args = parser.parse_args()
@@ -335,7 +306,7 @@ def main() -> None:
     if args.run_missing:
         run_missing(cases, Path(args.runs), args.parallel, "selection.json" if args.selection else "verdicts.json")
     if args.selection:
-        print(format_selection_score(score_selection(cases, Path(args.runs), args.sglang)))
+        print(format_selection_score(score_selection(cases, Path(args.runs))))
     else:
         print(format_score(score(cases, Path(args.runs))))
 

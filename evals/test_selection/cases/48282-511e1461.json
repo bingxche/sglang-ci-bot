@@ -10,12 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "One import in a Xeon CPU test; no GPU code."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "One import in a Xeon CPU test; no GPU code."
     }
   }

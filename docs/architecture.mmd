@@ -18,7 +18,7 @@ flowchart TB
 
     subgraph L3[" "]
         direction LR
-        P3["<b>③ @amd-bot ci-status</b><br/>did this PR break CI?<br/>which tests should it run?"]:::purpose ~~~ C1(["@amd-bot ci-status"]):::trigger --> C2["watcher →<br/>ci-status-check.yml"]:::workflow --> C3["evidence pack<br/>(code)"]:::code --> C4{{"attribution and<br/>test-selection agent"}}:::agent --> C5["verdicts checked<br/>against evidence;<br/>suggested tests checked<br/>against registrations"]:::code --> C6[("comment on<br/>the sglang PR")]:::output
+        P3["<b>③ @amd-bot ci-status</b><br/>did this PR break CI?<br/>does it need extra CI?"]:::purpose ~~~ C1(["@amd-bot ci-status"]):::trigger --> C2["watcher →<br/>ci-status-check.yml"]:::workflow --> C3["evidence pack<br/>(code)"]:::code --> C4{{"attribution and<br/>extra-CI agent"}}:::agent --> C5["verdicts checked<br/>against evidence"]:::code --> C6[("comment on<br/>the sglang PR")]:::output
     end
 
     subgraph L4[" "]

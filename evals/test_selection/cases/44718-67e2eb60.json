@@ -10,16 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": true,
-      "must_run": [
-        "test/registered/radix_cache/unified_radix_tree/test_unified_radix_cache_kl_mamba.py",
-        "test/registered/kernels/ops/attention/test_kda_fused_verify_backend.py",
-        "test/registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_load_back.py"
-      ],
       "basis": "Judged from the changed paths (the user asked for that): the PR changes the mamba component of the unified radix cache (python and rust/sglang-radix-tree), kv_cache_configurator and the KDA kernels. The new path is env-gated, but the shared code runs for every hybrid model; the E2E for that subsystem, test_unified_radix_cache_kl_mamba.py, is extra-b-test-4-gpu-h100, so extra is needed. Plus the PR's changed KDA kernel test and its new load-back test."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "No ROCm-specific path is changed (no is_hip, aiter, amd/ or rocm code), so by the write-sglang-test rule no AMD test is needed; the PR's AMD-registered unit tests run in AMD base anyway. (The author still ran /run-extra-ci amd.)"
     }
   }

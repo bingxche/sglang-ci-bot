@@ -10,14 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "_use_rocm_triton_softmax_topk requires _use_aiter and gfx95."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [
-        "test/registered/amd/test_qwen35_moe_softmax_topk.py"
-      ],
       "basis": "The reviewer posted /rerun-test for the PR's own test (stage-b mi35x)."
     }
   }

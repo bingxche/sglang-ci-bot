@@ -10,15 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": true,
-      "must_run": [
-        "test/registered/backends/test_flashinfer_nvfp4_online_moe_backend.py",
-        "test/registered/rl/test_update_weights_from_disk_blackwell.py"
-      ],
       "basis": "#49096: the FlashInfer 0.7.3 bump broke every --moe-runner-backend flashinfer_megamoe server; the nightly (4-gpu-b200) failed these two files. A dependency bump that changes MoE dispatch needs extra (the PR already had run-ci-nv-extra)."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "CUDA image and FlashInfer only; AMD installs neither."
     }
   }

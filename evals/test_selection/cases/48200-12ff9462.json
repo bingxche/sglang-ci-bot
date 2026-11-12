@@ -10,12 +10,10 @@
   "platforms": {
     "nv": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "Docs only."
     },
     "amd": {
       "extra_needed": false,
-      "must_run": [],
       "basis": "Docs only."
     }
   }
