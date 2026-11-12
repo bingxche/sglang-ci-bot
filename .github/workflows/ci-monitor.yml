@@ -131,7 +131,7 @@ jobs:
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
           AGENT_PARALLEL: '3'
-          AGENT_TIMEOUT_SECS: '1500'
+          AGENT_TIMEOUT_SECS: '2400'
           AGENT_MAX_TURNS: '150'
           # on unless the AUTO_RERUN repository variable says otherwise; a dry
           # run while AUTO_RERUN_TOKEN (Actions write on sglang) is unset.
@@ -202,7 +202,7 @@ jobs:
           LLM_GATEWAY_KEY: ${{ secrets.LLM_GATEWAY_KEY }}
           LLM_GATEWAY_URL: ${{ secrets.LLM_GATEWAY_URL }}
           TRACKER_AGENT_MAX_TURNS: '80'
-          TRACKER_AGENT_TIMEOUT_SECS: '900'
+          TRACKER_AGENT_TIMEOUT_SECS: '1800'
         run: |
           USE_AGENT="${{ github.event.inputs.use_agent || 'true' }}"
           ARGS="--bot-repo ${{ github.repository }}"

@@ -59,7 +59,7 @@ def crossrun():
         prompt=m._build_cross_run_prompt(wf, runs, patterns, analyses),
         work_dir=ensure_sglang_repo(),
         context_files={"per-job-analyses.md": m._format_per_job_dump(analyses)},
-        max_turns=150, timeout_secs=600,
+        max_turns=150, timeout_secs=int(os.environ.get("CROSS_RUN_TIMEOUT_SECS", "1200")),
     )
     print(m._render_cross_run_summary(wf, runs, patterns, agent_text=text, use_agent=True))
 

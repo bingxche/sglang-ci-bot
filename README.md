@@ -125,7 +125,7 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 <a id="r9"></a>**R9. Cost is bounded.**
 - Every agent run has a turn limit and a timeout.
 - Every fan-out has a cap: agents per matrix job, reviewers, findings verified, suspects verified per tick, autofix problems started per hour (each at most two attempts and two GPU runs).
-- Every task's model is chosen for its stakes (most use the default model; `AGENT_TASKS` can give one a cheaper model). Both CI autofix tasks are pinned to Opus 5.5 1M at effort max: `AGENT_MODEL_<TASK>` cannot change them, and they never fall back to another model ([R6](#r6)).
+- Every task's model is chosen for its stakes (most use the default model; `AGENT_TASKS` can give one a cheaper model), and every task runs at effort `xhigh`. Both CI autofix tasks are pinned to Opus 5.5 1M at effort max: `AGENT_MODEL_<TASK>` cannot change them, and they never fall back to another model ([R6](#r6)).
 
 *Why:* one loop without a bound spends the team's gateway quota. *Kept by:* review only. The limits are in the [environment variables](#environment-variables) table.
 
@@ -184,21 +184,21 @@ Every agent run goes through [`claude_code_analyze()`](scripts/utils.py):
 2. The instructions, [`agent/ground-rules.md`](agent/ground-rules.md) followed by `agent/tasks/<task>.md` ([`agent_instructions()`](scripts/utils.py)), are passed with `--append-system-prompt`. Nothing is read from the checkout's own `CLAUDE.md` or `.claude/`.
 3. Context files the script prepared (logs, evidence packs, other agents' output) are written to `.ci-context/` in the working directory and removed afterwards.
 4. It runs `claude -p` in the worktree:
-   - flags: `--setting-sources user --disable-slash-commands --dangerously-skip-permissions`, with a turn limit and a timeout. A task with a tool allowlist (`tools` in its `AgentTask`) runs with `--restricted --permission-mode dontAsk --allowedTools …` instead, so any other tool call is denied and file tools stay in the working directory; a task with an `effort` adds `--effort`;
+   - flags: `--setting-sources user --disable-slash-commands --dangerously-skip-permissions`, with a turn limit and a timeout. A task with a tool allowlist (`tools` in its `AgentTask`) runs with `--restricted --permission-mode dontAsk --allowedTools …` instead, so any other tool call is denied and file tools stay in the working directory; every task adds `--effort` (see Models below);
    - environment: no `BOT_PAT`, `AUTOFIX_TOKEN` or `LLM_GATEWAY_KEY`, and `AGENT_GH_TOKEN` in place of `GH_PAT` when set. A task with `github_token=False` gets no GitHub token at all.
 5. The text output is returned. When the final message misses the expected report (empty, or overwritten by a follow-up), the report is recovered from the session log. When `AGENT_ARCHIVE_DIR` is set, the prompt and session are archived with secrets redacted.
 
 Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sglang_repo()`](scripts/utils.py), [`create_agent_worktree()`](scripts/utils.py)), checked out at the exact commit the CI run or PR used. The clone is re-made if it is broken (an interrupted clone once left runner-7 with no `HEAD`).
 
-| `Task:` | Instructions | Model | Called from |
+| `Task:` | Instructions | Model, effort | Called from |
 |---|---|---|---|
-| Job Failure Analysis | [`job-failure-analysis.md`](agent/tasks/job-failure-analysis.md) | default | [`analyze_job_with_agent()`](scripts/utils.py) |
-| Cross-Job Summary | [`cross-job-summary.md`](agent/tasks/cross-job-summary.md) | default | [`cross_job_analysis()`](scripts/utils.py) |
-| Cross-Run Pattern Analysis | [`cross-run-pattern-analysis.md`](agent/tasks/cross-run-pattern-analysis.md) | default | [`maybe_publish_cross_run_summary()`](scripts/monitor_ci.py) |
-| Daily Cross-Workflow Summary | [`daily-cross-workflow-summary.md`](agent/tasks/daily-cross-workflow-summary.md) | default | [`build_and_publish_summary()`](scripts/daily_cross_workflow_summary.py) |
-| Failure Tracker Data | [`failure-tracker-data.md`](agent/tasks/failure-tracker-data.md) | default | [`run_agent_extraction()`](scripts/failure_tracker.py) |
-| PR CI Status Check | [`pr-ci-status-check.md`](agent/tasks/pr-ci-status-check.md) | default | [`check_ci_for_pr()`](scripts/check_ci_for_pr.py) |
-| PR Code Review | [`pr-code-review.md`](agent/tasks/pr-code-review.md) | default | [`review_pr_with_agent()`](scripts/review_pr.py) |
+| Job Failure Analysis | [`job-failure-analysis.md`](agent/tasks/job-failure-analysis.md) | default, xhigh | [`analyze_job_with_agent()`](scripts/utils.py) |
+| Cross-Job Summary | [`cross-job-summary.md`](agent/tasks/cross-job-summary.md) | default, xhigh | [`cross_job_analysis()`](scripts/utils.py) |
+| Cross-Run Pattern Analysis | [`cross-run-pattern-analysis.md`](agent/tasks/cross-run-pattern-analysis.md) | default, xhigh | [`maybe_publish_cross_run_summary()`](scripts/monitor_ci.py) |
+| Daily Cross-Workflow Summary | [`daily-cross-workflow-summary.md`](agent/tasks/daily-cross-workflow-summary.md) | default, xhigh | [`build_and_publish_summary()`](scripts/daily_cross_workflow_summary.py) |
+| Failure Tracker Data | [`failure-tracker-data.md`](agent/tasks/failure-tracker-data.md) | default, xhigh | [`run_agent_extraction()`](scripts/failure_tracker.py) |
+| PR CI Status Check | [`pr-ci-status-check.md`](agent/tasks/pr-ci-status-check.md) | default, xhigh | [`check_ci_for_pr()`](scripts/check_ci_for_pr.py) |
+| PR Code Review | [`pr-code-review.md`](agent/tasks/pr-code-review.md) | default, xhigh | [`review_pr_with_agent()`](scripts/review_pr.py) |
 | CI Autofix | [`ci-autofix.md`](agent/tasks/ci-autofix.md) | `Claude-Opus-5.5[1m]`, effort max, pinned | [`run_fix_agent()`](scripts/autofix_agents.py) |
 | CI Autofix Review | [`ci-autofix-review.md`](agent/tasks/ci-autofix-review.md) | `Claude-Opus-5.5[1m]`, effort max, pinned | [`run_review_agent()`](scripts/autofix_agents.py) |
 
@@ -206,7 +206,7 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 - `AGENT_MODEL_<TASK>` overrides the model for one task, e.g. `AGENT_MODEL_FAILURE_TRACKER_DATA=sonnet`.
 - An alias such as `sonnet` is used only when `claude.env` maps it (`ANTHROPIC_DEFAULT_SONNET_MODEL`); otherwise the task keeps the default model.
 - If the gateway has no deployment of the requested model, the task is retried once with the default ([`task_model()`](scripts/utils.py)).
-- An `AgentTask` can also set `effort` (passed as `--effort`) and `pinned`. A pinned task (the two CI autofix tasks) ignores `AGENT_MODEL_<TASK>`, is never retried with the default model, and is checked after the run: if the gateway does not serve its model, or the session log shows any other model, it fails with `ModelUnavailable` ([`claude_code_analyze()`](scripts/utils.py)). A pinned task that times out returns nothing.
+- Every task runs at effort `xhigh` (the `effort` default in `AgentTask`, always passed as `--effort`; without it the CLI uses `high`), except the two CI autofix tasks at `max`. xhigh runs slower (one CI-monitor pass took 1035 s instead of 586 s), so the agent timeouts were raised with it: per-job analysis 2400 s, Cross-Job Summary and daily summary 1800 s, Cross-Run Pattern Analysis and PR review 1200 s, Failure Tracker 1800 s (see [Environment variables](#environment-variables)). An `AgentTask` can also set `pinned`. A pinned task (the two CI autofix tasks) ignores `AGENT_MODEL_<TASK>`, is never retried with the default model, and is checked after the run: if the gateway does not serve its model, or the session log shows any other model, it fails with `ModelUnavailable` ([`claude_code_analyze()`](scripts/utils.py)). A pinned task that times out returns nothing.
 
 **Output contracts.** Reports start with a fixed first line (`### Commit Info`, `**Counts**:`, `# Daily Cross-Workflow Summary`), and the harness strips anything before it. Machine-readable results come in hidden or fenced blocks that code parses and validates: `ci-status-verdicts`, `job-clusters`, `suspect-prs`, and tracker data.
 
@@ -605,14 +605,14 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 | `AGENT_GH_TOKEN` | agent mode | Read-only token given to agents in place of `GH_PAT` / `GH_TOKEN` |
 | `AGENT_ARCHIVE_DIR` | agent mode | Copy each agent's prompt and session log (secrets redacted) here; the CI-status workflow uploads it |
 | `AGENT_PARALLEL` | `monitor_ci.py` | Agents per matrix job (default 3) |
-| `AGENT_TIMEOUT_SECS` / `AGENT_MAX_TURNS` | per-job analysis, daily summary | Per-job timeout (1500 in the workflow, 1800 in code) and turns (150 in the workflow; 1000 per job, 200 for the summary in code) |
-| `CROSS_JOB_TIMEOUT_SECS` / `CROSS_JOB_MAX_TURNS` | `utils.cross_job_analysis` | Cross-Job Summary budget (1200 s, 100 turns) |
-| `CROSS_RUN_TIMEOUT_SECS` | `monitor_ci.py` | Cross-Run Pattern Analysis timeout (600 s) |
-| `DAILY_SUMMARY_TIMEOUT_SECS` | `daily_cross_workflow_summary.py` | Summary agent timeout (1200 s) |
+| `AGENT_TIMEOUT_SECS` / `AGENT_MAX_TURNS` | per-job analysis, daily summary | Per-job timeout (2400 in the workflow and in code) and turns (150 in the workflow; 1000 per job, 200 for the summary in code) |
+| `CROSS_JOB_TIMEOUT_SECS` / `CROSS_JOB_MAX_TURNS` | `utils.cross_job_analysis` | Cross-Job Summary budget (1800 s, 100 turns) |
+| `CROSS_RUN_TIMEOUT_SECS` | `monitor_ci.py` | Cross-Run Pattern Analysis timeout (1200 s) |
+| `DAILY_SUMMARY_TIMEOUT_SECS` | `daily_cross_workflow_summary.py` | Summary agent timeout (1800 s) |
 | `AUTO_RERUN` / `AUTO_RERUN_TOKEN` | `monitor_ci.py` → `auto_rerun.py` | Mode (`on`, `dry-run`, `off`) and the token for the re-run calls |
 | `BUILD_DAILY_SUMMARY` | `monitor_ci.py` | `false` skips the summary refresh (legacy alias `BUILD_DAILY_BOARD`) |
 | `MILES_CAUSE_FIX_URL` | Miles analyses | The sglang-ci dashboard's Miles cause/fix payload (default `https://rocm.github.io/sglang-ci/api/miles/cause-fix.json`) |
-| `TRACKER_AGENT_TIMEOUT_SECS` / `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Tracker extraction budget (900 s, 80 turns) |
+| `TRACKER_AGENT_TIMEOUT_SECS` / `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Tracker extraction budget (1800 s, 80 turns) |
 | `SUSPECT_PR_COMMENTS` | `suspect_pr_comments.py` | Mode: `dry-run`, `post` or `off` |
 | `AUTOFIX_MODE` / `AUTOFIX_MAX_PER_HOUR` | `autofix_config.py` | The switch, `off` (default) or `live`; problems started per hour (3) |
 | `AUTOFIX_TOKEN` | `autofix.py` (publish job) | bingxche's PAT for branches, dispatches and draft PRs on sglang; the workflow passes the runners' `GH_PAT` |

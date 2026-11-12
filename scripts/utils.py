@@ -1553,7 +1553,9 @@ def _find_agent_file(name: str) -> Path | None:
 class AgentTask:
     doc: str          # methodology file under agent/tasks/
     model: str = ""   # "" = the runner's default (ANTHROPIC_MODEL)
-    effort: str = ""  # --effort level; "" = the CLI's default
+    # --effort level. xhigh for every task (user's choice, 2026-11-12); without
+    # the flag the CLI uses its own default (high).
+    effort: str = "xhigh"
     # Model and effort are fixed: AGENT_MODEL_<TASK> cannot change them, and a
     # model the gateway does not serve fails the task (ModelUnavailable)
     # instead of falling back to the default model.
@@ -1809,7 +1811,7 @@ def analyze_job_with_agent(
         prompt=prompt,
         work_dir=repo_path,
         max_turns=int(os.environ.get("AGENT_MAX_TURNS", "1000")),
-        timeout_secs=int(os.environ.get("AGENT_TIMEOUT_SECS", "1800")),
+        timeout_secs=int(os.environ.get("AGENT_TIMEOUT_SECS", "2400")),
     )
     _log.info("  [%s] Agent analysis done.", job_name)
 
@@ -1980,7 +1982,7 @@ def cross_job_analysis(
     analyses is too shallow to publish, so callers keep the last good one.
 
     Env vars (agent mode):
-      - CROSS_JOB_TIMEOUT_SECS (default 1200) — a busy pr-test-amd day has
+      - CROSS_JOB_TIMEOUT_SECS (default 1800) — a busy pr-test-amd day has
         60+ analyses of ~20 KB each; 300 s timed out on every tick.
       - CROSS_JOB_MAX_TURNS (default 100)
     """
@@ -2012,7 +2014,7 @@ def cross_job_analysis(
             work_dir=work_dir,
             context_files={"per-job-analyses.md": jobs_text},
             max_turns=int(os.environ.get("CROSS_JOB_MAX_TURNS", "100")),
-            timeout_secs=int(os.environ.get("CROSS_JOB_TIMEOUT_SECS", "1200")),
+            timeout_secs=int(os.environ.get("CROSS_JOB_TIMEOUT_SECS", "1800")),
         )
 
     if client is None:
