@@ -1,10 +1,11 @@
 """Which problems of the daily report ci-autofix tries, and when.
 
 ``build_plan()`` runs the checks (scheduled failure on main, fails for sure,
-not infrastructure, a dispatch recipe, no fix PR) and returns what an attempt
+not infrastructure, a dispatch recipe, no fix PR but a stalled one) and returns what an attempt
 needs; ``plan_hour()`` starts at most ``AUTOFIX_MAX_PER_HOUR`` problems per
 hour and queues the rest."""
 
+import itertools
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from autofix_ci import (
+    GPU_MEMORY,
     Recipe,
     classify_infra,
     crusoe_recipe_for,
@@ -21,11 +23,23 @@ from autofix_ci import (
     is_perf,
     job_family,
     job_label,
+    ran_first,
     recipe_for,
+    run_history,
+    same_job,
     test_outcome,
 )
-from autofix_config import AUTOFIX_WORKFLOWS, HISTORY_RUNS, HISTORY_SCAN, NOT_FIXED, SPUR_GPU
+from autofix_config import (
+    AUTOFIX_WORKFLOWS,
+    BRANCH_PREFIX,
+    FIX_PR_STALE_HOURS,
+    HISTORY_RUNS,
+    HISTORY_SCAN,
+    NOT_FIXED,
+    SPUR_GPU,
+)
 from autofix_github import GitHub
+from autofix_pr import PR_MARKER
 from daily_cross_workflow_summary import (
     _cluster_ids,
     collect_workflow_analyses,
@@ -54,7 +68,7 @@ def take_for_this_hour(
 
 
 _HEADING_ID_RE = re.compile(r"<!--\s*(R\d+(?:\s*·\s*R\d+)*)\s*-->")
-_FIX_LINK_RE = re.compile(r"\*\*In-flight fix\*\*:\s*✅\s*\[#(\d+)\]")
+_FIX_LINK_RE = re.compile(r"\*\*In-flight fix\*\*:\s*✅\s*\[#(\d+)\](?:\(([^)\s]*)\))?")
 
 
 def problem_sections(summary: str) -> dict[str, dict]:
@@ -97,8 +111,13 @@ def problem_sections(summary: str) -> dict[str, dict]:
             out[current[0]]["text"].append(s)
         m = _FIX_LINK_RE.search(s)
         if m and len(current) == 1:
-            out.setdefault(current[0], {"name": current[0], "fix": False, "fix_pr": None, "named": False, "text": []})
-            out[current[0]]["fix_pr"] = int(m.group(1))
+            entry = out.setdefault(current[0], {"name": current[0], "fix": False, "fix_pr": None, "named": False,
+                                                "text": []})
+            # A fix in another repo (AITER, Miles) is a fix, but its number is not an sglang PR.
+            if m.group(2) and "github.com/sgl-project/sglang/pull/" not in m.group(2):
+                entry["elsewhere"] = True
+            else:
+                entry["fix_pr"] = int(m.group(1))
     return out
 
 
@@ -110,6 +129,7 @@ class Problem:
     suspect: dict | None = None
     fix_pr: int | None = None
     report_fix: bool = False
+    fix_elsewhere: bool = False      # the report's fix is a PR in another repo (AITER, Miles)
     # The failing tests that are this problem's (``own_tests()``); a job's other failures are not.
     tests: list[tuple[str, str]] = field(default_factory=list)
 
@@ -135,6 +155,7 @@ def load_problems(token: str, bot_repo: str, issue_num: int) -> list[Problem]:
             pid, section.get("name") or pid, jobs, suspect,
             fix_pr=(suspect or {}).get("fix_pr") or section.get("fix_pr"),
             report_fix=section.get("fix", False),
+            fix_elsewhere=section.get("elsewhere", False),
             tests=own_tests(jobs, "\n".join(section.get("text") or []),
                             exclusive=all(membership[j["job_id"]] == 1 for j in jobs)),
         ))
@@ -217,6 +238,10 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
     files = {f for f, _ in tests}
     errors = [r["error"] for r in deterministic_rows("", jobs) if r["test_file"].strip("` ") in files]
     infra = classify_infra(errors)
+    # A server an earlier test of the job leaked looks the same: only a job whose first test
+    # file failed this way found the GPUs taken before it started.
+    if infra == GPU_MEMORY and not all(ran_first(gh.job_log(j["job_id"]), files) for j in jobs):
+        infra = None
     if infra:
         return None, f"infrastructure ({infra})"
     if is_perf([j["job_name"] for j in jobs], errors):
@@ -239,43 +264,55 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
     if set(tests) - covered:
         return None, "its tests failed in jobs no single dispatch can re-run"
 
-    if p.fix_pr or p.report_fix:
-        return None, f"the report shows a fix PR{f' (#{p.fix_pr})' if p.fix_pr else ''}"
+    if p.fix_elsewhere:
+        return None, "the report shows a fix in another repo"
+    # A report fix PR that cannot be read is taken at the report's word.
+    report_pr = gh.pull(p.fix_pr) if p.fix_pr else None
+    if p.fix_pr and (report_pr is None or blocks_now(report_pr, now)):
+        return None, f"the report shows a fix PR (#{p.fix_pr})"
+    if p.report_fix and not p.fix_pr:
+        return None, "the report shows a fix PR"
 
-    # History: each job of the group, newest scheduled runs first.
-    first_fail = last_pass = None
-    streak = 0
+    # History: one job per family (each ROCm version) of the dispatch's workflow, the dispatch
+    # group's first, newest scheduled runs first.
+    workflow = group_jobs[0]["workflow"]
+    dispatched = {job_family(j["job_name"]) for j in group_jobs}
+    newest = sorted((j for j in jobs if j["workflow"] == workflow), key=lambda j: j["run"]["created_at"], reverse=True)
     by_family: dict[str, dict] = {}
-    for j in sorted(group_jobs, key=lambda j: j["run"]["created_at"], reverse=True):
+    for j in sorted(newest, key=lambda j: job_family(j["job_name"]) not in dispatched):
         by_family.setdefault(job_family(j["job_name"]), j)
-    for fam, j in list(by_family.items())[:4]:
+    histories: list[tuple[list, list]] = []  # (the problem's tests in the job, its statuses)
+    for j in list(by_family.values())[:4]:
         job_tests = [t for t in problem_tests([j]) if t in own]
-        if not job_tests:
-            continue
-        statuses: list[tuple[str, dict]] = []
-        for run in gh.scheduled_runs(j["workflow"])[:HISTORY_SCAN]:
-            if len(statuses) >= HISTORY_RUNS:
-                break
-            match = next((x for x in gh.jobs(run["id"]) if x["name"] == j["job_name"]), None)
-            if not match or match.get("conclusion") in (None, "skipped", "cancelled"):
-                continue
-            if match["conclusion"] == "success":
-                status = "passed"
-            else:
-                outs = [test_outcome(gh.job_log(match["id"]), f, fn) for f, fn in job_tests]
-                status = "failed" if outs and all(o.status == "failed" for o in outs) else "other"
-            statuses.append((status, {"run_id": run["id"], "run_url": run["html_url"], "sha": run["head_sha"],
-                                      "date": run["created_at"][:10], "at": run["created_at"],
-                                      "job_url": match["html_url"]}))
-            if status != "failed":
-                break
-        if not fails_for_sure([s for s, _ in statuses]):
-            return None, (f"not failing for sure: `{job_label(j['job_name'])}` was "
-                          + ", ".join(s for s, _ in statuses[:3]) + " in its latest scheduled runs")
-        ff, lp, n = failure_window(statuses)
-        if ff and (first_fail is None or ff["date"] < first_fail["date"]):
-            first_fail, last_pass, streak = ff, lp, n
+        if job_tests:
+            histories.append((job_tests, job_history(gh, workflow, j, job_tests)))
+    history = run_history([statuses for _, statuses in histories])
+    if not fails_for_sure([s for s, _ in history]):
+        seen = ", ".join(f"{s} (`{r['job']}`)" for s, r in history[:3]) or "none"
+        return None, f"not failing for sure: its latest scheduled runs were {seen}"
+    # The runs failing in a row; every test must have failed in two of them, not one each.
+    failing = {r["run_id"] for _, r in itertools.takewhile(lambda x: x[0] == "failed", history)}
+    for t in tests:
+        runs = {r["run_id"] for job_tests, statuses in histories if t in job_tests
+                for s, r in statuses if s == "failed" and r["run_id"] in failing}
+        if len(runs) < 2:
+            return None, f"not failing for sure: `{t[1]}` failed in {len(runs)} of its latest runs"
+    # The failure window is each job's own: the earliest first failure is where it broke.
+    first_fail = last_pass = None
+    for _, statuses in histories:
+        ff, lp, _ = failure_window(statuses)
+        if ff and (first_fail is None or ff["at"] < first_fail["at"]):
+            first_fail, last_pass = ff, lp
+    streak = len(failing)
 
+    # An old open report fix PR is stalled only if it was open while the test still passed.
+    passed_at = (last_pass or {}).get("at")
+    stalled = []
+    if report_pr and report_pr.get("state") == "open":
+        if not passed_at or report_pr["created_at"] >= passed_at:
+            return None, (f"the report shows a fix PR (#{p.fix_pr}), "
+                          + ("opened after the test last passed" if passed_at else "and no passing run is known"))
+        stalled.append(p.fix_pr)
     since = (first_fail or {}).get("at") or (now - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
     fix = find_fix_pr(gh, tests, since, exclude={(p.suspect or {}).get("pr")})
     if fix:
@@ -297,6 +334,7 @@ def build_plan(p: Problem, gh: GitHub, workflow_yaml, now: datetime) -> tuple[di
         "failing_since": (first_fail or {}).get("date"),
         "failed_jobs": len(p.jobs),
         "suspect": p.suspect,
+        "stalled_fix_prs": stalled,
     }, ""
 
 
@@ -332,6 +370,55 @@ def plan_recipes(group: list[tuple[Recipe, dict]], workflow_yaml) -> dict:
         # Crusoe and ARC are two pools of one GPU: the check is the GPU, not the runner labels.
         return {"recipe": {**plan_recipe(crusoe), "gpu": SPUR_GPU}, "fallback_recipe": {**arc, "gpu": SPUR_GPU}}
     return {"recipe": arc}
+
+
+def job_history(gh: GitHub, workflow: str, j: dict, job_tests: list) -> list[tuple[str, dict]]:
+    """Job *j*'s status in the latest scheduled runs of *workflow*, newest first, up to its last pass.
+
+    ``failed`` needs every one of *job_tests* to fail in the job's log. Past ``HISTORY_RUNS``
+    failures only the last pass is looked for, so a failed job counts without reading its log:
+    a fix PR is stalled only if it was open while the test still passed, which needs that pass.
+    """
+    statuses: list[tuple[str, dict]] = []
+    for run in gh.scheduled_runs(workflow, running=True)[:HISTORY_SCAN]:
+        # A run may list the job once per runner pool: the one that ran decides.
+        match = next((x for x in gh.jobs(run["id"]) if same_job(x["name"], j["job_name"])
+                      and x.get("conclusion") not in (None, "skipped", "cancelled")), None)
+        if not match:
+            continue
+        entry = {"run_id": run["id"], "run_url": run["html_url"], "sha": run["head_sha"],
+                 "date": run["created_at"][:10], "at": run["created_at"], "job_url": match["html_url"],
+                 "job": job_label(j["job_name"])}
+        if match["conclusion"] == "success":
+            statuses.append(("passed", entry))
+            break
+        if len(statuses) >= HISTORY_RUNS:
+            statuses.append(("failed", entry))
+            continue
+        outs = [test_outcome(gh.job_log(match["id"]), f, fn) for f, fn in job_tests]
+        status = "failed" if outs and all(o.status == "failed" for o in outs) else "other"
+        statuses.append((status, entry))
+        if status != "failed":
+            break
+    return statuses
+
+
+def blocks_now(pr: dict, now: datetime) -> bool:
+    """Whether fix PR *pr* holds autofix back whatever the history says: merged, the bot's own,
+    or open for less than ``FIX_PR_STALE_HOURS``. An older open one is stalled only if it was
+    already open while the test still passed (``build_plan()``): the fix rides in a change made
+    for something else, like #48701 for R427. A fix opened after the break waits for its review
+    however long that takes (#46945 for R332)."""
+    if pr.get("merged_at"):
+        return True
+    if pr.get("state") != "open":
+        return False
+    # The bot's drafts stay open until people act on them: never a reason to try again.
+    if PR_MARKER.split("{")[0] in (pr.get("body") or "") \
+            or ((pr.get("head") or {}).get("ref") or "").startswith(BRANCH_PREFIX):
+        return True
+    opened = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
+    return now - opened < timedelta(hours=FIX_PR_STALE_HOURS)
 
 
 def find_fix_pr(gh: GitHub, tests: list[tuple[str, str]], since: str, exclude=frozenset()) -> int | None:

@@ -56,6 +56,30 @@ def job_family(name: str) -> str:
     return f"{j.base}|{j.rocm}"
 
 
+_RUNNER_LABEL_RE = re.compile(r"linux-[\w.-]+")
+
+
+def _runner_gpu(label: str) -> tuple[str, str | None]:
+    """``linux-mi35x-gpu-1`` → (``mi35x``, ``1``); a label naming no GPU count gives None for it."""
+    arch = re.search(r"mi\d+x?", label)
+    count = re.search(r"(\d+)-?gpu|gpu-(\d+)", label)
+    return (arch.group() if arch else label), (next(g for g in count.groups() if g) if count else None)
+
+
+def same_job(a: str, b: str) -> bool:
+    """Two names of one job that may have run on different pools of one GPU: ``x (rocm10, linux-mi35x-gpu-1)``
+    is ``x (rocm10, linux-sglang-mi35x-spur)``. GPUs, GPU counts (when both labels name one),
+    partitions, parts and ROCm versions still differ."""
+    ra, rb = _RUNNER_LABEL_RE.findall(a or ""), _RUNNER_LABEL_RE.findall(b or "")
+    if _RUNNER_LABEL_RE.sub("", a or "") != _RUNNER_LABEL_RE.sub("", b or "") or len(ra) != len(rb):
+        return False
+    for x, y in zip(ra, rb):
+        (gx, cx), (gy, cy) = _runner_gpu(x), _runner_gpu(y)
+        if gx != gy or (cx and cy and cx != cy):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class Recipe:
     workflow: str        # workflow file to dispatch
@@ -138,6 +162,7 @@ def dispatch_inputs(recipes: list[Recipe]) -> dict:
     return inputs
 
 
+GPU_MEMORY = "GPU memory taken before the job"
 # (kind, pattern): errors that are infrastructure, for people to handle.
 INFRA_PATTERNS = (
     ("runner lost", r"lost communication with the server|runner has received a shutdown signal"),
@@ -155,6 +180,15 @@ INFRA_PATTERNS = (
     ("image pull or build",
      r"failed to (?:pull|resolve) image|manifest unknown|toomanyrequests|pull access denied"
      r"|Error response from daemon|ERROR: failed to solve"),
+    # sglang's startup check: other processes already hold most of a GPU's memory (R422, R425).
+    # A server an earlier test of the job leaked trips it too: build_plan() counts it only
+    # when the failing file was the job's first (``ran_first()``).
+    (GPU_MEMORY, r"memory capacity is unbalanced"),
+    # A system binary loads a library the image shadows, e.g. ffmpeg picking up torch's
+    # libtinfo (R207); the fix is in docker/, which autofix may not change. The analyses
+    # retype quotes, so the GLIBC one allows any.
+    ("image library conflict",
+     r"undefined symbol: _nc_\w+|version\W{1,3}GLIBC(?:XX)?_[\d.]+\W{1,3}not found"),
 )
 _INFRA_RES = tuple((kind, re.compile(p, re.IGNORECASE)) for kind, p in INFRA_PATTERNS)
 PERF_RE = re.compile(
@@ -364,6 +398,13 @@ def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
     return Outcome("unknown", retried, note=f"no result for {test_func} in the log", ran_file=ran)
 
 
+def ran_first(raw_log: str, files) -> bool:
+    """Whether the job's first test file is one of *files*, so no earlier test of the job could have
+    left a server holding the GPUs. A log with no run_suite files (one test, or none read) counts."""
+    segments = [s for s in file_segments(clean_log(raw_log)) if s.file]
+    return not segments or any(same_file(segments[0].file, f) for f in files)
+
+
 def unrelated_failures(raw_log: str, tests: list[tuple[str, str]]) -> list[str]:
     """Files that failed in the job other than the problem's own."""
     failed = []
@@ -385,6 +426,22 @@ def segment_text(raw_log: str, test_file: str, max_lines: int = 300) -> str:
 def fails_for_sure(history: list[str]) -> bool:
     """*history*: the test's status in the latest completed scheduled runs, newest first."""
     return len(history) >= 2 and history[0] == "failed" and history[1] == "failed"
+
+
+def run_history(histories: list[list[tuple[str, dict]]]) -> list[tuple[str, dict]]:
+    """One history out of several jobs' (one per family, e.g. rocm10 and rocm720), newest run first.
+
+    Each family runs only in some scheduled runs (PR Test runs rocm720 once a day), so two
+    failed runs of any of the problem's jobs make it sure, as long as no later run of another
+    passed. A run where its jobs disagree counts as its first status that is not ``failed``.
+    """
+    runs: dict = {}
+    for history in histories:
+        for status, run in history:
+            prev = runs.get(run["run_id"])
+            if prev is None or (prev[0] == "failed" and status != "failed"):
+                runs[run["run_id"]] = (status, run)
+    return sorted(runs.values(), key=lambda x: x[1]["at"], reverse=True)
 
 
 def failure_window(history: list[tuple[str, dict]]) -> tuple[dict | None, dict | None, int]:
