@@ -42,6 +42,8 @@ from utils import REPO, gh_headers
 ROOT = Path(__file__).resolve().parent.parent
 CASES_DIR = ROOT / "evals" / "ci_status" / "cases"
 SELECTION_CASES_DIR = ROOT / "evals" / "test_selection" / "cases"
+# One replay: the agent may take CI_STATUS_AGENT_TIMEOUT (2400 s), plus evidence collection.
+CASE_TIMEOUT_SECS = int(os.environ.get("EVAL_CASE_TIMEOUT_SECS", "4200"))
 # Timestamps in what a tool returned (gh JSON, git log) that date the content itself.
 # updated_at is left out: fetching an old object today still shows a recent update.
 _DATED_FIELD_RE = re.compile(
@@ -132,9 +134,14 @@ def run_missing(cases: list[dict], runs_dir: Path, parallel: int = 1, marker: st
             env["AGENT_WORKSPACE"] = str(runs_dir / ".workspaces" / case["id"])
         print(f"Running ci-status for {case['id']}...", flush=True)
         with open(runs_dir / f"{case['id']}.log", "w") as log:
-            subprocess.run([sys.executable, str(ROOT / "scripts" / "check_ci_for_pr.py"), str(case["pr"]),
-                            "--no-post", "--head-sha", case["head_sha"], "--as-of", case["as_of"],
-                            "--out-dir", str(artifact)], check=False, env=env, stdout=log, stderr=subprocess.STDOUT)
+            try:
+                subprocess.run([sys.executable, "-u", str(ROOT / "scripts" / "check_ci_for_pr.py"), str(case["pr"]),
+                                "--no-post", "--head-sha", case["head_sha"], "--as-of", case["as_of"],
+                                "--out-dir", str(artifact)], check=False, env=env, stdout=log,
+                               stderr=subprocess.STDOUT, timeout=CASE_TIMEOUT_SECS)
+            except subprocess.TimeoutExpired:
+                # A hung GitHub request once kept a case running for hours; the case stays missing.
+                log.write(f"\neval: case timed out after {CASE_TIMEOUT_SECS} s\n")
 
     runs_dir.mkdir(parents=True, exist_ok=True)
     todo = [c for c in cases if not (runs_dir / c["id"] / marker).exists()]

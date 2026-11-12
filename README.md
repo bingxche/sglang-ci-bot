@@ -646,6 +646,7 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 | `SGLANG_CI_TOKEN` | `coverage-audit.yml` | ROCm/sglang-ci token, in place of `GH_PAT` |
 | `COMMENT_AUTHOR` | review, CI status | Set by the watcher; shown as "requested by" |
 | `PR_BODY` | `check_pr_rules.py` | The PR description, passed by `pr-checks.yml` (or `--body-file`) |
+| `EVAL_CASE_TIMEOUT_SECS` | `eval_ci_status.py --run-missing` | Time limit for one replayed case (4200 s); a case over it is left unscored |
 | `VALIDATE_*` | `validate_live.py` | See [Testing and validating a change](#testing-and-validating-a-change) |
 
 ### Repository layout

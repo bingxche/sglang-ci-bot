@@ -47,6 +47,25 @@ def _tool_result(text: str, ts: str = "2026-11-01T00:00:10Z") -> dict:
             "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": text}]}}
 
 
+class TestRunMissing(unittest.TestCase):
+    def test_a_hung_case_is_stopped_and_the_rest_still_run(self):
+        from unittest import mock
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd[3], kwargs["timeout"]))
+            if cmd[3] == "1":
+                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+            return subprocess.CompletedProcess(cmd, 0)
+
+        cases = [{"id": f"c{n}", "pr": n, "head_sha": "h", "as_of": "t"} for n in (1, 2)]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(ev.subprocess, "run", side_effect=fake_run):
+            ev.run_missing(cases, Path(tmp), marker="selection.json")
+            log = (Path(tmp) / "c1.log").read_text()
+        self.assertEqual(calls, [("1", ev.CASE_TIMEOUT_SECS), ("2", ev.CASE_TIMEOUT_SECS)])
+        self.assertIn("timed out", log)
+
+
 class TestSelectionScore(unittest.TestCase):
     AS_OF = "2026-11-01T00:00:00Z"
 
