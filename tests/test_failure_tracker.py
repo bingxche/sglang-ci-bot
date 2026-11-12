@@ -116,11 +116,13 @@ class MergeStateTest(unittest.TestCase):
         self.assertEqual(ft.classify(e, "2026-11-13"), "intermittent")
         self.assertEqual(ft.classify(e, "2026-11-14"), "quiet")
 
-    def test_fix_pr_is_kept_until_a_new_one_is_found(self):
+    def test_fix_pr_is_kept_until_the_analysis_says_none(self):
         state = _state()
         ft.merge_state(state, [_row("t/a.py", "f", fix_pr="[#1](u)")], "2026-11-10", "")
         ft.merge_state(state, [_row("t/a.py", "f")], "2026-11-11", "")
         self.assertEqual(state["active"]["t/a.py::f"]["fix_pr"], "[#1](u)")
+        ft.merge_state(state, [_row("t/a.py", "f", fix_pr="")], "2026-11-12", "")
+        self.assertEqual(state["active"]["t/a.py::f"]["fix_pr"], "")
 
     def test_archived_failure_comes_back_with_its_id(self):
         state = _state(archive=[["A4", "t/a.py::f", "2026-08-01", "2026-09-01", 5, "old"]])
@@ -162,7 +164,17 @@ class FixPrsByJobTest(unittest.TestCase):
         self.assertEqual(ft.fix_prs_by_job(analyses), {
             "1": "[#49711](https://github.com/sgl-project/sglang/pull/49711)",
             "2": "[radixark/miles#4803](https://github.com/radixark/miles/pull/4803)",
+            "3": "",
         })
+
+
+class TruncateTest(unittest.TestCase):
+    def test_cut_never_leaves_a_backslash_before_the_cell_pipe(self):
+        text = "a" * 108 + "| tail"
+        out = ft._one_line(text)
+        self.assertFalse(out[:-1].endswith("\\"), out[-5:])
+        entry = _entry("a", TODAY, TODAY, error="b" * 78 + "\| tail")
+        self.assertFalse(ft._archive_row(entry)[5][:-1].endswith("\\"))
 
 
 class RenderTest(unittest.TestCase):

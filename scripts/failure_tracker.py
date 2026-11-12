@@ -323,7 +323,9 @@ def _absorb(active: dict, entry: dict) -> None:
     else:
         newer, older = old, entry
     merged = {**older, **newer}
-    merged["first_seen"] = min(old.get("first_seen") or "9", entry.get("first_seen") or "9")
+    firsts = [d for d in (old.get("first_seen"), entry.get("first_seen")) if d]
+    if firsts:
+        merged["first_seen"] = min(firsts)
     merged["seen_days"] = max(old.get("seen_days", 1), entry.get("seen_days", 1))
     ids = [i for i in (old.get("id"), entry.get("id")) if i]
     if ids:
@@ -397,7 +399,7 @@ def merge_state(state: dict, rows: list[dict], today: str, detail_base: str) -> 
             "job_id": job_id,
             "detail_url": f"{detail_base}{job_id}" if detail_base and job_id else "",
         }
-        if r.get("fix_pr"):
+        if "fix_pr" in r:  # "" = the analysis found none
             latest["fix_pr"] = r["fix_pr"]
         e = active.get(key)
         if e is None:
@@ -423,7 +425,7 @@ def _archive_row(entry: dict) -> list:
     key = f"{entry.get('test_file', '')}::{entry.get('test_function', '')}"
     err = entry.get("error") or "—"
     if len(err) > 80:
-        err = err[:79].rstrip() + "…"
+        err = _truncate(err, 80)
     return [entry.get("id", ""), key, entry.get("first_seen", ""),
             entry.get("last_seen", ""), entry.get("seen_days", 1), err]
 
@@ -451,13 +453,25 @@ _FIX_RE = re.compile(
 )
 
 
+_NO_FIX_RE = re.compile(r"In-flight fix:[*\s]*❌")
+
+
 def fix_prs_by_job(analyses: list[dict]) -> dict[str, str]:
-    """Map job ID → the in-flight fix PR its daily analysis found, as a link."""
+    """Map job ID → the in-flight fix PR its daily analysis found, as a link.
+
+    A job whose analysis says ``In-flight fix: ❌`` maps to "", which clears
+    an earlier fix PR; a job that says nothing is left out.
+    """
     out: dict[str, str] = {}
     for ja in analyses:
-        m = _FIX_RE.search(ja.get("analysis") or "")
-        if m and ja.get("job_id"):
+        if not ja.get("job_id"):
+            continue
+        text = ja.get("analysis") or ""
+        m = _FIX_RE.search(text)
+        if m:
             out[str(ja["job_id"])] = f"[{m.group(1)}]({m.group(2)})"
+        elif _NO_FIX_RE.search(text):
+            out[str(ja["job_id"])] = ""
     return out
 
 
@@ -468,8 +482,13 @@ def fix_prs_by_job(analyses: list[dict]) -> dict[str, str]:
 def _one_line(text: str, limit: int = 110) -> str:
     flat = " ".join((text or "").split()).replace("|", "\\|")
     if len(flat) > limit:
-        flat = flat[: limit - 1].rstrip() + "…"
+        flat = _truncate(flat, limit)
     return flat or "—"
+
+
+def _truncate(text: str, limit: int) -> str:
+    # A cut inside an escaped "|" would leave a backslash escaping the cell pipe.
+    return text[: limit - 1].rstrip().rstrip("\\") + "…"
 
 
 def _cell(text: str) -> str:
@@ -956,7 +975,7 @@ def update_trackers(
         fixes = fix_prs_by_job(wf_analyses.get(wf, []))
         for r in wf_rows:
             fix = fixes.get(str(r.get("job_id")))
-            if fix:
+            if fix is not None:
                 r["fix_pr"] = fix
 
     results: dict[str, int | None] = {}
