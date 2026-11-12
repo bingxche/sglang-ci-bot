@@ -16,10 +16,9 @@ A runs directory holds one ci-status artifact per case (written by
 
 ``--selection`` scores the "Suggested extra CI" section instead, against
 ``evals/test_selection/cases/*.json``: per platform, whether the PR needs the
-extra tier (``extra_needed``). A case
-whose agent session read anything dated after the case's ``as_of`` (a later
-comment, run or commit could give the answer away) is reported as leaked and
-not scored.
+extra tier (``extra_needed``). A case whose agent session read anything dated
+after the case's ``as_of`` (a later comment, run or commit could give the
+answer away) is reported as leaked and not scored.
 """
 
 import argparse
