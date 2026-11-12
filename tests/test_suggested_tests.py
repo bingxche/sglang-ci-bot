@@ -47,6 +47,11 @@ class BlockTest(unittest.TestCase):
             "nv": {"extra_needed": True, "reason": "python/sglang/srt/x.py changes HiCache"},
             "amd": {"extra_needed": None, "reason": ""}})  # a non-bool answer counts as not stated
 
+    def test_a_broken_block_never_shows_its_json(self):
+        report = '## CI Status for PR #1\nok\n<!-- test-selection {"nv": {"reason": "a} --> b"}} -->\n'
+        self.assertIsNone(ts.parse_block(report))
+        self.assertEqual(ts.strip_block(report), "## CI Status for PR #1\nok\n")
+
     def test_malformed_blocks_do_not_crash(self):
         for block in (None, {"nv": []}, {"nv": {"extra_needed": 1}}, {"amd": "x"}):
             result = ts.check(block)

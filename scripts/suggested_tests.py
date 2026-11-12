@@ -53,7 +53,10 @@ def parse_block(report: str) -> dict | None:
 
 
 def strip_block(report: str) -> str:
-    return _BLOCK_RE.sub("", report).rstrip() + "\n"
+    # The block is the report's last part. Cut from its start rather than removing a regex match:
+    # a "} -->" inside its text would end the match early and leave the rest of the JSON visible.
+    cut = report.find("<!-- test-selection")
+    return (report[:cut] if cut >= 0 else report).rstrip() + "\n"
 
 
 def _text(value, limit: int = 600) -> str:
