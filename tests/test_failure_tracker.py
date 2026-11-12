@@ -16,13 +16,28 @@ TODAY = "2026-11-12"
 DAILY = "https://github.com/bingxche/sglang-ci-bot/issues/287"
 
 
-def _entry(name, first, last, error="AssertionError"):
-    return {
+def _entry(name, first, last, error="AssertionError", **extra):
+    e = {
         "test_file": f"test/{name}.py", "test_function": "test_x",
-        "cluster": "", "error": error, "status": "", "job_url": "",
-        "job_id": None, "detail_url": "", "run_started_at": "",
-        "first_seen": first, "last_seen": last,
+        "cluster": "", "error": error, "job_url": "", "job_id": None,
+        "detail_url": "", "first_seen": first, "last_seen": last,
+        "seen_days": 1, "streak_start": last,
     }
+    e.update(extra)
+    return e
+
+
+def _state(*entries, archive=()):
+    state = ft.upgrade_state({"version": ft.STATE_VERSION, "next_id": 1, "active": {}, "archive": []})
+    for e in entries:
+        e.setdefault("id", ft._next_id(state))
+        state["active"][f"{e['test_file']}::{e['test_function']}"] = e
+    state["archive"] = [list(a) for a in archive]
+    return state
+
+
+def _row(tf, fn, **extra):
+    return {"workflow": WF, "test_file": tf, "test_function": fn, "error": "boom", **extra}
 
 
 def _resp(payload):
@@ -32,54 +47,186 @@ def _resp(payload):
     return r
 
 
-class PruneStateTest(unittest.TestCase):
-    def test_drops_only_entries_quiet_past_retention(self):
-        state = {
-            "failing": _entry("failing", "2026-08-01", TODAY),
-            "edge": _entry("edge", "2026-10-01", "2026-10-13"),  # 30 days quiet
-            "old": _entry("old", "2026-09-01", "2026-10-12"),    # 31 days quiet
-            "bad": _entry("bad", "?", "not-a-date"),
+class CanonicalTestTest(unittest.TestCase):
+    def test_variants_of_one_test_share_a_key(self):
+        # Seen in sgl-project/sglang#45847: one failure, several rows.
+        variants = [
+            ("`t/a.py`", "TestA::test_b[x]"),
+            ("./t/a.py", "TestA.test_b[x]"),
+            ("t/a.py", "`TestA.test_b[x]` (most likely; rank 0 did not name it)"),
+        ]
+        self.assertEqual({ft.canonical_test(*v) for v in variants}, {("t/a.py", "TestA.test_b[x]")})
+
+    def test_placeholders_name_no_function(self):
+        for fn in ("N/A", "N/A (module import)", "unknown (likely test_x[17])",
+                   "unidentified (likely x)", "—", ""):
+            self.assertEqual(ft.canonical_test("t/a.py", fn), ("t/a.py", ""), fn)
+        self.assertEqual(ft.canonical_test("t/a.py", "none_left")[1], "none_left")
+
+
+class UpgradeStateTest(unittest.TestCase):
+    def test_version_1_is_rekeyed_merged_and_numbered(self):
+        v1 = {
+            "t/a.py::TestA::test_b": _entry("x", "2026-10-22", "2026-10-23",
+                                            test_file="t/a.py", test_function="TestA::test_b"),
+            "t/a.py::TestA.test_b": _entry("x", "2026-10-24", "2026-10-25", error="newer",
+                                           test_file="t/a.py", test_function="TestA.test_b"),
+            "t/c.py::N/A": _entry("x", "2026-10-21", "2026-10-21",
+                                  test_file="t/c.py", test_function="N/A"),
         }
-        self.assertEqual(ft.prune_state(state, TODAY, 30), 1)
-        self.assertEqual(sorted(state), ["bad", "edge", "failing"])
+        for e in v1.values():
+            del e["seen_days"], e["streak_start"]
+        state = ft.upgrade_state(v1)
+        self.assertEqual(sorted(state["active"]), ["t/a.py::TestA.test_b", "t/c.py::"])
+        merged = state["active"]["t/a.py::TestA.test_b"]
+        self.assertEqual((merged["first_seen"], merged["last_seen"], merged["error"]),
+                         ("2026-10-22", "2026-10-25", "newer"))
+        # IDs follow first_seen and are never handed out twice.
+        self.assertEqual(state["active"]["t/c.py::"]["id"], "A1")
+        self.assertEqual(merged["id"], "A2")
+        self.assertEqual(state["next_id"], 3)
+
+    def test_round_trip_through_the_body(self):
+        state = _state(_entry("a", "2026-11-01", TODAY),
+                       archive=[["A9", "t/z.py::", "2026-09-01", "2026-09-02", 2, "e"]])
+        body = ft.render_body(WF, "PR Test (AMD)", state, SNAPSHOT, DAILY)
+        self.assertEqual(ft.load_state(body), state)
+
+    def test_comment_closer_in_text_cannot_break_the_blob(self):
+        state = _state(_entry("a", TODAY, TODAY, error="x --> y"))
+        body = ft.render_body(WF, "PR Test (AMD)", state, SNAPSHOT, DAILY)
+        self.assertEqual(ft.load_state(body)["active"], state["active"])
+
+
+class MergeStateTest(unittest.TestCase):
+    def test_days_streak_and_classification(self):
+        state = _state()
+        rows = [_row("t/a.py", "test_a")]
+        ft.merge_state(state, rows, "2026-11-10", "")
+        e = state["active"]["t/a.py::test_a"]
+        self.assertEqual((e["id"], e["seen_days"]), ("A1", 1))
+        self.assertEqual(ft.classify(e, "2026-11-10"), "new")
+        ft.merge_state(state, rows, "2026-11-10", "")  # hourly tick, same day
+        ft.merge_state(state, rows, "2026-11-11", "")
+        self.assertEqual(e["seen_days"], 2)
+        self.assertEqual(ft.classify(e, "2026-11-11"), "broken")
+        ft.merge_state(state, rows, "2026-11-13", "")  # skipped a day
+        self.assertEqual((e["seen_days"], e["streak_start"], e["first_seen"]),
+                         (3, "2026-11-13", "2026-11-10"))
+        self.assertEqual(ft.classify(e, "2026-11-13"), "intermittent")
+        self.assertEqual(ft.classify(e, "2026-11-14"), "quiet")
+
+    def test_fix_pr_is_kept_until_a_new_one_is_found(self):
+        state = _state()
+        ft.merge_state(state, [_row("t/a.py", "f", fix_pr="[#1](u)")], "2026-11-10", "")
+        ft.merge_state(state, [_row("t/a.py", "f")], "2026-11-11", "")
+        self.assertEqual(state["active"]["t/a.py::f"]["fix_pr"], "[#1](u)")
+
+    def test_archived_failure_comes_back_with_its_id(self):
+        state = _state(archive=[["A4", "t/a.py::f", "2026-08-01", "2026-09-01", 5, "old"]])
+        state["next_id"] = 9
+        ft.merge_state(state, [_row("t/a.py", "f")], TODAY, "")
+        e = state["active"]["t/a.py::f"]
+        self.assertEqual((e["id"], e["first_seen"], e["back_from"], e["seen_days"]),
+                         ("A4", TODAY, "2026-09-01", 1))
+        self.assertEqual(state["archive"], [])
+        self.assertEqual(state["next_id"], 9)
+        self.assertEqual(ft.classify(e, TODAY), "intermittent")
+
+
+class ArchiveQuietTest(unittest.TestCase):
+    def test_archives_quiet_past_retention_and_drops_old_archive(self):
+        state = _state(
+            _entry("failing", "2026-08-01", TODAY),
+            _entry("edge", "2026-10-01", "2026-10-13"),  # 30 days quiet: stays
+            _entry("old", "2026-09-01", "2026-10-12"),   # 31 days quiet: archived
+            _entry("bad", "?", "not-a-date"),
+            archive=[["A50", "t/gone.py::", "2026-01-01", "2026-05-01", 1, "e"]],  # > 180 days
+        )
+        self.assertEqual(ft.archive_quiet(state, TODAY, 30), (1, 1))
+        self.assertEqual(sorted(state["active"]), ["test/bad.py::test_x", "test/edge.py::test_x",
+                                                   "test/failing.py::test_x"])
+        self.assertEqual([a[1] for a in state["archive"]], ["test/old.py::test_x"])
         # A failure still red keeps its original first_seen.
-        self.assertEqual(state["failing"]["first_seen"], "2026-08-01")
+        self.assertEqual(state["active"]["test/failing.py::test_x"]["first_seen"], "2026-08-01")
+
+
+class FixPrsByJobTest(unittest.TestCase):
+    def test_reads_the_in_flight_fix_line_in_its_variants(self):
+        analyses = [
+            {"job_id": 1, "analysis": "- In-flight fix: ✅ [#49711](https://github.com/sgl-project/sglang/pull/49711) (open)"},
+            {"job_id": 2, "analysis": "**In-flight fix:** ✅ [radixark/miles#4803](https://github.com/radixark/miles/pull/4803)"},
+            {"job_id": 3, "analysis": "In-flight fix: ❌ none found"},
+            {"job_id": 4, "analysis": "In-flight fix: ✅ landed upstream"},
+        ]
+        self.assertEqual(ft.fix_prs_by_job(analyses), {
+            "1": "[#49711](https://github.com/sgl-project/sglang/pull/49711)",
+            "2": "[radixark/miles#4803](https://github.com/radixark/miles/pull/4803)",
+        })
+
+
+class RenderTest(unittest.TestCase):
+    def test_summary_line_and_archive_section(self):
+        state = _state(
+            _entry("broken", "2026-11-01", TODAY, streak_start="2026-11-10", seen_days=5),
+            _entry("new", TODAY, TODAY),
+            _entry("quiet", "2026-11-01", "2026-11-05"),
+            archive=[["A9", "t/z.py::f", "2026-09-01", "2026-09-02", 2, "old error"]],
+        )
+        body = ft.render_body(WF, "PR Test (AMD)", state, SNAPSHOT, DAILY)
+        self.assertIn("**1 broken · 0 intermittent · 1 new · 1 quiet · 1 archived**", body)
+        self.assertIn("🔴 broken 3d", body)
+        self.assertIn("| A9 | `t/z.py::f` | 2026-09-01 | 2026-09-02 | 2/2d | old error |", body)
+        failing = body.split("## Currently failing")[1].split("<details>")[0]
+        self.assertLess(failing.index("broken.py"), failing.index("new.py"))
 
 
 class RenderBoundedBodyTest(unittest.TestCase):
-    def _state(self, n_quiet):
-        state = {"failing": _entry("failing", "2026-11-01", TODAY)}
-        for i in range(n_quiet):
-            state[f"q{i}"] = _entry(f"q{i:03d}", "2026-11-01", f"2026-11-{1 + i % 10:02d}", "E" * 100)
-        return state
+    def _state(self, n_quiet, n_archive=0):
+        quiet = [
+            _entry(f"q{i:03d}", "2026-11-01", f"2026-11-{1 + i % 10:02d}", "E" * 100)
+            for i in range(n_quiet)
+        ]
+        archive = [
+            [f"A{900 + i}", f"t/a{i}.py::", "2026-09-01", f"2026-09-{1 + i % 20:02d}", 1, "E" * 60]
+            for i in range(n_archive)
+        ]
+        return _state(_entry("failing", "2026-11-01", TODAY), *quiet, archive=archive)
 
     def test_fits_without_dropping(self):
-        state = self._state(3)
+        state = self._state(3, 3)
         body, dropped = ft.render_bounded_body(WF, "PR Test (AMD)", state, SNAPSHOT, DAILY)
         self.assertEqual(dropped, 0)
-        self.assertEqual(len(state), 4)
-        self.assertEqual(ft.load_state(body).keys(), state.keys())
+        self.assertEqual((len(state["active"]), len(state["archive"])), (4, 3))
 
-    def test_drops_oldest_quiet_entries_to_fit(self):
-        state = self._state(40)
-        original = dict(state)
-        full = ft.render_body(WF, "PR Test (AMD)", original, SNAPSHOT, DAILY)
-        budget = len(full.encode("utf-8")) - 3000
+    def test_sheds_oldest_archive_first(self):
+        state = self._state(40, 40)
+        full = len(ft.render_body(WF, "PR Test (AMD)", state, SNAPSHOT, DAILY).encode("utf-8"))
+        archive_last = sorted(a[3] for a in state["archive"])
         body, dropped = ft.render_bounded_body(
-            WF, "PR Test (AMD)", state, SNAPSHOT, DAILY, max_bytes=budget,
+            WF, "PR Test (AMD)", state, SNAPSHOT, DAILY, max_bytes=full - 2000,
         )
+        self.assertLessEqual(len(body.encode("utf-8")), full - 2000)
         self.assertGreater(dropped, 0)
-        self.assertEqual(len(original) - len(state), dropped)
-        self.assertLessEqual(len(body.encode("utf-8")), budget)
-        self.assertIn("failing", state)
-        # Everything left is at least as recent as everything dropped.
-        gone = [original[k]["last_seen"] for k in original if k not in state]
-        kept = [e["last_seen"] for k, e in state.items() if k != "failing"]
-        self.assertLessEqual(max(gone), min(kept))
-        self.assertEqual(ft.load_state(body).keys(), state.keys())
+        self.assertEqual(len(state["active"]), 41)  # the archive alone covered it
+        self.assertLessEqual(archive_last[dropped - 1], min(a[3] for a in state["archive"]))
+
+    def test_then_archives_oldest_quiet(self):
+        state = self._state(40)
+        full = len(ft.render_body(WF, "PR Test (AMD)", state, SNAPSHOT, DAILY).encode("utf-8"))
+        quiet_before = {k: e["last_seen"] for k, e in state["active"].items()}
+        body, _ = ft.render_bounded_body(
+            WF, "PR Test (AMD)", state, SNAPSHOT, DAILY, max_bytes=full - 6000,
+        )
+        self.assertLessEqual(len(body.encode("utf-8")), full - 6000)
+        self.assertIn("test/failing.py::test_x", state["active"])
+        gone = [k for k in quiet_before if k not in state["active"]]
+        self.assertTrue(gone)
+        kept = [e["last_seen"] for e in state["active"].values() if e["last_seen"] != TODAY]
+        self.assertLessEqual(max(quiet_before[k] for k in gone), min(kept))
 
     def test_raises_when_todays_failures_alone_do_not_fit(self):
-        state = {"failing": _entry("failing", "2026-11-01", TODAY)}
+        state = _state(_entry("failing", "2026-11-01", TODAY))
         with self.assertRaises(ValueError):
             ft.render_bounded_body(WF, "PR Test (AMD)", state, SNAPSHOT, DAILY, max_bytes=100)
 
@@ -131,7 +278,7 @@ class UpdateOneWorkflowTest(unittest.TestCase):
                 ft.update_one_workflow("t", WF, CFG, "bingxche/sglang-ci-bot", 287, self.ROWS, SNAPSHOT),
                 45847,
             )
-        self.assertIn("test/a.py::test_a", ft.load_state(captured["sent"]))
+        self.assertIn("test/a.py::test_a", ft.load_state(captured["sent"])["active"])
 
 
 class FindTrackerIssueTest(unittest.TestCase):

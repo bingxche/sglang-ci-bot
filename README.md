@@ -152,7 +152,7 @@ The decisions everything else follows, grouped by what they protect. Each has a 
 | `<!-- ci-monitor-cross-run-summary: <wf> -->` | daily issue | a workflow's cross-run comment |
 | `<!-- ci-monitor-suspect-pr-log -->` | daily issue | every suspect decision this tick, and why |
 | `<!-- amd-bot-suspect-pr:<cluster> -->`, `<!-- amd-bot-suspect-fix:<pr> -->` | sglang PRs | a suspect comment / a fix-review request was posted |
-| `<!-- ci-failure-tracker-state: … -->` | Failure Tracker issue body | `first_seen` / `last_seen` of every failure seen in the last 30 days |
+| `<!-- ci-failure-tracker-state: … -->` | Failure Tracker issue body | version-2 state: ID, `first_seen`, `last_seen`, days seen and streak of each failure seen in the last 30 days, plus a one-line archive of older ones |
 | 🚀 reaction by amd-bot | the `@amd-bot` comment | the command was claimed; no other watcher dispatches it |
 | `<!-- ci-autofix-log -->` with `<!-- ci-autofix-state:v1 … -->` | daily issue | CI autofix's log and state: per problem its attempts, branch, dispatched run and PR; the problems started each hour; who was notified. Carried over from the latest earlier day |
 | `<!-- ci-autofix-queue-notice -->` | daily issue | a notice that @-mentions the owner when problems first wait for their hour |
@@ -308,14 +308,16 @@ Each decision is kept in the monitor state under `auto_rerun`, keyed `<run_id>:<
 
 **Flow** ([`update_trackers()`](scripts/failure_tracker.py), once per tick in `finalize`):
 1. **Find the issue** ([`find_tracker_issue()`](scripts/failure_tracker.py)). It lists the open issues labelled `ci-failure-tracker` and falls back to search only when none matches. Search alone once missed the existing tracker on two ticks in a row (2026-10-22) and created two duplicates. If several open issues match, the oldest one is used and a warning names the others.
-2. **Content.** A small, JSON-only agent task (Failure Tracker Data) reads the same per-job analyses as the daily report. If the agent fails, [`deterministic_rows()`](scripts/failure_tracker.py) parses each analysis's `Failed Tests` table instead.
-3. **State.** [`merge_state()`](scripts/failure_tracker.py) keeps each failure, keyed by test file and function, in a hidden JSON blob in the issue body:
-   - an existing failure keeps its `first_seen` and only updates `last_seen`, so a test that stays red keeps its original "Broken since" date;
-   - a new failure is dated today;
-   - [`prune_state()`](scripts/failure_tracker.py) drops a failure that has not been seen for [`RETENTION_DAYS`](scripts/failure_tracker.py) (30). If it comes back later, it starts again as new.
+2. **Content.** A small, JSON-only agent task (Failure Tracker Data) reads the same per-job analyses as the daily report. If the agent fails, [`deterministic_rows()`](scripts/failure_tracker.py) parses each analysis's `Failed Tests` table instead. Code then adds each row's fix PR: the `In-flight fix: ✅` link in that job's analysis ([`fix_prs_by_job()`](scripts/failure_tracker.py)).
+3. **State.** [`merge_state()`](scripts/failure_tracker.py) keeps each failure in a hidden JSON blob in the issue body:
+   - **Key.** The key is test file plus function, normalized by [`canonical_test()`](scripts/failure_tracker.py). The agent names one test in several ways (`Class::fn` or `Class.fn`, stray backticks, notes such as `(most likely …)`, `N/A (…)`), and each variant used to start a new row with a new "Broken since". On sgl-project/sglang#45847, normalizing merged 195 keys into 158.
+   - **ID.** Each failure gets an ID (`A12`) that is never reused, so a PR can cite it.
+   - **Dates.** An existing failure keeps its `first_seen`, so a test that stays red keeps its original "Broken since". The state also counts the days it was seen (`seen_days`) and when its current run of consecutive days began (`streak_start`). [`classify()`](scripts/failure_tracker.py) turns these into 🔴 broken (failed yesterday and today), 🟡 intermittent (failed before, but not yesterday), 🆕 new and ⚪ quiet.
+   - **Archive.** [`archive_quiet()`](scripts/failure_tracker.py) moves a failure not seen for [`RETENTION_DAYS`](scripts/failure_tracker.py) (30) to a one-line archive, and drops archived ones after [`ARCHIVE_KEEP_DAYS`](scripts/failure_tracker.py) (180). An archived failure that fails again comes back with its old ID, dated today, and marked as back.
+   - **Migration.** [`upgrade_state()`](scripts/failure_tracker.py) converts the older flat layout on load. It cannot know how many days an old failure was seen, so it assumes one, or two when first and last seen differ.
 
    The LLM is never asked to remember dates.
-4. **Render** the table, linking each row back to its analysis in that day's daily issue. [`render_bounded_body()`](scripts/failure_tracker.py) keeps the body within [`MAX_BODY_BYTES`](scripts/failure_tracker.py) by dropping the oldest quiet failures first.
+4. **Render.** The issue shows a summary line (broken, intermittent, new, quiet and archived counts), then the failing table, then the quiet table and the archive, both collapsed. Each row has a **Seen** column (days failed out of days from first to last seen) and a **Fix PR** column, and links back to its analysis in that day's daily issue. [`render_bounded_body()`](scripts/failure_tracker.py) keeps the body within [`MAX_BODY_BYTES`](scripts/failure_tracker.py): over budget it drops the oldest archived failures first, then archives the oldest quiet ones.
 5. **Write and check.** After the PATCH, the body is read back (once more after a few seconds if it differs). If it is still not what was sent, the step fails.
 
 **Why the size bound and the read-back.** GitHub saves at most 262,144 UTF-8 bytes of issue body ([`GITHUB_ISSUE_BODY_MAX_BYTES`](scripts/utils.py)). A larger PATCH still gets `200 OK` with the new body echoed back, but the old body stays. The tracker used to grow without bound, so it froze without any error: sgl-project/sglang#37451 from 2026-09-03 and sgl-project/sglang#45847 from 2026-10-25 until 2026-11-12. [`update_issue_body()`](scripts/utils.py) now refuses an oversized body for every caller, and the tracker step exits non-zero whenever a tracker could not be updated.
