@@ -48,21 +48,33 @@ def _tool_result(text: str, ts: str = "2026-11-01T00:00:10Z") -> dict:
 
 
 class TestRunMissing(unittest.TestCase):
-    def test_a_hung_case_is_stopped_and_the_rest_still_run(self):
+    def test_a_hung_case_is_stopped_with_its_agent_and_the_rest_still_run(self):
         from unittest import mock
-        calls = []
+        started, killed = [], []
 
-        def fake_run(cmd, **kwargs):
-            calls.append((cmd[3], kwargs["timeout"]))
-            if cmd[3] == "1":
-                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
-            return subprocess.CompletedProcess(cmd, 0)
+        class FakeProc:
+            def __init__(self, cmd, **kwargs):
+                self.pid, self.pr = 4242, cmd[3]
+                started.append((self.pr, kwargs["start_new_session"]))
+
+            def wait(self, timeout=None):
+                if self.pr == "1" and timeout is not None:
+                    raise subprocess.TimeoutExpired("x", timeout)
+                return 0
+
+            def kill(self):
+                killed.append("proc")
 
         cases = [{"id": f"c{n}", "pr": n, "head_sha": "h", "as_of": "t"} for n in (1, 2)]
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(ev.subprocess, "run", side_effect=fake_run):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(ev.subprocess, "Popen", FakeProc), \
+                mock.patch.object(ev.os, "killpg", lambda pid, sig: killed.append(pid), create=True):
+            stale = Path(tmp) / "c1" / "sessions" / "old"
+            stale.mkdir(parents=True)
             ev.run_missing(cases, Path(tmp), marker="selection.json")
             log = (Path(tmp) / "c1.log").read_text()
-        self.assertEqual(calls, [("1", ev.CASE_TIMEOUT_SECS), ("2", ev.CASE_TIMEOUT_SECS)])
+            self.assertFalse(stale.exists())  # an earlier attempt's sessions are not counted again
+        self.assertEqual(started, [("1", True), ("2", True)])
+        self.assertEqual(killed, [4242])  # the whole process group, agent included
         self.assertIn("timed out", log)
 
 
@@ -91,10 +103,23 @@ class TestSelectionScore(unittest.TestCase):
             big = Path(tmp) / "c1" / "sessions" / "s1" / "a" / "tool-results"
             big.mkdir(parents=True)
             (big / "b1.txt").write_text('{"merged_at": "2026-11-04T00:00:00Z"}')
+            (big / "b2.txt").write_text('{"createdAt": "2026-11-05T01:02:03.123Z"}\nabc 2026-11-06 10:00:00 -0800 fix\n')
             found = ev.leaks(Path(tmp) / "c1", self.AS_OF)
         self.assertEqual(sorted(found), ["a.jsonl: createdAt 2026-11-03T08:00:00Z",
                                          "a.jsonl: git date 2026-11-02T18:00:00Z",
-                                         "b1.txt: merged_at 2026-11-04T00:00:00Z"])
+                                         "b1.txt: merged_at 2026-11-04T00:00:00Z",
+                                         "b2.txt: createdAt 2026-11-05T01:02:03Z",
+                                         "b2.txt: git date 2026-11-06T18:00:00Z"])
+
+    def test_a_run_without_a_session_log_is_not_scored_as_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "c1"
+            artifact.mkdir()
+            (artifact / "selection.json").write_text(json.dumps({"platforms": {
+                "nv": {"extra_needed": True}, "amd": {"extra_needed": False}}}))
+            self.assertIsNone(ev.leaks(artifact, self.AS_OF))
+            result = ev.score_selection([self.case("c1")], Path(tmp))
+        self.assertEqual((result["all"]["scored"], result["all"]["unchecked"]), (0, 2))
 
     def test_score_selection(self):
         clean = [{"type": "assistant", "timestamp": "2026-11-01T00:00:00Z",

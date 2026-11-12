@@ -28,6 +28,17 @@ class MainContextTest(unittest.TestCase):
         self.assertEqual(files, {"sglang-skills/rerun-test.md": "main:.agents/skills/rerun-test/SKILL.md",
                                  "sglang-skills/write-sglang-test.md": "main:.agents/skills/write-sglang-test/SKILL.md"})
 
+    def test_a_replay_reads_main_as_of_its_time(self):
+        resp = mock.Mock(status_code=200, json=lambda: [{"sha": "abc123"}])
+        refs = []
+        with mock.patch.object(ts, "gh_get", return_value=resp) as get:
+            ts.main_context("t", as_of="2026-09-01T06:40:00Z", fetch=lambda t, p, r: refs.append(r) or "x")
+        self.assertEqual(get.call_args.kwargs["params"]["until"], "2026-09-01T06:40:00Z")
+        self.assertEqual(set(refs), {"abc123"})
+        with mock.patch.object(ts, "gh_get", side_effect=ts.requests.ConnectionError("x")):
+            ts.main_context("t", as_of="2026-09-01T06:40:00Z", fetch=lambda t, p, r: refs.append(r) or "x")
+        self.assertEqual(refs[-1], "main")
+
     def test_a_github_error_leaves_the_file_out(self):
         def fetch(token, path, ref):
             raise ts.requests.ConnectionError("reset")
@@ -51,6 +62,13 @@ class BlockTest(unittest.TestCase):
         report = '## CI Status for PR #1\nok\n<!-- test-selection {"nv": {"reason": "a} --> b"}} -->\n'
         self.assertIsNone(ts.parse_block(report))
         self.assertEqual(ts.strip_block(report), "## CI Status for PR #1\nok\n")
+
+    def test_strip_cuts_the_last_block_and_its_fence(self):
+        block = '<!-- test-selection {"nv": {"extra_needed": false}} -->'
+        quoted = "The task asks for a `<!-- test-selection` block.\n\n| a | b |\n"
+        self.assertEqual(ts.strip_block(quoted + block + "\n"), quoted.rstrip() + "\n")
+        fenced = "## T\nok\n\n```\n" + block + "\n```\n"
+        self.assertEqual(ts.strip_block(fenced), "## T\nok\n")
 
     def test_malformed_blocks_do_not_crash(self):
         for block in (None, {"nv": []}, {"nv": {"extra_needed": 1}}, {"amd": "x"}):
@@ -77,17 +95,34 @@ class RenderTest(unittest.TestCase):
 
 
 class MentionTest(unittest.TestCase):
+    def n(self, text):
+        return ts.neutralize_outside_code(text, neutralize_mentions)
+
     def test_code_fences_are_left_alone(self):
         text = "ping @dev\n```python\n@torch.no_grad()\ndef f(): pass\n```\nand @other\n"
-        self.assertEqual(ts.neutralize_outside_code(text, neutralize_mentions),
+        self.assertEqual(self.n(text),
                          "ping `@dev`\n```python\n@torch.no_grad()\ndef f(): pass\n```\nand `@other`\n")
+
+    def test_fences_as_github_reads_them(self):
+        # An indented closing fence still closes it, so the mention after it is live.
+        self.assertIn("cc `@octocat`", self.n("```\nlog\n  ```\ncc @octocat\n```\n"))
+        # A backtick in the info string means no fence: inline code, then a live mention.
+        self.assertIn("cc `@octocat`", self.n("```x`y``` cc @octocat\n"))
+        # An unclosed fence is code to the end.
+        self.assertEqual(self.n("```\n@torch.jit\n"), "```\n@torch.jit\n")
+        self.assertEqual(self.n("~~~\n@a\n~~~\n@b\n"), "~~~\n@a\n~~~\n`@b`\n")
+
+    def test_inline_code_and_urls_are_left_alone(self):
+        self.assertEqual(self.n("see [post](https://medium.com/@foo/bar) and `x --tag @foo`, ask @dev"),
+                         "see [post](https://medium.com/@foo/bar) and `x --tag @foo`, ask `@dev`")
 
 
 class CiStatusIntegrationTest(unittest.TestCase):
     """The ci-status harness: skills passed as context, the section rendered, mentions neutralized."""
 
     def test_report_gets_the_section(self):
-        block = {"nv": {"extra_needed": True, "reason": "ping @someone about python/sglang/srt/x.py"},
+        block = {"nv": {"extra_needed": True, "reason": "ping @someone about python/sglang/srt/x.py; "
+                                                          "token ghp_" + "a" * 36},
                  "amd": {"extra_needed": False, "reason": "no ROCm path"}}
         agent_out = ("## CI Status for PR #7\n\n**Verdict:** no failures.\n"
                      "<!-- ci-status-verdicts {\"verdicts\": []} -->\n"
@@ -115,6 +150,8 @@ class CiStatusIntegrationTest(unittest.TestCase):
         self.assertIn("`/run-extra-ci nv`", report)
         self.assertNotIn("test-selection", report)
         self.assertIn("`@someone`", report)
+        self.assertNotIn("ghp_" + "a" * 36, report)
+        self.assertNotIn("ghp_" + "a" * 36, json.dumps(saved))
         self.assertEqual(saved["platforms"]["nv"]["extra_needed"], True)
         self.assertEqual(saved["as_of"], "2026-11-01T00:00:00Z")
 

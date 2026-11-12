@@ -13,8 +13,8 @@
       "basis": "The author posted /rerun-test for six files and /run-extra-ci nv. The three CPU-only files of that list (test_hybrid_pool_assembler.py, test_unified_kv_storage.py, test_unified_radix_hicache_dispatch.py) run in base-a-test-cpu on every PR and have no register_cuda_ci, so they are left out."
     },
     "amd": {
-      "extra_needed": true,
-      "basis": "The author posted /run-extra-ci amd: HiCache host-pool assembly is shared code that AMD runs too. No AMD-registered file was named."
+      "extra_needed": false,
+      "basis": "Relabelled 2026-11-13 by the same changed-paths rule as #44718 (the user asked to judge by paths): the PR changes shared HiCache host-pool code (python/sglang/srt/mem_cache/hybrid_cache/, memory_pool.py) and no ROCm-specific path, so AMD needs no extra by write-sglang-test's rule. The author still posted /run-extra-ci amd; the first label followed that comment."
     }
   }
 }

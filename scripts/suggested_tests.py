@@ -15,7 +15,7 @@ import re
 
 import requests
 
-from utils import get_file_content_at_ref
+from utils import REPO, get_file_content_at_ref, gh_get, gh_headers
 
 # .ci-context/sglang-skills/<name> <- path on sglang main
 SKILL_FILES = {
@@ -25,16 +25,36 @@ SKILL_FILES = {
 DISCLAIMER = "🤖 AI-generated suggestion — use it with your own judgement."
 # Platform key -> (name, the comment that runs its extra tier; contribution guide "How to trigger CI tests")
 PLATFORMS = {"nv": ("NVIDIA", "/run-extra-ci nv"), "amd": ("AMD", "/run-extra-ci amd")}
+_MARKER = "<!-- test-selection"
 _BLOCK_RE = re.compile(r"<!--\s*test-selection\s*(\{.*?\})\s*-->", re.DOTALL)
+# CommonMark fences: up to 3 spaces of indent; a backtick fence's info string has no backtick.
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+# Spans GitHub never turns into a mention: inline code and URLs.
+_INLINE_SAFE_RE = re.compile(r"(`+)[^\n]*?\1|https?://[^\s)>\]]+")
 
 
-def main_context(token: str, fetch=None) -> dict[str, str]:
+def _main_at(token: str, as_of: str | None) -> str:
+    """``main``, or for a replay the ``main`` commit current at *as_of* (later skills may know the answer)."""
+    if not as_of:
+        return "main"
+    try:
+        resp = gh_get(f"https://api.github.com/repos/{REPO}/commits", headers=gh_headers(token),
+                      params={"sha": "main", "until": as_of, "per_page": 1})
+        if resp.status_code == 200 and resp.json():
+            return resp.json()[0]["sha"]
+    except (requests.RequestException, ValueError, KeyError, IndexError):
+        pass
+    return "main"
+
+
+def main_context(token: str, as_of: str | None = None, fetch=None) -> dict[str, str]:
     """The skill files from sglang ``main`` as context files; one that cannot be fetched is left out."""
     fetch = fetch or get_file_content_at_ref
+    ref = _main_at(token, as_of)
 
     def get(path: str) -> str | None:
         try:
-            return fetch(token, path, "main")
+            return fetch(token, path, ref)
         except requests.RequestException:
             return None
 
@@ -53,10 +73,20 @@ def parse_block(report: str) -> dict | None:
 
 
 def strip_block(report: str) -> str:
-    # The block is the report's last part. Cut from its start rather than removing a regex match:
-    # a "} -->" inside its text would end the match early and leave the rest of the JSON visible.
-    cut = report.find("<!-- test-selection")
-    return (report[:cut] if cut >= 0 else report).rstrip() + "\n"
+    """The report without its block, which is its last part.
+
+    Cut from the last marker (parse_block reads the last block; prose may quote the
+    marker earlier) rather than removing a regex match: a "} -->" inside the block's
+    text would end the match early and leave the rest of the JSON visible.
+    """
+    cut = report.rfind(_MARKER)
+    if cut < 0:
+        return report.rstrip() + "\n"
+    lines = report[:cut].rstrip().split("\n")
+    # A block the agent wrapped in a fence (as the task file shows it) would leave an open fence.
+    if _FENCE_OPEN_RE.match(lines[-1]):
+        lines.pop()
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _text(value, limit: int = 600) -> str:
@@ -93,10 +123,34 @@ def render(result: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def neutralize_outside_code(text: str, neutralize) -> str:
-    """Apply *neutralize* (``neutralize_mentions``) to everything except fenced code blocks.
+def _neutralize_inline(text: str, neutralize) -> str:
+    out, last = [], 0
+    for m in _INLINE_SAFE_RE.finditer(text):
+        out += [neutralize(text[last:m.start()]), m.group(0)]
+        last = m.end()
+    return "".join(out + [neutralize(text[last:])])
 
-    GitHub pings nobody from inside a fence, and rewriting ``@decorator`` lines there garbles code.
+
+def neutralize_outside_code(text: str, neutralize) -> str:
+    """Apply *neutralize* (``neutralize_mentions``) except where GitHub never pings: fenced code
+    blocks as CommonMark reads them (an unclosed fence runs to the end), inline code and URLs.
+
+    Rewriting ``@decorator`` lines in code, or ``/@user`` in a URL, would garble them.
     """
-    parts = re.split(r"(^```.*?^```[^\n]*$)", text, flags=re.M | re.S)
-    return "".join(p if i % 2 else neutralize(p) for i, p in enumerate(parts))
+    out, plain, fence = [], [], None
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\n")
+        if fence:
+            out.append(line)
+            if re.match(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$", body):
+                fence = None
+            continue
+        m = _FENCE_OPEN_RE.match(body)
+        if m:
+            out.append(_neutralize_inline("".join(plain), neutralize))
+            plain, fence = [], m.group(1)
+            out.append(line)
+        else:
+            plain.append(line)
+    out.append(_neutralize_inline("".join(plain), neutralize))
+    return "".join(out)

@@ -26,6 +26,8 @@ import json
 import math
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -44,11 +46,15 @@ SELECTION_CASES_DIR = ROOT / "evals" / "test_selection" / "cases"
 # One replay: the agent may take CI_STATUS_AGENT_TIMEOUT (2400 s), plus evidence collection.
 CASE_TIMEOUT_SECS = int(os.environ.get("EVAL_CASE_TIMEOUT_SECS", "4200"))
 # Timestamps in what a tool returned (gh JSON, git log) that date the content itself.
-# updated_at is left out: fetching an old object today still shows a recent update.
+# updated_at is left out: fetching an old object today still shows a recent update. Bare
+# values (jq -r, gh's text tables, "2 days ago") cannot be told apart and are not caught.
 _DATED_FIELD_RE = re.compile(
     r'"(created_at|createdAt|submitted_at|submittedAt|merged_at|mergedAt|closed_at|closedAt|committedDate|'
-    r'authoredDate|publishedAt|published_at|run_started_at)"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)"')
+    r'authoredDate|publishedAt|published_at|run_started_at)"\s*:\s*'
+    r'"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))"')
 _GIT_DATE_RE = re.compile(r"^(?:Date|CommitDate|AuthorDate):\s+(\w{3} \w{3} +\d+ [\d:]+ \d{4} [+-]\d{4})", re.M)
+# git log --format=%ci / %ai and --date=iso
+_GIT_ISO_DATE_RE = re.compile(r"\b(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d{4})\b")
 
 
 def load_cases(cases_dir: Path = CASES_DIR) -> list[dict]:
@@ -128,18 +134,27 @@ def run_missing(cases: list[dict], runs_dir: Path, parallel: int = 1, marker: st
     """
     def run(case: dict) -> None:
         artifact = runs_dir / case["id"]
+        # Sessions of an earlier attempt would be counted again (leaks, cost).
+        shutil.rmtree(artifact / "sessions", ignore_errors=True)
         env = {**os.environ, "AGENT_ARCHIVE_DIR": str(artifact / "sessions")}
         if parallel > 1:
             env["AGENT_WORKSPACE"] = str(runs_dir / ".workspaces" / case["id"])
-        print(f"Running ci-status for {case['id']}...", flush=True)
+        print(f"Running ci-status for {case['id']} (output in {runs_dir / case['id']}.log)...", flush=True)
         with open(runs_dir / f"{case['id']}.log", "w") as log:
+            # Its own process group, so a timeout also stops the claude agent it started.
+            proc = subprocess.Popen([sys.executable, "-u", str(ROOT / "scripts" / "check_ci_for_pr.py"),
+                                     str(case["pr"]), "--no-post", "--head-sha", case["head_sha"],
+                                     "--as-of", case["as_of"], "--out-dir", str(artifact)],
+                                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             try:
-                subprocess.run([sys.executable, "-u", str(ROOT / "scripts" / "check_ci_for_pr.py"), str(case["pr"]),
-                                "--no-post", "--head-sha", case["head_sha"], "--as-of", case["as_of"],
-                                "--out-dir", str(artifact)], check=False, env=env, stdout=log,
-                               stderr=subprocess.STDOUT, timeout=CASE_TIMEOUT_SECS)
+                proc.wait(timeout=CASE_TIMEOUT_SECS)
             except subprocess.TimeoutExpired:
                 # A hung GitHub request once kept a case running for hours; the case stays missing.
+                if hasattr(os, "killpg"):
+                    os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                else:
+                    proc.kill()
+                proc.wait()
                 log.write(f"\neval: case timed out after {CASE_TIMEOUT_SECS} s\n")
 
     runs_dir.mkdir(parents=True, exist_ok=True)
@@ -180,8 +195,13 @@ def _read_texts(artifact: Path):
             yield path.name, path.read_text(errors="replace")
 
 
-def leaks(artifact: Path, as_of: str) -> list[str]:
-    """What the agent read that is dated after ``as_of`` (gh JSON dates, git log dates)."""
+def leaks(artifact: Path, as_of: str) -> list[str] | None:
+    """What the agent read that is dated after ``as_of`` (gh JSON dates, git log dates).
+
+    None when the run has no session log to check (no ``AGENT_ARCHIVE_DIR``, or archiving failed).
+    """
+    if not any((artifact / "sessions").glob("**/*.jsonl")):
+        return None
     limit = _parse_time(as_of)
     found = []
     for name, text in _read_texts(artifact):
@@ -191,6 +211,8 @@ def leaks(artifact: Path, as_of: str) -> list[str]:
                 dates.append(("git date", parsedate_to_datetime(raw)))
             except (TypeError, ValueError):
                 pass
+        for raw in _GIT_ISO_DATE_RE.findall(text):
+            dates.append(("git date", datetime.strptime(raw, "%Y-%m-%d %H:%M:%S %z")))
         for field, when in dates:
             if when > limit:
                 found.append(f"{name}: {field} {when.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}")
@@ -233,7 +255,8 @@ def score_selection(cases: list[dict], runs_dir: Path) -> dict:
             got = (sel or {}).get("platforms", {}).get(key, {})
             rows.append({
                 "case": case["id"], "platform": key, "status": case.get("status", "proposed"),
-                "run": "missing" if sel is None else "leaked" if leaked else "ok", "leaks": leaked[:3],
+                "run": "missing" if sel is None else "unchecked" if leaked is None else "leaked" if leaked else "ok",
+                "leaks": (leaked or [])[:3],
                 "truth_extra": case["platforms"][key]["extra_needed"], "bot_extra": got.get("extra_needed"),
                 "reason": got.get("reason", ""),
             })
@@ -244,6 +267,7 @@ def score_selection(cases: list[dict], runs_dir: Path) -> dict:
             "scored": len(ok), "of": len(selected),
             "extra_correct": sum(r["bot_extra"] == r["truth_extra"] for r in ok),
             "leaked": sum(r["run"] == "leaked" for r in selected), "missing": sum(r["run"] == "missing" for r in selected),
+            "unchecked": sum(r["run"] == "unchecked" for r in selected),
         }
     secs = sorted(c["seconds"] for c in costs)
     result["cost"] = {
@@ -266,7 +290,7 @@ def format_selection_score(result: dict) -> str:
     for scope in ("all", "confirmed"):
         m = result[scope]
         out += ["", f"**{scope} labels**: scored {m['scored']} of {m['of']} case-platforms "
-                f"(leaked {m['leaked']}, missing {m['missing']})",
+                f"(leaked {m['leaked']}, missing {m['missing']}, no session log to check {m['unchecked']})",
                 f"- extra_needed correct: {_rate(m['extra_correct'], m['scored'])}"]
     c = result["cost"]
     out.append(f"\n**cost**: {c['runs']} runs, p90 {c['p90_seconds']:.0f} s, max {c['max_seconds']:.0f} s, "
