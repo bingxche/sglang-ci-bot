@@ -133,6 +133,23 @@ class JobNameAndRecipeTest(unittest.TestCase):
         self.assertEqual(af_ci.job_family(SMALL), af_ci.job_family(SMALL.replace(", 3)", ", 5)")))
         self.assertNotEqual(af_ci.job_family(SMALL), af_ci.job_family(SMALL.replace("rocm10", "rocm720")))
 
+    def test_partitions_of_one_job(self):
+        mm = "multimodal-gen-test-1-gpu-amd (rocm720, linux-mi300-1gpu-sglang, 1)"
+        self.assertTrue(af_ci.same_job(mm, mm.replace(", 1)", ", 3)"), any_partition=True))
+        part1 = "nightly-test-1-gpu-unit (rocm720, linux-mi300-1gpu-sglang) part 1"
+        self.assertTrue(af_ci.same_job(part1, part1.replace("part 1", "part 2"), any_partition=True))
+        # Still not another ROCm version, GPU or job.
+        self.assertFalse(af_ci.same_job(mm, mm.replace("rocm720", "rocm10"), any_partition=True))
+        self.assertFalse(af_ci.same_job(mm, mm.replace("mi300", "mi325"), any_partition=True))
+        self.assertFalse(af_ci.same_job(mm, mm.replace("multimodal-gen", "unit"), any_partition=True))
+        # A runner label on one side only, or none on either.
+        self.assertFalse(af_ci.same_job(mm, "multimodal-gen-test-1-gpu-amd (rocm720, 3)", any_partition=True))
+        self.assertTrue(af_ci.same_job("x (rocm720, 1)", "x (rocm720, 3)", any_partition=True))
+        # Only the last number is a partition; the caller keeps its own parameters.
+        self.assertFalse(af_ci.same_job("x (rocm720, 8, 1)", "x (rocm720, 4, 1)", any_partition=True))
+        self.assertFalse(af_ci.same_job("call-a (rocm10) / x (rocm10, 1)", "call-a (rocm720) / x (rocm10, 1)",
+                                        any_partition=True))
+
     def test_one_job_on_two_runner_pools(self):
         gpu1 = "stage-b-test-1-gpu-small-amd-mi35x (rocm10, linux-mi35x-gpu-1)"
         self.assertTrue(af_ci.same_job(gpu1, gpu1.replace("linux-mi35x-gpu-1", "linux-sglang-mi35x-spur")))
@@ -257,6 +274,15 @@ class LogParsingTest(unittest.TestCase):
         log = ci_log("FAILED (errors=1)", "ERROR: setUpClass (__main__.TestTorchCompile)")
         self.assertEqual(af_ci.test_outcome(log, TEST_FILE, "TestTorchCompile.setUpClass").status, "failed")
         self.assertEqual(af_ci.test_outcome(PASSED_LOG, TEST_FILE, "setUpClass").status, "passed")
+
+    def test_a_pytest_line_of_another_file_does_not_count(self):
+        # Read whole (no run_suite markers): only the line of the file asked for counts.
+        log = "\n".join(["sglang/multimodal_gen/test/unit/test_other.py::test_x FAILED",
+                         "sglang/multimodal_gen/test/unit/test_nomas.py::test_x PASSED"])
+        f = "python/sglang/multimodal_gen/test/unit/test_nomas.py"
+        self.assertEqual(af_ci.test_outcome(log, f, "test_x").status, "passed")
+        # A pytest log that lists other files but not this one did not run it.
+        self.assertEqual(af_ci.test_outcome(log, "python/sglang/x/test_absent.py", "test_x").status, "not-run")
 
     def test_pytest_status_on_a_later_line(self):
         log = "\n".join([
@@ -553,7 +579,8 @@ class FakeGitHub:
         return [{"id": 7, "name": SMALL, "labels": ["linux-mi300-1gpu-sglang"]}]
 
     def job_log(self, job_id):
-        return FAILED_LOG
+        i = job_id - 1000
+        return PASSED_LOG if 0 <= i < len(self.history) and self.history[i] == "passed" else FAILED_LOG
 
     def search_prs(self, query):
         opened = (NOW - self.fix_pr_age).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -595,6 +622,12 @@ class TimelineGitHub(FakeGitHub):
                  "conclusion": None if ok is None else "success" if ok else "failure",
                  "html_url": f"https://github.com/x/job/{2000 + 10 * i + k}", "labels": []}
                 for k, (name, ok) in enumerate(self.timeline[i][1].items())]
+
+    def job_log(self, job_id):
+        i, k = divmod(job_id - 2000, 10)
+        if 0 <= i < len(self.timeline) and k < len(self.timeline[i][1]):
+            return PASSED_LOG if list(self.timeline[i][1].values())[k] else FAILED_LOG
+        return FAILED_LOG
 
 
 def two_rocm_problem() -> af_select.Problem:
@@ -750,6 +783,8 @@ class SelectionTest(unittest.TestCase):
 
         class TwoTests(TimelineGitHub):
             def job_log(self, job_id):
+                if super().job_log(job_id) is PASSED_LOG:
+                    return PASSED_LOG
                 return "\n".join(["Begin (0/1):", f"python3 /sglang-checkout/{TEST_FILE}",
                                   "FAIL: test_a (__main__.T.test_a)", "FAIL: test_b (__main__.T.test_b)",
                                   "FAILED (failures=2)"])
@@ -760,6 +795,69 @@ class SelectionTest(unittest.TestCase):
         # Once each has failed twice, it is sure.
         gh.timeline.insert(0, ("2026-11-12T01:10:00Z", {b: False, c: False}))
         self.assertEqual(autofix.build_plan(p, gh, CrusoeTest.yaml, NOW)[1], "")
+
+    def test_a_test_that_moved_partition_is_followed(self):
+        # R317 (Nov 7-11): the file moved between partitions, and on Nov 9 the problem's own partition did
+        # not run it, so that run was read as "other" and two failures never made it sure. Here the file
+        # runs in partition 3 on Nov 11, in no partition on Nov 9, and in partition 1 on Nov 7.
+        p1, p3 = SMALL.replace(", 3)", ", 1)"), SMALL
+        fail = ci_log("FAILED (errors=1)", "ERROR: test_first_chunk_reads_fp8_pool "
+                      "(__main__.TestMiniMaxHD128AsmPrefill.test_first_chunk_reads_fp8_pool)")
+        other_only = "\n".join(["Begin (0/1):", "python3 /sglang-checkout/test/registered/a/test_other.py",
+                                "FAILED (errors=1)"])
+
+        class Moving(TimelineGitHub):
+            logs = {}
+
+            def job_log(self, job_id):
+                return self.logs.get(job_id) or super().job_log(job_id)
+        gh = Moving([("2026-11-11T19:05:00Z", {p3: False, p1: True}),
+                     ("2026-11-09T19:05:00Z", {p3: False, p1: False}),
+                     ("2026-11-07T19:05:00Z", {p3: True, p1: False}),
+                     ("2026-11-05T19:05:00Z", {p3: True, p1: True})])
+        # Nov 9: neither partition ran the file. Nov 7: it ran in partition 1 and failed.
+        gh.logs = {2010: other_only, 2011: other_only, 2021: fail}
+        plan, why = self.build(problem(), gh)
+        self.assertEqual(why, "")
+        self.assertEqual((plan["first_fail"]["at"], plan["last_pass"]["at"], plan["failing_runs"]),
+                         ("2026-11-07T19:05:00Z", "2026-11-05T19:05:00Z", 2))
+        self.assertEqual(plan["first_fail"]["job_url"], "https://github.com/x/job/2021")
+        # Nov 9 again, now with partition 1 green: its log shows the test passed, which ends the streak.
+        gh.logs = {2010: other_only, 2011: other_only, 2020: other_only, 2021: other_only}
+        gh.timeline[1] = ("2026-11-09T19:05:00Z", {p3: False, p1: True})
+        why = self.build(problem(), gh)[1]
+        self.assertTrue(why.startswith("not failing for sure: its latest scheduled runs were failed"), why)
+        self.assertIn("passed", why)
+
+    def test_what_one_run_says(self):
+        p1, p3 = SMALL.replace(", 3)", ", 1)"), SMALL
+        j = {"job_name": p3}
+        tests = [(TEST_FILE, TEST_FUNC)]
+        other_only = "\n".join(["Begin (0/1):", "python3 /sglang-checkout/test/registered/a/test_other.py",
+                                "FAILED (errors=1)"])
+        timeout = "\n".join(["Begin (8/90):", f"python3 /sglang-checkout/{TEST_FILE}", "✗ TIMEOUT: x"])
+
+        def status(jobs, logs, **kw):
+            gh = mock.Mock(job_log=lambda i: logs[i])
+            jobs = [{"id": i, "name": n, "conclusion": c, "html_url": f"u{i}"} for i, n, c in jobs]
+            st, job = af_select.run_status(gh, jobs, j, tests, **kw)
+            return st, (job or {}).get("id")
+        # The file timed out in its partition while the other passed: no pass is read into it.
+        self.assertEqual(status([(1, p3, "failure"), (2, p1, "success")], {1: timeout, 2: PASSED_LOG.replace(
+            TEST_FILE, "test/registered/a/test_other2.py")}), ("other", 1))
+        # The partition that would run it has not finished: the run says nothing yet.
+        self.assertEqual(status([(1, p3, None), (2, p1, "failure")], {2: other_only}), (None, None))
+        # It ran and passed in another partition, whose log shows it.
+        self.assertEqual(status([(1, p3, "failure"), (2, p1, "success")], {1: other_only, 2: PASSED_LOG}),
+                         ("passed", 2))
+        # One test failed and one passed: mixed.
+        two = [(TEST_FILE, TEST_FUNC), (TEST_FILE, "TestMiniMaxHD128AsmPrefill.test_other")]
+        gh = mock.Mock(job_log=lambda i: FAILED_LOG.replace(
+            "Ran 1 test", "test_other (__main__.TestMiniMaxHD128AsmPrefill.test_other) ... ok\nRan 1 test"))
+        st, _ = af_select.run_status(gh, [{"id": 1, "name": p3, "conclusion": "failure", "html_url": "u"}], j, two)
+        self.assertEqual(st, "other")
+        # Past the history cap only its own partition decides, unread.
+        self.assertEqual(status([(1, p1, "failure"), (2, p3, "success")], {}, read_logs=False), ("passed", 2))
 
     def test_a_job_listed_twice_counts_where_it_ran(self):
         # The run lists the job on two pools; the first listed was cancelled, the second failed.

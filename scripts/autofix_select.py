@@ -20,6 +20,7 @@ from autofix_ci import (
     dispatch_inputs,
     fails_for_sure,
     failure_window,
+    find_outcome,
     is_perf,
     job_family,
     job_label,
@@ -27,7 +28,6 @@ from autofix_ci import (
     recipe_for,
     run_history,
     same_job,
-    test_outcome,
 )
 from autofix_config import (
     AUTOFIX_WORKFLOWS,
@@ -381,26 +381,46 @@ def job_history(gh: GitHub, workflow: str, j: dict, job_tests: list) -> list[tup
     """
     statuses: list[tuple[str, dict]] = []
     for run in gh.scheduled_runs(workflow, running=True)[:HISTORY_SCAN]:
-        # A run may list the job once per runner pool: the one that ran decides.
-        match = next((x for x in gh.jobs(run["id"]) if same_job(x["name"], j["job_name"])
-                      and x.get("conclusion") not in (None, "skipped", "cancelled")), None)
-        if not match:
-            continue
+        status, match = run_status(gh, gh.jobs(run["id"]), j, job_tests, read_logs=len(statuses) < HISTORY_RUNS)
+        if not status:
+            continue  # no job of this run ran the tests: it says nothing
         entry = {"run_id": run["id"], "run_url": run["html_url"], "sha": run["head_sha"],
                  "date": run["created_at"][:10], "at": run["created_at"], "job_url": match["html_url"],
                  "job": job_label(j["job_name"])}
-        if match["conclusion"] == "success":
-            statuses.append(("passed", entry))
-            break
-        if len(statuses) >= HISTORY_RUNS:
-            statuses.append(("failed", entry))
-            continue
-        outs = [test_outcome(gh.job_log(match["id"]), f, fn) for f, fn in job_tests]
-        status = "failed" if outs and all(o.status == "failed" for o in outs) else "other"
         statuses.append((status, entry))
         if status != "failed":
             break
     return statuses
+
+
+def run_status(gh: GitHub, run_jobs: list[dict], j: dict, job_tests: list,
+               read_logs: bool = True) -> tuple[str | None, dict | None]:
+    """How *job_tests* ended in one run, and the job that says so: ``failed`` (all failed),
+    ``other`` (some failed, or one ran with no clear result), ``passed`` (a log shows each
+    pass), or ``(None, None)`` when the run says nothing: no partition shows the tests ran.
+
+    The tests are looked for in every finished partition and runner pool of job *j*
+    (``find_outcome()``), its own and the failed ones first: suites that place tests by time
+    move a file between partitions (R317's on Nov 9), and a run may list the job once per
+    pool. Without *read_logs* (past ``HISTORY_RUNS``) only the job's own partition decides,
+    by its conclusion.
+    """
+    done = [x for x in run_jobs if x.get("conclusion") not in (None, "skipped", "cancelled")]
+    if not read_logs:
+        own = next((x for x in done if same_job(x["name"], j["job_name"])), None)
+        return ((("passed" if own["conclusion"] == "success" else "failed"), own) if own else (None, None))
+    jobs = sorted((x for x in done if same_job(x["name"], j["job_name"], any_partition=True)),
+                  key=lambda x: (x["conclusion"] == "success", not same_job(x["name"], j["job_name"])))
+    found = [r for t in job_tests if (r := find_outcome(jobs, gh.job_log, *t, first_known=True))]
+    statuses = [o.status for o, _ in found]
+    if "failed" in statuses:
+        status = "failed" if len(found) == len(job_tests) and set(statuses) == {"failed"} else "other"
+        return status, next(x for o, x in found if o.status == "failed")
+    if not found:
+        return None, None
+    # Every test that ran passed; one that ran with no clear result (a timeout, a log that
+    # could not be read) leaves the run undecided, which stops the history.
+    return ("passed" if set(statuses) == {"passed"} else "other"), found[0][1]
 
 
 def blocks_now(pr: dict, now: datetime) -> bool:

@@ -66,18 +66,31 @@ def _runner_gpu(label: str) -> tuple[str, str | None]:
     return (arch.group() if arch else label), (next(g for g in count.groups() if g) if count else None)
 
 
-def same_job(a: str, b: str) -> bool:
+def _same_gpu(x: str, y: str) -> bool:
+    (gx, cx), (gy, cy) = _runner_gpu(x), _runner_gpu(y)
+    return gx == gy and not (cx and cy and cx != cy)
+
+
+def same_job(a: str, b: str, any_partition: bool = False) -> bool:
     """Two names of one job that may have run on different pools of one GPU: ``x (rocm10, linux-mi35x-gpu-1)``
-    is ``x (rocm10, linux-sglang-mi35x-spur)``. GPUs, GPU counts (when both labels name one),
-    partitions, parts and ROCm versions still differ."""
+    is ``x (rocm10, linux-sglang-mi35x-spur)``. GPUs, GPU counts (when both labels name one) and
+    ROCm versions still differ; partitions (``…, 3)``) and parts (``part 2``) too, unless *any_partition*:
+    suites that place tests by time move a file from one partition to another between runs."""
+    if any_partition:
+        def rest(name: str) -> tuple:
+            # The caller as written (with its own parameters), and the job's last parameter
+            # when it is a partition number.
+            j = parse_job_name(name)
+            params = [p for p in j.params if p != j.runner]
+            if params and params[-1].isdigit():
+                params.pop()
+            return (name or "").split(" / ")[0] if " / " in (name or "") else "", j.base, tuple(params), j.runner
+        ra, rb = rest(a), rest(b)
+        return ra[:3] == rb[:3] and bool(ra[3]) == bool(rb[3]) and _same_gpu(ra[3], rb[3])
     ra, rb = _RUNNER_LABEL_RE.findall(a or ""), _RUNNER_LABEL_RE.findall(b or "")
     if _RUNNER_LABEL_RE.sub("", a or "") != _RUNNER_LABEL_RE.sub("", b or "") or len(ra) != len(rb):
         return False
-    for x, y in zip(ra, rb):
-        (gx, cx), (gy, cy) = _runner_gpu(x), _runner_gpu(y)
-        if gx != gy or (cx and cy and cx != cy):
-            return False
-    return True
+    return all(_same_gpu(x, y) for x, y in zip(ra, rb))
 
 
 @dataclass(frozen=True)
@@ -290,8 +303,9 @@ def _unittest_ids(inner: str, name: str) -> str:
     return comps[-1]
 
 
-def func_status(lines: list[str], want: str) -> str | None:
-    """``passed`` / ``failed`` / ``skipped`` for test function *want*, or None when the lines never name it."""
+def func_status(lines: list[str], want: str, test_file: str = "") -> str | None:
+    """``passed`` / ``failed`` / ``skipped`` for test function *want*, or None when the lines never name it.
+    With *test_file*, a pytest line of another file does not count (a log read whole, not per file)."""
     statuses: list[str] = []
     pending: tuple[str, str, str] | None = None
     for raw in lines:
@@ -314,6 +328,9 @@ def func_status(lines: list[str], want: str) -> str | None:
                 pending = (cls, m.group(1), "")
             continue
         m = _PYTEST_RE.match(line)
+        if m and test_file and not same_file(m.group(2), test_file):
+            pending = None
+            continue
         if m:
             cls_name = m.group(3).split("::")
             cls = cls_name[-2] if len(cls_name) > 1 else ""
@@ -376,6 +393,10 @@ def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
         return Outcome("not-run", note=f"{test_file} did not run in this job")
     whole_log = not segments
     if whole_log:
+        # A pytest log lists every file it ran: one listing others but not this one did not run it.
+        files = {m.group(2) for m in (_PYTEST_RE.match(line.strip()) for line in lines) if m}
+        if files and not any(same_file(f, test_file) for f in files):
+            return Outcome("not-run", note=f"{test_file} did not run in this job")
         mine = [Segment(None, lines)]
     retried = len(mine) > 1 or any(
         (m := _RETRY_RE.match(line.strip())) and same_file(m.group(1) or m.group(2), test_file)
@@ -383,7 +404,7 @@ def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
     )
     last = mine[-1]
     ran = not whole_log
-    status = func_status(last.lines, test_func)
+    status = func_status(last.lines, test_func, test_file)
     if status:
         return Outcome(status, retried, ran_file=ran)
     _, name, _ = _split_func(test_func)
@@ -396,6 +417,24 @@ def test_outcome(raw_log: str, test_file: str, test_func: str) -> Outcome:
         return Outcome("unknown", retried, note="file passed with skipped tests; this one may be among them",
                        ran_file=ran)
     return Outcome("unknown", retried, note=f"no result for {test_func} in the log", ran_file=ran)
+
+
+def find_outcome(jobs: list[dict], job_log, test_file: str, test_func: str,
+                 first_known: bool = False) -> tuple[Outcome, dict] | None:
+    """The job of *jobs* that ran *test_file* and says how *test_func* ended, with that outcome;
+    None when none ran it. A known result beats ``unknown``, and a run_suite file beats a log
+    read whole. With *first_known* the first passed or failed result is taken, reading no
+    more logs (they are downloaded one by one)."""
+    best = None
+    for j in jobs:
+        o = test_outcome(job_log(j["id"]), test_file, test_func)
+        if o.status == "not-run":
+            continue
+        if first_known and o.status in ("passed", "failed"):
+            return o, j
+        if best is None or (o.status == "unknown", not o.ran_file) < (best[0].status == "unknown", not best[0].ran_file):
+            best = (o, j)
+    return best
 
 
 def ran_first(raw_log: str, files) -> bool:
@@ -539,9 +578,7 @@ def verify_run(plan: dict, rec: dict, run: dict, jobs: list[dict], job_log) -> d
     for f, fn in plan["tests"]:
         # The job that ran the file and says how the test ended; a job that died before running
         # any file, or does not name the test, says nothing.
-        outcomes = [(test_outcome(job_log(j["id"]), f, fn), j) for j in mine]
-        ran = [x for x in outcomes if x[0].status != "not-run"]
-        best = min(ran, key=lambda x: (x[0].status == "unknown", not x[0].ran_file), default=None)
+        best = find_outcome(mine, job_log, f, fn)
         if not best:
             out["reasons"].append(f"`{f}` did not run")
             continue
