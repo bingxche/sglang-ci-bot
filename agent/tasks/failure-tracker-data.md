@@ -22,7 +22,7 @@ Your output is consumed by a parser, NOT shown to humans, so it must be **only**
   - Never add notes or guesses to either field (no `(most likely …)`, `(unconfirmed)`, `likely …`). If the analysis does not name the failing function, leave `test_function` as an empty string.
 - `error` is exactly ONE line (error type + short message), no newlines.
 - `status` is the regression status you see, e.g. `new today` / `recurring` / `flaky 2/4` / `never-passed`.
-- A non-test failure (build error, server crash, runner hang) is still a row: put a short descriptor in `test_file` and an empty string in `test_function`. A lost runner is `runner lost during <step>`, one row per job, since there is no test to deduplicate on.
+- A non-test failure (build error, server crash, runner hang) is still a row, with an empty string in `test_function`. Its `test_file` is `step: <name>`, where `<name>` is the failing step exactly as GitHub names it (e.g. `step: Ensure VRAM is clear`), with no job name and no words such as "failed" or "timed out" (those go in `error`). A lost runner is `runner lost during <name>`, one row per job, since there is no test to deduplicate on.
 - Do NOT include `first_seen`, `duration`, or any "days" field — the harness owns those.
 - Include a row for EVERY failing test across ALL tracked workflows. If a tracked workflow had no failures, simply emit no rows for it (an overall empty array `[]` is valid if nothing failed).
 
