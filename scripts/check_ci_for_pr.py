@@ -16,8 +16,6 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import requests
-
 import suggested_tests
 from ci_evidence import build_evidence_pack
 from ci_verdicts import annotate_report, parse_verdict_block, validate
@@ -38,6 +36,7 @@ from utils import (
     get_pr_diff,
     get_run_jobs,
     get_workflow_runs_for_sha,
+    gh_get,
     gh_headers,
     is_gate_job,
     load_prompt_template,
@@ -58,7 +57,7 @@ AGENT_TIMEOUT_SECS = int(os.environ.get("CI_STATUS_AGENT_TIMEOUT", "2400"))
 def get_pr_head_sha(token: str, pr_number: int) -> str:
     """Get the head commit SHA for a PR."""
     url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}"
-    resp = requests.get(url, headers=gh_headers(token))
+    resp = gh_get(url, headers=gh_headers(token))
     resp.raise_for_status()
     return resp.json()["head"]["sha"]
 
