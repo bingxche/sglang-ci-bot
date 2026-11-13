@@ -97,11 +97,20 @@ def _retry(fn, *args, **kwargs):
             if isinstance(result, str) and result.startswith("[Failed to fetch logs: HTTP 5"):
                 raise requests.ConnectionError(result)
             return result
-        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError,
+                requests.exceptions.ChunkedEncodingError) as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if i == attempts - 1 or (status is not None and status < 500):
                 raise
             time.sleep(2 ** (i + 1))
+
+
+def _baseline_log(token: str, job_id: int) -> str | requests.RequestException:
+    """The log of a `main` job, or the error that stopped its download after retries."""
+    try:
+        return _retry(download_job_logs, token, job_id)
+    except requests.RequestException as exc:
+        return exc
 
 
 def _get(token: str, path: str, **params) -> dict:
@@ -664,7 +673,13 @@ def build_evidence_pack(
         to_fetch = [j["id"] for _, j in matches if j and j.get("conclusion") in (*_FAILED, "success")
                     and j["id"] not in main_logs][:max(0, MAX_BASELINE_LOGS - len(main_logs))]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            for job_id, log in zip(to_fetch, pool.map(lambda i: _retry(download_job_logs, token, i), to_fetch)):
+            for job_id, log in zip(to_fetch, pool.map(lambda i: _baseline_log(token, i), to_fetch)):
+                if isinstance(log, Exception):
+                    # A missing baseline log is a gap, not a failed check. None
+                    # keeps the job from being fetched again for the next failure.
+                    main_logs[job_id] = None
+                    gap(f"`main` log of job {job_id}", f"download failed ({log.__class__.__name__})")
+                    continue
                 (logs_dir / "main" / f"{job_id}.log").write_text(log)
                 main_logs[job_id] = parse_job_log(log)
         pr_env = evidence[f"{failure['id']}.env"]

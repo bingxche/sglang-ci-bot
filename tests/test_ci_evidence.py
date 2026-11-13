@@ -156,12 +156,63 @@ class TestHelpers(unittest.TestCase):
             ce._retry(fn)
         self.assertEqual(fn.call_count, 1)
 
+    def test_retry_retries_a_body_cut_off_mid_transfer(self):
+        # 2026-11-12: "Connection broken: BrokenPipeError" while reading a job log.
+        fn = mock.Mock(side_effect=[ce.requests.exceptions.ChunkedEncodingError("broken"), "ok"])
+        with mock.patch.object(ce.time, "sleep"):
+            self.assertEqual(ce._retry(fn), "ok")
+
     def test_job_log_is_decoded_as_utf8(self):
         resp = mock.Mock(status_code=200, content="✗ FAILED".encode())
         resp.encoding = "ISO-8859-1"
         type(resp).text = mock.PropertyMock(side_effect=lambda: resp.content.decode(resp.encoding))
         with mock.patch.object(utils.requests, "get", return_value=resp):
             self.assertEqual(utils.download_job_logs("t", 1), "✗ FAILED")
+
+
+class TestBuildEvidencePack(unittest.TestCase):
+    PR_JOB, MAIN_JOB, MAIN_RUN = 11, 22, 33
+    WF = ".github/workflows/pr-test-amd.yml"
+
+    def _paged(self, token, path, key, **params):
+        job = {"name": "stage-b-test-2-gpu-amd (0)", "steps": [{"name": "Run test", "number": 1, "conclusion": "failure"}],
+               "labels": ["linux-mi35x-gpu-2"], "runner_name": "r", "html_url": "u"}
+        if path == "actions/runs":
+            return [{"id": 1, "path": self.WF, "run_attempt": 1, "created_at": "2026-10-14T00:00:00Z",
+                     "html_url": "u", "status": "completed", "conclusion": "failure"}]
+        if path == "actions/runs/1/attempts/1/jobs":
+            return [{**job, "id": self.PR_JOB, "conclusion": "failure"}]
+        if path == f"actions/runs/{self.MAIN_RUN}/jobs":
+            return [{**job, "id": self.MAIN_JOB, "conclusion": "failure"}]
+        raise AssertionError(path)
+
+    def _logs(self, token, job_id):
+        if job_id == self.PR_JOB:
+            return PR_LOG
+        raise ce.requests.exceptions.ChunkedEncodingError("Connection broken: BrokenPipeError")
+
+    def test_a_baseline_log_that_cannot_be_downloaded_is_a_gap(self):
+        # 2026-11-12: one broken `main` log download failed the whole ci-status run.
+        import tempfile
+        pr = {"head": {"sha": HEAD}, "base": {"ref": "main"}, "title": "t", "user": {"login": "a"},
+              "html_url": "u"}
+        main_run = {"id": self.MAIN_RUN, "html_url": "u", "created_at": "2026-10-13T00:00:00Z", "head_sha": BASE}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(ce, "_get", return_value=pr), \
+                mock.patch.object(ce, "_pr_diff", return_value=("", [])), \
+                mock.patch.object(ce, "_paged", side_effect=self._paged), \
+                mock.patch.object(ce, "_main_runs", return_value=[main_run]), \
+                mock.patch.object(ce, "download_job_logs", side_effect=self._logs) as logs, \
+                mock.patch.object(ce, "checkout_commit", return_value=True), \
+                mock.patch.object(ce, "_exec_env", return_value={}), \
+                mock.patch.object(ce, "fetch_image_env", return_value=(None, "test")), \
+                mock.patch.object(ce.time, "sleep"):
+            pack = ce.build_evidence_pack("t", 1, Path(tmp), as_of="2026-10-15T00:00:00Z")
+        self.assertEqual([g["what"] for g in pack["gaps"]], [f"`main` log of job {self.MAIN_JOB}"])
+        self.assertIn("ChunkedEncodingError", pack["gaps"][0]["why"])
+        self.assertEqual(pack["evidence"]["F1.M1"]["test_result"], "unknown (log unavailable)")
+        # Retried before giving up.
+        self.assertEqual([c.args[1] for c in logs.call_args_list].count(self.MAIN_JOB), 5)
 
 
 if __name__ == "__main__":

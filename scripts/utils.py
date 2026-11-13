@@ -302,18 +302,27 @@ def gh_headers(token: str) -> dict:
 # because a write that timed out may still have happened (a duplicate comment).
 GH_RETRY_STATUSES = frozenset({500, 502, 503, 504})
 GH_RETRY_DELAYS = (5, 15, 45)
+# (connect, read) seconds. Without one, a stalled connection hung a CI-status
+# check for 2.5 hours on 2026-11-12. The read timeout bounds the wait for each
+# chunk, not the whole body, so large job logs still download.
+GH_TIMEOUT = (10, 120)
+# A body cut off mid-transfer raises ChunkedEncodingError, which is not a
+# ConnectionError (2026-11-12: "Connection broken: BrokenPipeError").
+GH_RETRY_ERRORS = (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError)
 
 
 def gh_get(url: str, headers: dict, **kwargs) -> requests.Response:
     """``requests.get`` for GitHub reads, retried on 5xx and connection errors.
 
     Returns the last response; callers check its status as before. A connection
-    error on the last attempt is raised.
+    error on the last attempt is raised. Uses ``GH_TIMEOUT`` unless the caller
+    passes ``timeout``.
     """
+    kwargs.setdefault("timeout", GH_TIMEOUT)
     for delay in (*GH_RETRY_DELAYS, None):
         try:
             resp = requests.get(url, headers=headers, **kwargs)
-        except (requests.ConnectionError, requests.Timeout) as exc:
+        except GH_RETRY_ERRORS as exc:
             if delay is None:
                 raise
             logging.getLogger("github").warning("GET %s failed (%s); retrying in %ds", url, exc, delay)
