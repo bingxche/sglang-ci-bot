@@ -949,7 +949,6 @@ def render_workflow_comment(
 # ---------------------------------------------------------------------------
 
 CROSS_RUN_MARKER_TMPL = "<!-- ci-monitor-cross-run-summary: {wf} -->"
-_CROSS_RUN_RE_TMPL = r"<!-- ci-monitor-cross-run-summary: {wf} -->"
 
 
 def _runs_from_analyses(job_analyses: list[dict]) -> list[dict]:

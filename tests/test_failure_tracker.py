@@ -173,7 +173,7 @@ class TruncateTest(unittest.TestCase):
         text = "a" * 108 + "| tail"
         out = ft._one_line(text)
         self.assertFalse(out[:-1].endswith("\\"), out[-5:])
-        entry = _entry("a", TODAY, TODAY, error="b" * 78 + "\| tail")
+        entry = _entry("a", TODAY, TODAY, error="b" * 78 + "\\| tail")
         self.assertFalse(ft._archive_row(entry)[5][:-1].endswith("\\"))
 
 
