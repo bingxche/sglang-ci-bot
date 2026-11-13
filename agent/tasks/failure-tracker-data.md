@@ -18,11 +18,11 @@ Your output is consumed by a parser, NOT shown to humans, so it must be **only**
 - Reuse the facts already in the analyses — do NOT re-investigate or invent.
 - Name a test the same way every time, because the name is the tracker's key:
   - `test_file` is the repo-relative path as the analysis gives it, without backticks.
-  - `test_function` is `Class.method` (a dot, never `::`), or the bare function name for a module-level test. Keep a parametrize suffix such as `[ltx_2_5]` exactly as written.
+  - `test_function` is `Class.method` (a dot, never `::`), or the bare function name for a module-level test. Take the name from the analysis's `Failed Tests` table, one row per table row: keep a parametrize suffix such as `[ltx_2_5]` exactly as the table writes it, and never expand one row into its variants or merge variants into one row.
   - Never add notes or guesses to either field (no `(most likely …)`, `(unconfirmed)`, `likely …`). If the analysis does not name the failing function, leave `test_function` as an empty string.
 - `error` is exactly ONE line (error type + short message), no newlines.
 - `status` is the regression status you see, e.g. `new today` / `recurring` / `flaky 2/4` / `never-passed`.
-- A non-test failure (build error, server crash, runner hang) is still a row, with an empty string in `test_function`. Its `test_file` is `step: <name>`, where `<name>` is the failing step exactly as GitHub names it (e.g. `step: Ensure VRAM is clear`), with no job name and no words such as "failed" or "timed out" (those go in `error`). A lost runner is `runner lost during <name>`, one row per job, since there is no test to deduplicate on.
+- A non-test failure (build error, server crash, runner hang) is still a row, with an empty string in `test_function`. Its `test_file` is `step: <name>`, where `<name>` is the failing step exactly as GitHub names it (e.g. `step: Ensure VRAM is clear`), with no job name and no words such as "failed" or "timed out" (those go in `error`). The one exception is a lost runner: its `test_file` is `runner lost during <name>` (not `step: <name>`), one row per job, since there is no test to deduplicate on.
 - Do NOT include `first_seen`, `duration`, or any "days" field — the harness owns those.
 - Include a row for EVERY failing test across ALL tracked workflows. If a tracked workflow had no failures, simply emit no rows for it (an overall empty array `[]` is valid if nothing failed).
 
