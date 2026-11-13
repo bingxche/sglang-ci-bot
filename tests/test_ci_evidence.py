@@ -186,14 +186,16 @@ class TestBuildEvidencePack(unittest.TestCase):
             return [{**job, "id": self.MAIN_JOB, "conclusion": "failure"}]
         raise AssertionError(path)
 
-    def _logs(self, token, job_id):
-        if job_id == self.PR_JOB:
-            return PR_LOG
-        raise ce.requests.exceptions.ChunkedEncodingError("Connection broken: BrokenPipeError")
-
-    def test_a_baseline_log_that_cannot_be_downloaded_is_a_gap(self):
-        # 2026-11-12: one broken `main` log download failed the whole ci-status run.
+    def _pack(self, main_log):
         import tempfile
+
+        def logs(token, job_id):
+            if job_id == self.PR_JOB:
+                return PR_LOG
+            if isinstance(main_log, Exception):
+                raise main_log
+            return main_log
+
         pr = {"head": {"sha": HEAD}, "base": {"ref": "main"}, "title": "t", "user": {"login": "a"},
               "html_url": "u"}
         main_run = {"id": self.MAIN_RUN, "html_url": "u", "created_at": "2026-10-13T00:00:00Z", "head_sha": BASE}
@@ -202,17 +204,28 @@ class TestBuildEvidencePack(unittest.TestCase):
                 mock.patch.object(ce, "_pr_diff", return_value=("", [])), \
                 mock.patch.object(ce, "_paged", side_effect=self._paged), \
                 mock.patch.object(ce, "_main_runs", return_value=[main_run]), \
-                mock.patch.object(ce, "download_job_logs", side_effect=self._logs) as logs, \
+                mock.patch.object(ce, "download_job_logs", side_effect=logs) as get, \
                 mock.patch.object(ce, "checkout_commit", return_value=True), \
                 mock.patch.object(ce, "_exec_env", return_value={}), \
                 mock.patch.object(ce, "fetch_image_env", return_value=(None, "test")), \
                 mock.patch.object(ce.time, "sleep"):
             pack = ce.build_evidence_pack("t", 1, Path(tmp), as_of="2026-10-15T00:00:00Z")
-        self.assertEqual([g["what"] for g in pack["gaps"]], [f"`main` log of job {self.MAIN_JOB}"])
-        self.assertIn("ChunkedEncodingError", pack["gaps"][0]["why"])
+        return pack, [c.args[1] for c in get.call_args_list].count(self.MAIN_JOB)
+
+    def test_a_baseline_log_that_cannot_be_downloaded_is_a_gap(self):
+        # 2026-11-12: one broken `main` log download failed the whole ci-status run.
+        pack, calls = self._pack(ce.requests.exceptions.ChunkedEncodingError("Connection broken: BrokenPipeError"))
+        self.assertEqual(pack["gaps"], [{"id": "G1", "what": f"`main` log of job {self.MAIN_JOB}",
+                                         "why": "download failed (ChunkedEncodingError)"}])
         self.assertEqual(pack["evidence"]["F1.M1"]["test_result"], "unknown (log unavailable)")
-        # Retried before giving up.
-        self.assertEqual([c.args[1] for c in logs.call_args_list].count(self.MAIN_JOB), 5)
+        # gh_get already retried it; _retry on top would multiply the attempts.
+        self.assertEqual(calls, 1)
+
+    def test_a_baseline_log_github_refuses_is_a_gap_not_a_log(self):
+        # An expired log (HTTP 410) used to be parsed as the log and read as "not reached".
+        pack, _ = self._pack("[Failed to fetch logs: HTTP 410]")
+        self.assertEqual([g["why"] for g in pack["gaps"]], ["Failed to fetch logs: HTTP 410"])
+        self.assertEqual(pack["evidence"]["F1.M1"]["test_result"], "unknown (log unavailable)")
 
 
 if __name__ == "__main__":

@@ -105,12 +105,19 @@ def _retry(fn, *args, **kwargs):
             time.sleep(2 ** (i + 1))
 
 
-def _baseline_log(token: str, job_id: int) -> str | requests.RequestException:
-    """The log of a `main` job, or the error that stopped its download after retries."""
+def _baseline_log(token: str, job_id: int) -> tuple[str | None, str | None]:
+    """``(log, None)`` for a `main` job, or ``(None, why)`` when it could not be downloaded.
+
+    Only ``gh_get`` retries here: wrapped in ``_retry`` too, one stalled log
+    took 20 requests (about 45 minutes) before giving up.
+    """
     try:
-        return _retry(download_job_logs, token, job_id)
+        log = download_job_logs(token, job_id)
     except requests.RequestException as exc:
-        return exc
+        return None, f"download failed ({exc.__class__.__name__})"
+    if log.startswith("[Failed to fetch logs:"):
+        return None, log.strip("[]")
+    return log, None
 
 
 def _get(token: str, path: str, **params) -> dict:
@@ -649,7 +656,7 @@ def build_evidence_pack(
     # The same job on main: status, raw metrics, and environment of each run.
     main_runs: dict[str, list[dict]] = {}
     main_jobs: dict[int, list[dict]] = {}
-    main_logs: dict[int, dict] = {}
+    main_logs: dict[int, dict | None] = {}
     main_lines: dict[int, list[str]] = {}
     for failure in failures:
         if failure["cascade_of"]:
@@ -673,12 +680,12 @@ def build_evidence_pack(
         to_fetch = [j["id"] for _, j in matches if j and j.get("conclusion") in (*_FAILED, "success")
                     and j["id"] not in main_logs][:max(0, MAX_BASELINE_LOGS - len(main_logs))]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            for job_id, log in zip(to_fetch, pool.map(lambda i: _baseline_log(token, i), to_fetch)):
-                if isinstance(log, Exception):
+            for job_id, (log, why) in zip(to_fetch, pool.map(lambda i: _baseline_log(token, i), to_fetch)):
+                if log is None:
                     # A missing baseline log is a gap, not a failed check. None
                     # keeps the job from being fetched again for the next failure.
                     main_logs[job_id] = None
-                    gap(f"`main` log of job {job_id}", f"download failed ({log.__class__.__name__})")
+                    gap(f"`main` log of job {job_id}", why)
                     continue
                 (logs_dir / "main" / f"{job_id}.log").write_text(log)
                 main_logs[job_id] = parse_job_log(log)
