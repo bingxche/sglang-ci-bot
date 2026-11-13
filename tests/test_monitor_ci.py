@@ -940,6 +940,21 @@ class GitHubRetryTests(unittest.TestCase):
             with self.assertRaises(utils.requests.ConnectionError):
                 utils.gh_get("https://api.github.com/x", headers={})
 
+    def test_a_body_cut_off_mid_transfer_is_retried(self):
+        # 2026-11-12: "Connection broken: BrokenPipeError" while reading a job log.
+        import utils
+        err = utils.requests.exceptions.ChunkedEncodingError("broken")
+        with patch.object(utils.requests, "get", side_effect=[err, self.responses(200)[0]]):
+            self.assertEqual(utils.gh_get("https://api.github.com/x", headers={}).status_code, 200)
+
+    def test_reads_time_out_by_default(self):
+        # 2026-11-12: a read with no timeout hung a CI-status check for 2.5 hours.
+        import utils
+        with patch.object(utils.requests, "get", side_effect=self.responses(200, 200)) as get:
+            utils.gh_get("https://api.github.com/x", headers={})
+            utils.gh_get("https://api.github.com/x", headers={}, timeout=30)
+        self.assertEqual([c.kwargs["timeout"] for c in get.call_args_list], [utils.GH_TIMEOUT, 30])
+
     def test_a_502_no_longer_fails_the_monitor(self):
         # 2026-10-29 18:02: one 502 on the jobs list failed the pr-test-amd monitor job.
         import utils
