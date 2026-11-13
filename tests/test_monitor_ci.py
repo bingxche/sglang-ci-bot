@@ -955,15 +955,17 @@ class GitHubRetryTests(unittest.TestCase):
             utils.gh_get("https://api.github.com/x", headers={}, timeout=30)
         self.assertEqual([c.kwargs["timeout"] for c in get.call_args_list], [utils.GH_TIMEOUT, 30])
 
-    def test_no_script_reads_without_a_timeout(self):
+    def test_no_script_calls_github_without_a_timeout(self):
         # check_ci_for_pr, review_pr and analyze_url called requests.get directly,
-        # so a stalled connection there still hung forever after gh_get got one.
+        # and post_comment and other writes had no timeout either, so a stalled
+        # connection there still hung forever after gh_get got one.
         import ast
+        methods = {"get", "post", "patch", "put", "delete", "request"}
         missing = []
         for path in sorted((ROOT / "scripts").glob("*.py")):
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "get" and isinstance(node.func.value, ast.Name)
+                        and node.func.attr in methods and isinstance(node.func.value, ast.Name)
                         and node.func.value.id == "requests"
                         and not any(k.arg in ("timeout", None) for k in node.keywords)):
                     missing.append(f"{path.name}:{node.lineno}")

@@ -63,6 +63,7 @@ from monitor_ci import (
     parse_job_analyses_from_comment,
 )
 from utils import (
+    GH_TIMEOUT,
     REPO,
     claude_code_analyze,
     claude_code_available,
@@ -757,7 +758,7 @@ def find_tracker_issue(token: str, title: str) -> int | None:
 def _rename_issue(token: str, issue_num: int, title: str) -> None:
     resp = requests.patch(
         f"https://api.github.com/repos/{REPO}/issues/{issue_num}",
-        headers=gh_headers(token), json={"title": title},
+        headers=gh_headers(token), json={"title": title}, timeout=GH_TIMEOUT,
     )
     resp.raise_for_status()
 
