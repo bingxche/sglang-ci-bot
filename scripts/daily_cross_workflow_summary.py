@@ -65,7 +65,6 @@ from monitor_ci import (
     parse_job_analyses_from_comment,
 )
 from utils import (
-    REPO,
     CLAUDE_MODEL,
     agent_failure_notice,
     claude_code_analyze,

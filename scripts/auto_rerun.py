@@ -23,7 +23,6 @@ needs ``AUTO_RERUN_TOKEN``, a token with Actions write access on sglang
 """
 
 import logging
-import os
 import re
 from datetime import datetime, timedelta, timezone
 
