@@ -252,18 +252,19 @@ def deterministic_rows(workflow: str, analyses: list[dict]) -> list[dict]:
 #   {"version": 3,
 #    "active":  {"<test_file>::<test_function>": {test_file, test_function,
 #                cluster, error, job_url, job_name, job_id, detail_url, fix_pr,
-#                first_seen, last_seen, fail_runs, observed, streak, variants,
+#                first_seen, last_seen, fail_runs, failed, observed, streak, variants,
 #                back_from}},
 #    "archive": [[key, first_seen, last_seen, failed, observed, error], ...],
 #    "runs":    {"<run id>": [created_at, "rocm10"], ...}}
 #
-# ``fail_runs`` lists the scheduled runs (IDs) the test failed in. ``observed``
-# (completed scheduled runs of the same ROCm variant since its first failing
-# run) and ``streak`` (failing runs in a row, newest first) are recomputed
-# every tick by apply_run_stats(). ``runs`` caches each run's variant
-# (with_variants()). ``back_from`` is the old last_seen of a failure that
-# returned from the archive. Version 2 counted days and carried row IDs;
-# both were dropped to follow sgl-project/sglang#17050, which counts runs.
+# ``fail_runs`` lists the scheduled runs (IDs) the test failed in. ``failed``
+# (those inside the run window), ``observed`` (completed scheduled runs of
+# the same ROCm variant since its first failing run) and ``streak`` (failing
+# runs in a row, newest first) are recomputed every tick by
+# apply_run_stats(). ``runs`` caches each finished run's creation time and
+# variant (collect_runs()). ``back_from`` is the old last_seen of a failure
+# that returned from the archive. Version 2 counted days and carried row
+# IDs; both were dropped to follow sgl-project/sglang#17050, which counts runs.
 
 # "N/A", "unknown (likely test_x[17])", ... name no function.
 _PLACEHOLDER_FN_RE = re.compile(
@@ -550,42 +551,44 @@ def record_table_runs(state: dict, analyses: list[dict]) -> int:
     return added
 
 
-def apply_run_stats(state: dict, runs: list[tuple[str, str, str]]) -> None:
-    """Set each active entry's ``observed``, ``streak`` and ``variants`` from the runs.
+def apply_run_stats(state: dict, runs: dict[str, list], since: str) -> None:
+    """Set each active entry's ``failed``, ``observed``, ``streak`` and ``variants``.
 
-    ``runs`` are the completed scheduled runs on ``main`` as (id, created_at,
-    variant). Each scheduled run tests one ROCm image (``rocm10`` twice a day,
-    ``rocm724`` once), so a test is measured only against runs of the
-    variants it has failed on: a rocm724-only failure is "failed 3 of 3 runs
-    on rocm724", not "3 of 9 runs". Runs newer than the newest failing run
-    anywhere in the tracker are left out, because their analyses may not have
-    arrived yet. A failing run not in ``runs`` (still running) counts as the
-    newest run. ``first_seen`` moves back to the first failing run's date.
+    ``runs`` maps run ID → [created_at, variant, listed]: every run in the
+    window, plus every run an entry failed in (``listed`` is False for those
+    not in the completed-scheduled list, e.g. still running or cancelled).
+    Each scheduled run tests one ROCm image, so a test is measured only
+    against runs of the variants it failed on: a rocm724-only failure is
+    "failed 3 of 3 runs on rocm724", not "3 of 9 runs". A test's runs are
+    counted from its first failing run, but not before ``since``. Runs newer
+    than the newest failing run anywhere in the tracker are left out, because
+    their analyses may not have arrived yet. ``first_seen`` moves back to the
+    first failing run's date.
     """
-    when = {r: t for r, t, _ in runs}
-    variant = {r: v for r, _, v in runs}
-    known = [when[r] for e in state["active"].values() for r in e.get("fail_runs", []) if r in when]
+    def created(r):
+        return runs[r][0] if r in runs else ""
+
+    known = [created(r) for e in state["active"].values() for r in e.get("fail_runs", []) if r in runs]
     horizon = max(known) if known else ""
-    ordered = [r for r, t, _ in sorted(runs, key=lambda x: x[1]) if t <= horizon]
+    ordered = sorted((r for r, v in runs.items() if v[0] <= horizon), key=created)
     for e in state["active"].values():
-        all_fails = e.get("fail_runs", [])
-        fails = [r for r in all_fails if r in when]
-        pending = len(all_fails) - len(fails)
-        variants = sorted({variant[r] for r in fails if variant.get(r)})
+        fails = {r for r in e.get("fail_runs", []) if r in runs and created(r) >= since}
+        variants = sorted({runs[r][1] for r in fails if runs[r][1]})
         e["variants"] = variants
         if not fails:
-            e["observed"], e["streak"] = max(len(all_fails), 1), pending
+            n = len(e.get("fail_runs", [])) or 1
+            e["failed"], e["observed"], e["streak"] = n, n, 0
             continue
-        first = min(when[r] for r in fails)
+        first = min(created(r) for r in fails)
         window = [r for r in ordered
-                  if when[r] >= first and (not variants or variant.get(r) in variants)]
+                  if created(r) >= first and (runs[r][2] or r in fails)
+                  and (not variants or runs[r][1] in variants)]
         streak = 0
         for r in reversed(window):
             if r not in fails:
                 break
             streak += 1
-        e["observed"] = len(window) + pending
-        e["streak"] = streak + pending
+        e["failed"], e["observed"], e["streak"] = len(fails), len(window), streak
         e["first_seen"] = min(e.get("first_seen") or "9", first[:10])
 
 
@@ -594,7 +597,7 @@ def _archive_row(entry: dict) -> list:
     err = entry.get("error") or "—"
     if len(err) > 80:
         err = _truncate(err, 80)
-    failed = len(entry.get("fail_runs", []))
+    failed = entry.get("failed", len(entry.get("fail_runs", [])))
     return [key, entry.get("first_seen", ""), entry.get("last_seen", ""),
             failed, max(entry.get("observed", failed), failed), err]
 
@@ -687,7 +690,7 @@ def _runs_text(failed: int, observed: int, variants: list[str] | None = None) ->
 
 def _notes_cell(entry: dict, today: str) -> str:
     kind = classify(entry, today)
-    failed = len(entry.get("fail_runs", [])) or 1
+    failed = entry.get("failed") or len(entry.get("fail_runs", [])) or 1
     streak = entry.get("streak", 0)
     if kind == "broken" and streak < failed:
         kind = f"broken, last {streak} runs in a row"
@@ -699,7 +702,9 @@ def _notes_cell(entry: dict, today: str) -> str:
 
 def _test_cell(test_file: str, test_function: str) -> str:
     # The file name alone, like sgl-project/sglang#17050; the job log has the path.
-    name = (test_file or "—").rsplit("/", 1)[-1] if "/" in (test_file or "") else (test_file or "—")
+    name = test_file or "—"
+    if test_function or name.endswith(".py"):  # a path, not a step descriptor
+        name = name.rsplit("/", 1)[-1]
     if test_function:
         name += f"::{test_function}"
     return f"`{name}`"
@@ -766,7 +771,7 @@ def render_body(
     # Quiet active entries and the archive share one compact list, newest first.
     fixed = [
         (e.get("last_seen", ""), e.get("test_file", ""), e.get("test_function", ""),
-         e.get("first_seen", ""), len(e.get("fail_runs", [])) or 1,
+         e.get("first_seen", ""), e.get("failed") or len(e.get("fail_runs", [])) or 1,
          e.get("observed", 0), e.get("error") or "—", e.get("fix_pr") or "-")
         for e in entries if e.get("last_seen") != today
     ]
@@ -807,7 +812,8 @@ def render_body(
         "**Notes:** *broken* = failed in the latest runs one after another; *flaky* = "
         "failed again, but not in every run; *new* = failed in one run so far. "
         "\"Failed 5 of 12 runs on rocm724\" counts the completed scheduled runs on `main` "
-        "since the first failing one, among runs of the ROCm images it failed on (each "
+        f"since the first failing one (at most {RUN_WINDOW_DAYS} days back), among runs of "
+        "the ROCm images it failed on (each "
         "scheduled run tests one image). A test can fail in a different job each time "
         "(suites are re-partitioned), so runs, not jobs, are counted.",
         "",
@@ -984,40 +990,61 @@ def scheduled_runs(token: str, workflow: str, since: str) -> list[tuple[str, str
 
 
 _VARIANT_RE = re.compile(r"\((rocm\w+)")
+# How far back run counts reach; older failing runs are not counted.
+RUN_WINDOW_DAYS = 45
 
 
-def with_variants(token: str, state: dict, runs: list[tuple[str, str]]) -> list[tuple[str, str, str]]:
-    """Attach each run's ROCm variant, read from its job names and cached in ``state["runs"]``.
+def _run_variant(token: str, run_id: str) -> str:
+    resp = gh_get(
+        f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs",
+        headers=gh_headers(token), params={"per_page": 30},
+    )
+    resp.raise_for_status()
+    names = " ".join(j.get("name") or "" for j in resp.json().get("jobs", []))
+    m = _VARIANT_RE.search(names)
+    return m.group(1) if m else ""
 
-    One API call per run the cache has not seen; the cache keeps only the
-    runs passed in, so it stays as small as the run window.
+
+def collect_runs(token: str, state: dict, completed: list[tuple[str, str]]) -> dict[str, list]:
+    """Every run the counts need, as run ID → [created_at, variant, listed].
+
+    ``completed`` are the completed scheduled runs in the window. Runs some
+    entry failed in but that are not listed (still running, cancelled, or
+    older than the window) are fetched once. Each run's ROCm variant is read
+    from its job names. Finished runs are cached in ``state["runs"]`` as
+    [created_at, variant], so later ticks only look up new runs; the cache
+    keeps only the runs still needed.
     """
-    cache = state.setdefault("runs", {})
-    out = []
-    for run_id, created in runs:
-        if run_id not in cache:
-            resp = gh_get(
-                f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs",
-                headers=gh_headers(token), params={"per_page": 30},
-            )
+    cache = state.get("runs", {})
+    listed = dict(completed)
+    referenced = {r for e in state["active"].values() for r in e.get("fail_runs", [])}
+    out: dict[str, list] = {}
+    keep: dict[str, list] = {}
+    for run_id in set(listed) | referenced:
+        if run_id in cache:
+            made, variant = cache[run_id]
+            done = True
+        elif run_id in listed:
+            made, variant, done = listed[run_id], _run_variant(token, run_id), True
+        else:
+            resp = gh_get(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}",
+                          headers=gh_headers(token))
+            if resp.status_code == 404:
+                continue
             resp.raise_for_status()
-            names = " ".join(j.get("name") or "" for j in resp.json().get("jobs", []))
-            m = _VARIANT_RE.search(names)
-            cache[run_id] = [created, m.group(1) if m else ""]
-        out.append((run_id, created, cache[run_id][1]))
-    state["runs"] = {r: cache[r] for r, _ in runs}
+            run = resp.json()
+            made, variant = run["created_at"], _run_variant(token, run_id)
+            done = run.get("status") == "completed"
+        out[run_id] = [made, variant, run_id in listed]
+        if done:
+            keep[run_id] = [made, variant]
+    state["runs"] = keep
     return out
 
 
-def _runs_since(state: dict, today: str) -> str:
-    """The earliest date any active entry's runs can start (two days of slack)."""
-    firsts = [e["first_seen"] for e in state["active"].values() if e.get("first_seen")]
-    try:
-        start = datetime.strptime(min(firsts) if firsts else today, "%Y-%m-%d")
-    except ValueError:
-        start = datetime.strptime(today, "%Y-%m-%d")
-    floor = datetime.strptime(today, "%Y-%m-%d") - timedelta(days=ARCHIVE_KEEP_DAYS)
-    return max(start - timedelta(days=2), floor).strftime("%Y-%m-%d")
+def _runs_since(today: str) -> str:
+    start = datetime.strptime(today, "%Y-%m-%d") - timedelta(days=RUN_WINDOW_DAYS)
+    return start.strftime("%Y-%m-%d")
 
 
 _DAILY_TITLE = "[CI Monitor] Daily Report - "
@@ -1087,8 +1114,9 @@ def update_one_workflow(
     state = merge_state(state, rows, today, detail_base)
     record_table_runs(state, analyses or [])
     try:
-        runs = scheduled_runs(token, workflow, _runs_since(state, today))
-        apply_run_stats(state, with_variants(token, state, runs))
+        since = _runs_since(today)
+        runs = collect_runs(token, state, scheduled_runs(token, workflow, since))
+        apply_run_stats(state, runs, since)
     except Exception as exc:  # the counts wait for the next tick; the rows still update
         log.warning("[%s] could not list scheduled runs (%s); run counts not refreshed",
                     workflow, exc)

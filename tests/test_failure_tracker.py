@@ -204,22 +204,25 @@ class RecordTableRunsTest(unittest.TestCase):
 
 
 class ApplyRunStatsTest(unittest.TestCase):
-    RUNS = [  # one ROCm image per scheduled run, as on pr-test-amd.yml
-        ("1", "2026-11-10T01:10:00Z", "rocm10"), ("2", "2026-11-10T13:10:00Z", "rocm10"),
-        ("3", "2026-11-10T19:00:00Z", "rocm724"), ("4", "2026-11-11T01:10:00Z", "rocm10"),
-        ("5", "2026-11-11T13:10:00Z", "rocm10"), ("6", "2026-11-11T19:00:00Z", "rocm724"),
-        ("7", "2026-11-12T01:10:00Z", "rocm10"),
-    ]
+    # One ROCm image per scheduled run, as on pr-test-amd.yml: run ID →
+    # [created_at, variant, listed among completed scheduled runs].
+    RUNS = {
+        "1": ["2026-11-10T01:10:00Z", "rocm10", True], "2": ["2026-11-10T13:10:00Z", "rocm10", True],
+        "3": ["2026-11-10T19:00:00Z", "rocm724", True], "4": ["2026-11-11T01:10:00Z", "rocm10", True],
+        "5": ["2026-11-11T13:10:00Z", "rocm10", True], "6": ["2026-11-11T19:00:00Z", "rocm724", True],
+        "7": ["2026-11-12T01:10:00Z", "rocm10", True],
+    }
+    SINCE = "2026-10-01"
 
-    def _stats(self, fail_runs, first=TODAY):
-        state = _state(_entry("a", first, TODAY, fail_runs=fail_runs),
+    def _stats(self, fail_runs, runs=None, since=SINCE):
+        state = _state(_entry("a", TODAY, TODAY, fail_runs=fail_runs),
                        _entry("horizon", TODAY, TODAY, fail_runs=["7"]))
-        ft.apply_run_stats(state, self.RUNS)
+        ft.apply_run_stats(state, runs or self.RUNS, since)
         return state["active"]["test/a.py::test_x"]
 
     def test_counts_only_runs_of_the_images_it_failed_on(self):
         e = self._stats(["3", "6"])
-        self.assertEqual((e["observed"], e["streak"], e["variants"]), (2, 2, ["rocm724"]))
+        self.assertEqual((e["failed"], e["observed"], e["streak"], e["variants"]), (2, 2, 2, ["rocm724"]))
         self.assertEqual(e["first_seen"], "2026-11-10")  # moved back to the first failing run
         self.assertEqual(ft._notes_cell(e, TODAY), "broken · failed 2 of 2 runs on rocm724")
 
@@ -233,13 +236,21 @@ class ApplyRunStatsTest(unittest.TestCase):
 
     def test_runs_newer_than_any_analysis_are_not_counted_yet(self):
         state = _state(_entry("a", TODAY, TODAY, fail_runs=["1", "2"]))
-        ft.apply_run_stats(state, self.RUNS)
+        ft.apply_run_stats(state, self.RUNS, self.SINCE)
         e = state["active"]["test/a.py::test_x"]
         self.assertEqual((e["observed"], e["streak"]), (2, 2))
 
-    def test_a_failing_run_still_in_progress_counts_as_newest(self):
-        e = self._stats(["4", "5", "7", "8"])
-        self.assertEqual((e["observed"], e["streak"]), (4, 4))
+    def test_unlisted_failing_runs_count_by_their_own_time(self):
+        runs = dict(self.RUNS)
+        runs["8"] = ["2026-11-12T13:10:00Z", "rocm10", False]   # still running: the newest
+        runs["0"] = ["2026-11-09T13:10:00Z", "rocm10", False]   # cancelled, older
+        e = self._stats(["0", "5", "7", "8"], runs)
+        # Window: 0 (failed), 1, 2, 4, 5 (failed), 7 (failed), 8 (failed).
+        self.assertEqual((e["failed"], e["observed"], e["streak"]), (4, 7, 3))
+
+    def test_failing_runs_before_the_window_are_not_counted(self):
+        e = self._stats(["1", "4"], since="2026-11-11")
+        self.assertEqual((e["failed"], e["observed"]), (1, 3))
 
 
 class ArchiveQuietTest(unittest.TestCase):
@@ -316,6 +327,11 @@ class RenderTest(unittest.TestCase):
                       "(failed 2 of 6 runs since 2026-11-01) | - |", body)
         self.assertIn("`z.py::f` — old error (failed 2 of 5 runs since 2026-09-01)", body)
 
+    def test_step_names_keep_their_slashes(self):
+        self.assertEqual(ft._test_cell("step: Build sgl-kernel / install", ""),
+                         "`step: Build sgl-kernel / install`")
+        self.assertEqual(ft._test_cell("test/registered/a/test_b.py", "f"), "`test_b.py::f`")
+
     def test_newest_failures_first(self):
         failing = self._body().split("## Currently failing")[1].split("**Notes:**")[0]
         self.assertLess(failing.index("new.py"), failing.index("old_broken.py"))
@@ -384,15 +400,30 @@ class RunListTest(unittest.TestCase):
         self.assertEqual((params["event"], params["branch"], params["created"]),
                          ("schedule", "main", ">=2026-10-01"))
 
-    def test_variants_are_read_once_and_cached(self):
-        state = _state()
-        jobs = {"jobs": [{"name": "stage-a (rocm724, linux-mi35x)"}]}
-        with patch.object(ft, "gh_get", return_value=_resp(jobs)) as get:
-            out = ft.with_variants("t", state, [("5", "c")])
-            ft.with_variants("t", state, [("5", "c")])
-        self.assertEqual(out, [("5", "c", "rocm724")])
-        self.assertEqual(get.call_count, 1)
-        self.assertEqual(state["runs"], {"5": ["c", "rocm724"]})
+    def test_collect_runs_reads_each_variant_once_and_fetches_unlisted_runs(self):
+        state = _state(_entry("a", TODAY, TODAY, fail_runs=["5", "9"]))
+        jobs = _resp({"jobs": [{"name": "stage-a (rocm724, linux-mi35x)"}]})
+        run9 = _resp({"created_at": "z", "status": "in_progress"})
+        run9.status_code = 200
+
+        def fake_get(url, **kw):
+            return run9 if url.endswith("/runs/9") else jobs
+
+        with patch.object(ft, "gh_get", side_effect=fake_get) as get:
+            out = ft.collect_runs("t", state, [("5", "c")])
+            self.assertEqual(out, {"5": ["c", "rocm724", True], "9": ["z", "rocm724", False]})
+            # The finished run is cached; the running one is looked up again.
+            self.assertEqual(state["runs"], {"5": ["c", "rocm724"]})
+            calls = get.call_count
+            ft.collect_runs("t", state, [("5", "c")])
+            self.assertEqual(get.call_count, calls + 2)
+
+    def test_collect_runs_skips_a_deleted_run(self):
+        state = _state(_entry("a", TODAY, TODAY, fail_runs=["9"]))
+        gone = _resp({})
+        gone.status_code = 404
+        with patch.object(ft, "gh_get", return_value=gone):
+            self.assertEqual(ft.collect_runs("t", state, []), {})
 
 
 class BackfillRunsTest(unittest.TestCase):
