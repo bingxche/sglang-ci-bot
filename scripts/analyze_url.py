@@ -22,8 +22,6 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import requests
-
 from utils import (
     REPO,
     agent_failure_notice,
@@ -36,6 +34,7 @@ from utils import (
     cross_job_analysis,
     ensure_sglang_repo,
     get_failed_jobs,
+    gh_get,
     gh_headers,
     is_gate_job,
     is_runner_lost,
@@ -59,14 +58,14 @@ _RUN_URL_RE = re.compile(
 
 def get_run(token: str, run_id: int) -> dict:
     url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}"
-    resp = requests.get(url, headers=gh_headers(token))
+    resp = gh_get(url, headers=gh_headers(token))
     resp.raise_for_status()
     return resp.json()
 
 
 def get_job(token: str, job_id: int) -> dict:
     url = f"https://api.github.com/repos/{REPO}/actions/jobs/{job_id}"
-    resp = requests.get(url, headers=gh_headers(token))
+    resp = gh_get(url, headers=gh_headers(token))
     resp.raise_for_status()
     return resp.json()
 

@@ -11,8 +11,6 @@ import os
 import sys
 from datetime import datetime, timezone
 
-import requests
-
 from utils import (
     CLAUDE_MODEL,
     REPO,
@@ -21,6 +19,7 @@ from utils import (
     claude_code_analyze,
     claude_code_available,
     create_anthropic_client,
+    gh_get,
     gh_headers,
     load_prompt_template,
     post_comment,
@@ -32,7 +31,7 @@ MAX_DIFF_CHARS = 120000
 def get_pr_info(token: str, pr_number: int) -> dict:
     """Get PR metadata."""
     url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}"
-    resp = requests.get(url, headers=gh_headers(token))
+    resp = gh_get(url, headers=gh_headers(token))
     resp.raise_for_status()
     return resp.json()
 
@@ -42,7 +41,7 @@ def get_pr_diff(token: str, pr_number: int) -> str:
     url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}"
     headers = gh_headers(token)
     headers["Accept"] = "application/vnd.github.diff"
-    resp = requests.get(url, headers=headers)
+    resp = gh_get(url, headers=headers)
     resp.raise_for_status()
     diff = resp.text
     if len(diff) > MAX_DIFF_CHARS:
@@ -53,7 +52,7 @@ def get_pr_diff(token: str, pr_number: int) -> str:
 def get_pr_files(token: str, pr_number: int) -> list[dict]:
     """Get list of files changed in the PR."""
     url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}/files"
-    resp = requests.get(url, headers=gh_headers(token), params={"per_page": 100})
+    resp = gh_get(url, headers=gh_headers(token), params={"per_page": 100})
     resp.raise_for_status()
     return resp.json()
 
@@ -61,7 +60,7 @@ def get_pr_files(token: str, pr_number: int) -> list[dict]:
 def get_pr_comments(token: str, pr_number: int) -> list[dict]:
     """Get existing review comments on the PR."""
     url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}/comments"
-    resp = requests.get(url, headers=gh_headers(token), params={"per_page": 100})
+    resp = gh_get(url, headers=gh_headers(token), params={"per_page": 100})
     resp.raise_for_status()
     return resp.json()
 
@@ -69,7 +68,7 @@ def get_pr_comments(token: str, pr_number: int) -> list[dict]:
 def get_pr_review_comments(token: str, pr_number: int) -> list[dict]:
     """Get issue-level comments on the PR."""
     url = f"https://api.github.com/repos/{REPO}/issues/{pr_number}/comments"
-    resp = requests.get(url, headers=gh_headers(token), params={"per_page": 100})
+    resp = gh_get(url, headers=gh_headers(token), params={"per_page": 100})
     resp.raise_for_status()
     return resp.json()
 
@@ -79,7 +78,7 @@ def get_file_content(token: str, path: str, ref: str) -> str | None:
     url = f"https://api.github.com/repos/{REPO}/contents/{path}"
     headers = gh_headers(token)
     headers["Accept"] = "application/vnd.github.raw"
-    resp = requests.get(url, headers=headers, params={"ref": ref})
+    resp = gh_get(url, headers=headers, params={"ref": ref})
     if resp.status_code == 200:
         return resp.text
     return None

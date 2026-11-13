@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from utils import REPO, download_job_logs, gh_headers
+from utils import GH_TIMEOUT, REPO, download_job_logs, gh_headers
 
 log = logging.getLogger("ci-monitor")
 
@@ -131,7 +131,7 @@ def skip_reason(run: dict, now: datetime | None = None) -> str | None:
 
 
 def _post(url: str, token: str) -> None:
-    resp = requests.post(url, headers=gh_headers(token), json={})
+    resp = requests.post(url, headers=gh_headers(token), json={}, timeout=GH_TIMEOUT)
     if resp.status_code not in (201, 204):
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
 

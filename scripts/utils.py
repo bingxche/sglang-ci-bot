@@ -1099,7 +1099,7 @@ def post_comment(
 ) -> dict:
     """Post a comment on an issue or PR."""
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
-    resp = requests.post(url, headers=gh_headers(token), json={"body": body})
+    resp = requests.post(url, headers=gh_headers(token), json={"body": body}, timeout=GH_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -1107,7 +1107,7 @@ def post_comment(
 def update_comment(token: str, repo: str, comment_id: int, body: str) -> dict:
     """Update an existing comment on an issue or PR."""
     url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
-    resp = requests.patch(url, headers=gh_headers(token), json={"body": body})
+    resp = requests.patch(url, headers=gh_headers(token), json={"body": body}, timeout=GH_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -1143,7 +1143,7 @@ def update_issue_body(
             f"{GITHUB_ISSUE_BODY_MAX_BYTES}"
         )
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
-    resp = requests.patch(url, headers=gh_headers(token), json={"body": body})
+    resp = requests.patch(url, headers=gh_headers(token), json={"body": body}, timeout=GH_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -1151,7 +1151,7 @@ def update_issue_body(
 def delete_comment(token: str, repo: str, comment_id: int) -> None:
     """Delete a comment on an issue or PR. Silently no-op on 404."""
     url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
-    resp = requests.delete(url, headers=gh_headers(token))
+    resp = requests.delete(url, headers=gh_headers(token), timeout=GH_TIMEOUT)
     if resp.status_code == 404:
         return
     resp.raise_for_status()
@@ -1170,7 +1170,7 @@ def create_github_issue(
     data = {"title": title, "body": body}
     if labels:
         data["labels"] = labels
-    resp = requests.post(url, headers=gh_headers(token), json=data)
+    resp = requests.post(url, headers=gh_headers(token), json=data, timeout=GH_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
