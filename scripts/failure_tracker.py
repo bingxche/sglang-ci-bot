@@ -49,7 +49,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -113,11 +113,9 @@ ARCHIVE_KEEP_DAYS = 180
 MAX_BODY_BYTES = 250_000
 READ_BACK_DELAY_SECS = 5
 
-# State blob layout. Version 1 was a flat {key: entry} dict; it is upgraded
-# on load by upgrade_state().
-STATE_VERSION = 2
-# Row IDs (A1, A2, ...) are never reused, so a PR can cite "AMD tracker A12".
-ID_PREFIX = "A"
+# State blob layout. Versions 1 (a flat {key: entry} dict) and 2 (with row
+# IDs) are upgraded on load by upgrade_state().
+STATE_VERSION = 3
 
 # Body markers (generic, shared across all per-workflow tracker issues — they
 # are scoped inside each issue's own body). We always rewrite the FULL body,
@@ -251,16 +249,23 @@ def deterministic_rows(workflow: str, analyses: list[dict]) -> list[dict]:
 # 3. State persistence (the part the agent must NOT own)
 # ---------------------------------------------------------------------------
 #
-# State (version 2):
-#   {"version": 2, "next_id": 13,
-#    "active":  {"<test_file>::<test_function>": {id, test_file, test_function,
-#                cluster, error, job_url, job_id, detail_url, fix_pr,
-#                first_seen, last_seen, seen_days, streak_start, back_from}},
-#    "archive": [[id, key, first_seen, last_seen, seen_days, error], ...]}
+# State (version 3):
+#   {"version": 3,
+#    "active":  {"<test_file>::<test_function>": {test_file, test_function,
+#                cluster, error, job_url, job_name, job_id, detail_url, fix_pr,
+#                first_seen, last_seen, fail_runs, failed, observed, streak, variants,
+#                back_from}},
+#    "archive": [[key, first_seen, last_seen, failed, observed, error], ...],
+#    "runs":    {"<run id>": [created_at, "rocm10"], ...}}
 #
-# ``seen_days`` counts the days the failure was seen; ``streak_start`` is the
-# first day of the current run of consecutive days. ``back_from`` is the old
-# last_seen of a failure that returned from the archive.
+# ``fail_runs`` lists the scheduled runs (IDs) the test failed in. ``failed``
+# (those inside the run window), ``observed`` (completed scheduled runs of
+# the same ROCm variant since its first failing run) and ``streak`` (failing
+# runs in a row, newest first) are recomputed every tick by
+# apply_run_stats(). ``runs`` caches each finished run's creation time and
+# variant (collect_runs()). ``back_from`` is the old last_seen of a failure
+# that returned from the archive. Version 2 counted days and carried row
+# IDs; both were dropped to follow sgl-project/sglang#17050, which counts runs.
 
 # "N/A", "unknown (likely test_x[17])", ... name no function.
 _PLACEHOLDER_FN_RE = re.compile(
@@ -268,6 +273,52 @@ _PLACEHOLDER_FN_RE = re.compile(
 )
 # A trailing " (...)" note the agent appends, e.g. "test_x[17] (most likely; ...)".
 _ANNOTATION_RE = re.compile(r"\s+\(.*\)\s*$")
+# A parenthesised job name the agent appends to a step, e.g.
+# "(multimodal-gen-test-1-gpu-amd (rocm724, 2))".
+_JOB_HINT_RE = re.compile(r"amd|rocm\d|mi3\d|not a test", re.IGNORECASE)
+# The agent's many ways of naming a failed step: "step: X", "step timeout: X",
+# "step 'X' timeout", "pre-flight step X failed", "(step-level) X", ...
+_STEP_RE = re.compile(
+    r"^(?:n/a:\s*)?(?:\((?:step|step-level)\)\s*|(?:pre-flight\s+)?step(?:\s+timeout)?\b\s*:?\s*)(.+)$",
+    re.IGNORECASE,
+)
+_STEP_OUTCOME_RE = re.compile(r"\s+(?:failed|timed out|timeout)\s*$", re.IGNORECASE)
+_LOST_PREFIX = "runner lost during "
+# One test name: Class.method or function, an optional parametrize suffix.
+_TEST_NAME_RE = re.compile(r"^[A-Za-z_][\w.*]*(?:\[.*\])?$")
+_RUN_ID_RE = re.compile(r"/actions/runs/(\d+)")
+
+
+def _strip_job_parens(text: str) -> str:
+    """Drop trailing "(...)" groups that name a job, keeping ones like "(1-GPU)"."""
+    text = text.strip()
+    while text.endswith(")"):
+        depth = 0
+        for i in range(len(text) - 1, -1, -1):
+            depth += {")": 1, "(": -1}.get(text[i], 0)
+            if depth == 0:
+                break
+        else:
+            return text
+        if not _JOB_HINT_RE.search(text[i + 1 : -1]):
+            return text
+        text = text[:i].rstrip()
+    return text
+
+
+def _step_name(name: str) -> str:
+    name = name.split(", ", 1)[0].strip()
+    name = _STEP_OUTCOME_RE.sub("", name).strip()
+    return name.strip("'\"‘’").strip()
+
+
+def _canonical_descriptor(text: str) -> str:
+    """One form for a failure outside a test: ``step: X`` or ``runner lost during X``."""
+    text = _strip_job_parens(text)
+    if text.lower().startswith(_LOST_PREFIX):
+        return _LOST_PREFIX + _step_name(text[len(_LOST_PREFIX):])
+    m = _STEP_RE.match(text)
+    return f"step: {_step_name(m.group(1))}" if m else text
 
 
 def canonical_test(test_file: str, test_function: str) -> tuple[str, str]:
@@ -275,7 +326,8 @@ def canonical_test(test_file: str, test_function: str) -> tuple[str, str]:
 
     The agent writes the same test as ``Class::fn`` one day and ``Class.fn``
     the next, and adds notes like ``(most likely ...)``; each variant used to
-    start a new row with a new "Broken since".
+    start a new row with a new "Broken since". A failure outside a test gets
+    one descriptor form (``_canonical_descriptor``).
     """
     # Test names never contain backticks; the agent's Markdown leaves stray ones.
     tf = (test_file or "").replace("`", "").strip()
@@ -284,7 +336,57 @@ def canonical_test(test_file: str, test_function: str) -> tuple[str, str]:
     fn = _ANNOTATION_RE.sub("", (test_function or "").replace("`", "").strip())
     if _PLACEHOLDER_FN_RE.match(fn):
         fn = ""
+    if not fn:
+        tf = _canonical_descriptor(tf)
     return tf, fn.replace("::", ".")
+
+
+def _split_top_level(text: str, sep: str) -> list[str]:
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        depth += {"[": 1, "]": -1, "(": 1, ")": -1}.get(ch, 0)
+        if depth == 0 and text.startswith(sep, i):
+            parts.append(text[start:i])
+            start = i + len(sep)
+    parts.append(text[start:])
+    return parts
+
+
+def split_tests(test_file: str, test_function: str) -> list[tuple[str, str]]:
+    """Canonical (file, function) pairs; one agent row may name several tests.
+
+    The analysis's Failed Tests table sometimes puts several tests in one cell
+    (``test_a, test_b[x / y]``, ``test_c[1], [2]``); each becomes its own row.
+    Text that is not a test name (``10 tests``, ``subtest ...``) is dropped.
+    """
+    tf, fn = canonical_test(test_file, test_function)
+    if not fn:
+        return [(tf, fn)]
+    fn = _split_top_level(fn, ": ")[0]
+    names: list[str] = []
+    base = ""
+    for part in _split_top_level(fn, ","):
+        part = part.strip()
+        if part.startswith("[") and base:
+            part = base + part
+        if not _TEST_NAME_RE.match(part):
+            continue
+        stem, bracket, params = part.partition("[")
+        base = stem
+        variants = params[:-1].split(" / ") if bracket and " / " in params else None
+        if variants:
+            names += [f"{stem}[{v.strip()}]" for v in variants if v.strip()]
+        else:
+            names.append(part)
+    # "test_x[*]" means every variant, the same as the bare name.
+    names = [n[:-3] if n.endswith("[*]") else n for n in names]
+    names = list(dict.fromkeys(names)) or [fn]
+    return [(tf, n) for n in names]
+
+
+def _run_id(url: str) -> str:
+    m = _RUN_ID_RE.search(url or "")
+    return m.group(1) if m else ""
 
 
 def _load_raw_state(body: str) -> dict:
@@ -301,66 +403,72 @@ def _load_raw_state(body: str) -> dict:
     return {}
 
 
-def _id_number(entry_id: str) -> int:
-    try:
-        return int(entry_id[len(ID_PREFIX):])
-    except (TypeError, ValueError):
-        return 10**9
-
-
 def _absorb(active: dict, entry: dict) -> None:
-    """Add ``entry`` under its canonical key, merging with an existing one."""
-    tf, fn = canonical_test(entry.get("test_file") or "", entry.get("test_function") or "")
-    if not tf and not fn:
-        return
-    entry = {**entry, "test_file": tf, "test_function": fn}
-    key = f"{tf}::{fn}"
-    old = active.get(key)
-    if old is None:
-        active[key] = entry
-        return
-    if entry.get("last_seen", "") >= old.get("last_seen", ""):
-        newer, older = entry, old
-    else:
-        newer, older = old, entry
-    merged = {**older, **newer}
-    firsts = [d for d in (old.get("first_seen"), entry.get("first_seen")) if d]
-    if firsts:
-        merged["first_seen"] = min(firsts)
-    merged["seen_days"] = max(old.get("seen_days", 1), entry.get("seen_days", 1))
-    ids = [i for i in (old.get("id"), entry.get("id")) if i]
-    if ids:
-        merged["id"] = min(ids, key=_id_number)
-    active[key] = merged
+    """Add ``entry`` under its canonical key(s), merging with existing ones."""
+    for tf, fn in split_tests(entry.get("test_file") or "", entry.get("test_function") or ""):
+        if not tf and not fn:
+            continue
+        new = {**entry, "test_file": tf, "test_function": fn}
+        key = f"{tf}::{fn}"
+        old = active.get(key)
+        if old is None:
+            active[key] = new
+            continue
+        if new.get("last_seen", "") >= old.get("last_seen", ""):
+            newer, older = new, old
+        else:
+            newer, older = old, new
+        merged = {**older, **newer}
+        firsts = [d for d in (old.get("first_seen"), new.get("first_seen")) if d]
+        if firsts:
+            merged["first_seen"] = min(firsts)
+        if "fail_runs" in old or "fail_runs" in new:
+            merged["fail_runs"] = sorted(set(old.get("fail_runs", [])) | set(new.get("fail_runs", [])))
+        active[key] = merged
 
 
 def upgrade_state(raw: dict) -> dict:
-    """Return a version-2 state from any stored layout, keys re-normalized."""
-    if raw.get("version") == STATE_VERSION:
+    """Return a version-3 state from any stored layout, keys re-normalized.
+
+    Entries from older versions have no ``fail_runs``; needs_backfill() spots
+    them so the caller can rebuild their runs from the daily issues once.
+    """
+    version = raw.get("version")
+    if version == STATE_VERSION:
         old_active = [e for e in (raw.get("active") or {}).values() if isinstance(e, dict)]
-        archive = [a for a in raw.get("archive") or [] if isinstance(a, list) and len(a) >= 6]
-        next_id = int(raw.get("next_id") or 1)
+        archive_rows = [a for a in raw.get("archive") or [] if isinstance(a, list) and len(a) == 6]
     else:
-        # Version 1 kept only first/last seen: assume one day seen, or two if
-        # they differ, and no streak.
-        old_active = []
-        for e in raw.values():
-            if not isinstance(e, dict):
-                continue
-            first, last = e.get("first_seen", ""), e.get("last_seen", "")
-            e = {k: v for k, v in e.items() if k not in ("status", "run_started_at")}
-            e["seen_days"] = 1 if first == last else 2
-            e["streak_start"] = last
-            old_active.append(e)
-        archive, next_id = [], 1
+        if version == 2:
+            old_active = [e for e in (raw.get("active") or {}).values() if isinstance(e, dict)]
+        else:  # version 1: a flat {key: entry} dict
+            old_active = [e for e in raw.values() if isinstance(e, dict)]
+        old_active = [
+            {k: v for k, v in e.items()
+             if k not in ("id", "seen_days", "streak_start", "status", "run_started_at")}
+            for e in old_active
+        ]
+        # Version 2 archive rows: [id, key, first, last, seen_days, error]; the
+        # day count is not a run count, so it is dropped.
+        archive_rows = [
+            [a[1], a[2], a[3], 0, 0, a[5]] for a in raw.get("archive") or []
+            if version == 2 and isinstance(a, list) and len(a) >= 6
+        ]
     active: dict = {}
     for e in old_active:
         _absorb(active, e)
-    state = {"version": STATE_VERSION, "next_id": next_id, "active": active, "archive": archive}
-    for e in sorted(active.values(), key=lambda e: (e.get("first_seen", ""), e.get("test_file", ""))):
-        if not e.get("id"):
-            e["id"] = _next_id(state)
-    return state
+    archive: dict = {}
+    for key, first, last, failed, observed, err in archive_rows:
+        tf, _, fn = key.partition("::")
+        for ctf, cfn in split_tests(tf, fn):
+            ckey = f"{ctf}::{cfn}"
+            if ckey in active:
+                continue
+            old = archive.get(ckey)
+            if old is None or last > old[2]:
+                archive[ckey] = [ckey, min(first, old[1]) if old else first, last, failed, observed, err]
+    runs = raw.get("runs") if version == STATE_VERSION and isinstance(raw.get("runs"), dict) else {}
+    return {"version": STATE_VERSION, "active": active, "archive": list(archive.values()),
+            "runs": runs}
 
 
 def load_state(body: str) -> dict:
@@ -368,58 +476,121 @@ def load_state(body: str) -> dict:
     return upgrade_state(_load_raw_state(body))
 
 
-def _next_id(state: dict) -> str:
-    n = state["next_id"]
-    state["next_id"] = n + 1
-    return f"{ID_PREFIX}{n}"
+def needs_backfill(state: dict) -> bool:
+    """True if some entry predates run counting (no ``fail_runs`` yet)."""
+    return any("fail_runs" not in e for e in state["active"].values())
 
 
 def merge_state(state: dict, rows: list[dict], today: str, detail_base: str) -> dict:
     """Merge today's failures into the tracker; first_seen is kept while it fails.
 
-    - Active key → keep ``first_seen``; on a new day add one to ``seen_days``
-      and restart the streak unless it was also seen yesterday.
-    - Archived key → back to active with its old ID, dated today, with
-      ``back_from`` set to the day it was last seen before.
-    - New key → new ID, ``first_seen = last_seen = today``.
-    - Absent key → untouched → renders "quiet".
+    - Active key → keep ``first_seen``; record the row's run in ``fail_runs``.
+    - Archived key → back to active, dated today, with ``back_from`` set to
+      the day it was last seen before; its run history starts again.
+    - New key → ``first_seen = last_seen = today``.
+    - Absent key → untouched → renders under "No longer failing".
     """
     active, archive = state["active"], state["archive"]
     for r in rows:
-        tf, fn = canonical_test(r.get("test_file") or "", r.get("test_function") or "")
-        if not tf and not fn:
-            continue
-        key = f"{tf}::{fn}"
         job_id = r.get("job_id")
         latest = {
-            "test_file": tf,
-            "test_function": fn,
             "cluster": (r.get("cluster") or "").strip(),
             "error": _one_line(r.get("error") or ""),
             "job_url": (r.get("job_url") or "").strip(),
+            "job_name": (r.get("job_name") or "").strip(),
             "job_id": job_id,
             "detail_url": f"{detail_base}{job_id}" if detail_base and job_id else "",
         }
         if "fix_pr" in r:  # "" = the analysis found none
             latest["fix_pr"] = r["fix_pr"]
-        e = active.get(key)
-        if e is None:
-            back = next((a for a in archive if a[1] == key), None)
-            if back is not None:
-                archive.remove(back)
-                e = {"id": back[0], "back_from": back[3]}
-            else:
-                e = {"id": _next_id(state)}
-            e.update(first_seen=today, last_seen="", seen_days=0, streak_start=today)
-            active[key] = e
-        prev = e.get("last_seen", "")
-        if prev != today:
-            e["seen_days"] = e.get("seen_days", 0) + 1
-            if not (prev and prev < today and _days_between(prev, today) == 1):
-                e["streak_start"] = today
-        e.update(latest)
-        e["last_seen"] = today
+        run_id = _run_id(latest["job_url"])
+        for tf, fn in split_tests(r.get("test_file") or "", r.get("test_function") or ""):
+            if not tf and not fn:
+                continue
+            key = f"{tf}::{fn}"
+            e = active.get(key)
+            if e is None:
+                back = next((a for a in archive if a[0] == key), None)
+                e = {"back_from": back[2]} if back is not None else {}
+                if back is not None:
+                    archive.remove(back)
+                e.update(first_seen=today, fail_runs=[])
+                active[key] = e
+            if run_id and run_id not in e.setdefault("fail_runs", []):
+                e["fail_runs"].append(run_id)
+            e.update(latest, test_file=tf, test_function=fn, last_seen=today)
     return state
+
+
+_SAME_FILE = {"same file", "same", "same as above", "ditto", "〃"}
+
+
+def record_table_runs(state: dict, analyses: list[dict]) -> int:
+    """Add each analysis's run to the tracked tests its Failed Tests table names.
+
+    The agent reports one row per test, from its latest run, so a test that
+    failed in two runs of the same day would be counted once. The tables list
+    every failing job; only tests already tracked are touched. Returns how
+    many (test, run) pairs were added.
+    """
+    added = 0
+    for ja in analyses:
+        run_id = _run_id(ja.get("run_url") or "")
+        if not run_id:
+            continue
+        prev_file = ""
+        for row in deterministic_rows("", [ja]):
+            # Tables often write "same file" for the row above's file.
+            if row["test_file"].lower().strip(" .") in _SAME_FILE and prev_file:
+                row["test_file"] = prev_file
+            prev_file = row["test_file"]
+            for tf, fn in split_tests(row["test_file"], row["test_function"]):
+                e = state["active"].get(f"{tf}::{fn}")
+                if e is not None and run_id not in e.setdefault("fail_runs", []):
+                    e["fail_runs"].append(run_id)
+                    added += 1
+    return added
+
+
+def apply_run_stats(state: dict, runs: dict[str, list], since: str) -> None:
+    """Set each active entry's ``failed``, ``observed``, ``streak`` and ``variants``.
+
+    ``runs`` maps run ID → [created_at, variant, listed]: every run in the
+    window, plus every run an entry failed in (``listed`` is False for those
+    not in the completed-scheduled list, e.g. still running or cancelled).
+    Each scheduled run tests one ROCm image, so a test is measured only
+    against runs of the variants it failed on: a rocm724-only failure is
+    "failed 3 of 3 runs on rocm724", not "3 of 9 runs". A test's runs are
+    counted from its first failing run, but not before ``since``. Runs newer
+    than the newest failing run anywhere in the tracker are left out, because
+    their analyses may not have arrived yet. ``first_seen`` moves back to the
+    first failing run's date.
+    """
+    def created(r):
+        return runs[r][0] if r in runs else ""
+
+    known = [created(r) for e in state["active"].values() for r in e.get("fail_runs", []) if r in runs]
+    horizon = max(known) if known else ""
+    ordered = sorted((r for r, v in runs.items() if v[0] <= horizon), key=created)
+    for e in state["active"].values():
+        fails = {r for r in e.get("fail_runs", []) if r in runs and created(r) >= since}
+        variants = sorted({runs[r][1] for r in fails if runs[r][1]})
+        e["variants"] = variants
+        if not fails:
+            n = len(e.get("fail_runs", [])) or 1
+            e["failed"], e["observed"], e["streak"] = n, n, 0
+            continue
+        first = min(created(r) for r in fails)
+        window = [r for r in ordered
+                  if created(r) >= first and (runs[r][2] or r in fails)
+                  and (not variants or runs[r][1] in variants)]
+        streak = 0
+        for r in reversed(window):
+            if r not in fails:
+                break
+            streak += 1
+        e["failed"], e["observed"], e["streak"] = len(fails), len(window), streak
+        e["first_seen"] = min(e.get("first_seen") or "9", first[:10])
 
 
 def _archive_row(entry: dict) -> list:
@@ -427,8 +598,9 @@ def _archive_row(entry: dict) -> list:
     err = entry.get("error") or "—"
     if len(err) > 80:
         err = _truncate(err, 80)
-    return [entry.get("id", ""), key, entry.get("first_seen", ""),
-            entry.get("last_seen", ""), entry.get("seen_days", 1), err]
+    failed = entry.get("failed", len(entry.get("fail_runs", [])))
+    return [key, entry.get("first_seen", ""), entry.get("last_seen", ""),
+            failed, max(entry.get("observed", failed), failed), err]
 
 
 def archive_quiet(state: dict, today: str, retention_days: int = RETENTION_DAYS) -> tuple[int, int]:
@@ -444,7 +616,7 @@ def archive_quiet(state: dict, today: str, retention_days: int = RETENTION_DAYS)
         state["archive"].append(_archive_row(state["active"].pop(key)))
     before = len(state["archive"])
     state["archive"] = [
-        a for a in state["archive"] if _days_between(a[3], today) <= ARCHIVE_KEEP_DAYS
+        a for a in state["archive"] if _days_between(a[2], today) <= ARCHIVE_KEEP_DAYS
     ]
     return len(stale), before - len(state["archive"])
 
@@ -492,10 +664,6 @@ def _truncate(text: str, limit: int) -> str:
     return text[: limit - 1].rstrip().rstrip("\\") + "…"
 
 
-def _cell(text: str) -> str:
-    return _one_line(text, limit=80)
-
-
 def _days_between(start: str, end: str) -> int:
     try:
         d0 = datetime.strptime(start, "%Y-%m-%d")
@@ -506,68 +674,76 @@ def _days_between(start: str, end: str) -> int:
 
 
 def classify(entry: dict, today: str) -> str:
-    """``broken`` / ``intermittent`` / ``new`` / ``quiet`` (see render_body)."""
+    """``broken`` / ``flaky`` / ``new`` / ``fixed``, counted in runs (see render_body)."""
     if entry.get("last_seen") != today:
-        return "quiet"
-    if _days_between(entry.get("streak_start") or today, today) >= 1:
+        return "fixed"
+    if entry.get("streak", 0) >= 2:
         return "broken"
-    if entry.get("seen_days", 1) > 1 or entry.get("back_from"):
-        return "intermittent"
-    return "new"
+    if len(entry.get("fail_runs", [])) <= 1 and not entry.get("back_from"):
+        return "new"
+    return "flaky"
 
 
-def _state_cell(entry: dict, today: str) -> str:
+def _runs_text(failed: int, observed: int, variants: list[str] | None = None) -> str:
+    on = f" on {', '.join(variants)}" if variants else ""
+    return f"failed {failed} of {max(observed, failed)} runs{on}"
+
+
+def _notes_cell(entry: dict, today: str) -> str:
     kind = classify(entry, today)
-    if kind == "broken":
-        return f"🔴 broken {_days_between(entry['streak_start'], today) + 1}d"
-    if kind == "intermittent":
-        return "🟡 intermittent"
-    if kind == "new":
-        return "🆕 new"
-    return f"⚪ quiet {_days_between(entry.get('last_seen', ''), today)}d"
-
-
-def _seen_cell(entry: dict) -> str:
-    span = _days_between(entry.get("first_seen", ""), entry.get("last_seen", "")) + 1
-    txt = f"{entry.get('seen_days', 1)}/{span}d"
+    failed = entry.get("failed") or len(entry.get("fail_runs", [])) or 1
+    streak = entry.get("streak", 0)
+    if kind == "broken" and streak < failed:
+        kind = f"broken, last {streak} runs in a row"
+    txt = f"{kind} · {_runs_text(failed, entry.get('observed', failed), entry.get('variants'))}"
     if entry.get("back_from"):
-        txt += f" · back (was quiet since {entry['back_from']})"
+        txt += f"; failing again, the failure before was on {entry['back_from']}"
     return txt
 
 
 def _test_cell(test_file: str, test_function: str) -> str:
+    # The file name alone, like sgl-project/sglang#17050; the job log has the path.
     name = test_file or "—"
+    if test_function or name.endswith(".py"):  # a path, not a step descriptor
+        name = name.rsplit("/", 1)[-1]
     if test_function:
         name += f"::{test_function}"
     return f"`{name}`"
 
 
+def _job_cell(entry: dict) -> str:
+    url, name = entry.get("job_url") or "", (entry.get("job_name") or "").replace("|", "\\|")
+    if url:
+        return f"[{name or 'job'}]({url})"
+    return name or "—"
+
+
 def _render_row(entry: dict, today: str) -> str:
-    job_url = entry.get("job_url") or ""
-    job = f"[job]({job_url})" if job_url else "—"
-    detail = f"[详情]({entry['detail_url']})" if entry.get("detail_url") else "—"
+    detail = f"[Detail]({entry['detail_url']})" if entry.get("detail_url") else "—"
     return (
-        f"| {entry.get('id', '—')} | {_state_cell(entry, today)} "
-        f"| {entry.get('first_seen', '?')} | {entry.get('last_seen', '?')} "
-        f"| {_seen_cell(entry)} "
+        f"| {entry.get('first_seen', '?')} "
         f"| {_test_cell(entry.get('test_file', ''), entry.get('test_function', ''))} "
-        f"| {_cell(entry.get('cluster') or '—')} | {entry.get('error') or '—'} "
-        f"| {entry.get('fix_pr') or '—'} | {job} | {detail} |"
+        f"| {_job_cell(entry)} | {entry.get('error') or '—'} "
+        f"| {_notes_cell(entry, today)} | {entry.get('fix_pr') or '-'} | {detail} |"
     )
 
 
 _TABLE_HEADER = (
-    "| ID | State | Broken since | Last seen | Seen | Test | Cluster | Error "
-    "| Fix PR | Job | Detail |\n"
-    "|---|---|---|---|---|---|---|---|---|---|---|"
+    "| Broken since | Test | Latest failing job | Error | Notes "
+    "| Fix PR (from AI analysis, may be wrong) | Detail |\n"
+    "|------|------|---------|-------|-------|--------|-------|"
 )
 
-_ARCHIVE_HEADER = (
-    "| ID | Test | Broken since | Last seen | Seen | Error |\n"
-    "|---|---|---|---|---|---|"
+_FIXED_HEADER = (
+    "| Last failed | Issue | Fix PR (from AI analysis, may be wrong) |\n"
+    "|------|-------|-----|"
 )
 
-_KIND_ORDER = {"broken": 0, "intermittent": 1, "new": 2}
+_KIND_ORDER = {"broken": 0, "flaky": 1, "new": 2}
+
+CI_FAILURE_MONITOR_URL = (
+    "https://github.com/sgl-project/sglang/actions/workflows/ci-failure-monitor.yml"
+)
 
 
 def _state_blob(state: dict) -> str:
@@ -584,82 +760,84 @@ def render_body(
     snapshot_utc: str,
     bot_daily_url: str,
 ) -> str:
-    """Render a single workflow Failure Tracker issue body (state blob + tables)."""
+    """Render one workflow's Failure Tracker body, laid out like sgl-project/sglang#17050."""
     today = snapshot_utc.split(" ")[0]
     entries = list(state["active"].values())
     failing = [e for e in entries if e.get("last_seen") == today]
-    quiet = [e for e in entries if e.get("last_seen") != today]
-    failing.sort(key=lambda e: (
-        _KIND_ORDER[classify(e, today)], e.get("streak_start", ""),
-        -e.get("seen_days", 1), e.get("first_seen", ""), e.get("test_file", ""),
-    ))
-    quiet.sort(key=lambda e: (e.get("last_seen", ""), e.get("first_seen", "")), reverse=True)
-    archive = sorted(state["archive"], key=lambda a: (a[3], a[2]), reverse=True)
+    # Newest failures first.
+    failing.sort(key=lambda e: (e.get("first_seen", ""), e.get("test_file", ""),
+                                e.get("test_function", "")), reverse=True)
     counts = {k: sum(1 for e in failing if classify(e, today) == k) for k in _KIND_ORDER}
+
+    # Quiet active entries and the archive share one compact list, newest first.
+    fixed = [
+        (e.get("last_seen", ""), e.get("test_file", ""), e.get("test_function", ""),
+         e.get("first_seen", ""), e.get("failed") or len(e.get("fail_runs", [])) or 1,
+         e.get("observed", 0), e.get("error") or "—", e.get("fix_pr") or "-")
+        for e in entries if e.get("last_seen") != today
+    ]
+    for key, first, last, failed, observed, err in state["archive"]:
+        tf, _, fn = key.partition("::")
+        fixed.append((last, tf, fn, first, failed, observed, err, "-"))
+    fixed.sort(key=lambda f: (f[0], f[1], f[2]), reverse=True)
 
     lines = [
         BODY_START,
         _state_blob(state),
-        f"# {display} — Failure Tracker",
+        f"# [Failure Tracker] {display}",
         "",
-        f"_Maintained by amd-bot · workflow `{workflow}` (scheduled runs on `main`) · "
-        f"last updated {snapshot_utc}_",
+        f"This issue tracks test failures in the scheduled `{workflow}` runs on `main`, "
+        "kept up to date by amd-bot. A failure keeps its **Broken since** date for as "
+        "long as it keeps failing.",
         "",
-        f"**{counts['broken']} broken · {counts['intermittent']} intermittent · "
-        f"{counts['new']} new · {len(quiet)} quiet · {len(archive)} archived**",
+        f"**Last auto-update:** {snapshot_utc} — {counts['broken']} broken, "
+        f"{counts['flaky']} flaky, {counts['new']} new, {len(fixed)} no longer failing",
         "",
-        f"This tracker lists the test failures of `{workflow}` and how long each "
-        "has been red; a failure keeps its **Broken since** date for as long as it "
-        f"keeps failing. It complements the bot's [daily report]({bot_daily_url}) "
-        "(a rolling recent-days view) — click **Detail** on any row to jump to the "
-        "full analysis (stack trace, suspected commits, in-flight fixes) in that "
-        "day's daily report.",
+        "## Quick Links",
         "",
-        "- **State**: 🔴 broken = failed in the latest scan and on every day of the "
-        "current streak (its length is shown) · 🟡 intermittent = failed in the "
-        "latest scan, and on earlier days, but not the day before · 🆕 new = first "
-        "seen in the latest scan · ⚪ quiet = not in the latest scan (fixed, or "
-        "simply did not re-run — check **Last seen**).",
-        "- **Seen** = days it failed / days from **Broken since** to **Last seen**.",
-        "- **Fix PR** = the in-flight fix the daily analysis found, if any.",
-        f"- **ID** is never reused, so it can be cited (\"AMD tracker {ID_PREFIX}12\"). "
-        f"A failure quiet for over {RETENTION_DAYS} days moves to **Archived**, one "
-        "line each, and keeps its ID if it comes back.",
+        f"- **[Daily report]({bot_daily_url})** - today's per-job analyses "
+        "(stack traces, suspected commits, in-flight fixes)",
+        f"- **[CI Failure Monitor]({CI_FAILURE_MONITOR_URL})** - sglang's own "
+        "failure-streak report across backends",
         "",
-        "## Currently failing (latest scan)",
+        "---",
+        "",
+        "## Currently failing",
         "",
     ]
     if failing:
         lines += [_TABLE_HEADER] + [_render_row(e, today) for e in failing] + [""]
     else:
-        lines += [f"_No `{workflow}` failures observed in the latest scan._", ""]
-
-    if quiet:
+        lines += [f"_No `{workflow}` failures in the latest scan._", ""]
+    lines += [
+        "**Notes:** *broken* = failed in the latest runs one after another; *flaky* = "
+        "failed again, but not in every run; *new* = failed in one run so far. "
+        "\"Failed 5 of 12 runs on rocm724\" counts the completed scheduled runs on `main` "
+        f"since the first failing one (at most {RUN_WINDOW_DAYS} days back), among runs of "
+        "the ROCm images it failed on (each "
+        "scheduled run tests one image). A test can fail in a different job each time "
+        "(suites are re-partitioned), so runs, not jobs, are counted.",
+        "",
+        "---",
+        "",
+    ]
+    if fixed:
         lines += [
-            "<details><summary><b>⚪ Quiet / no longer observed failing "
-            f"({len(quiet)})</b> · click to expand</summary>",
+            "<details>",
+            f"<summary><h2>No longer failing ({len(fixed)}, click to expand)</h2></summary>",
             "",
-            _TABLE_HEADER,
+            f"Not seen in the latest scan: fixed, or not run again. After {RETENTION_DAYS} "
+            f"quiet days a failure is kept here in short form for {ARCHIVE_KEEP_DAYS} days.",
+            "",
+            _FIXED_HEADER,
         ]
-        lines += [_render_row(e, today) for e in quiet]
+        for last, tf, fn, first, failed, observed, err, fix in fixed:
+            err = _truncate(err, 70) if len(err) > 70 else err
+            runs = f"{_runs_text(failed, observed)} since {first}" if observed else f"since {first}"
+            lines.append(f"| {last} | {_test_cell(tf, fn)} — {err} ({runs}) | {fix} |")
         lines += ["", "</details>", ""]
 
-    if archive:
-        lines += [
-            f"<details><summary><b>🗄️ Archived: not seen for over {RETENTION_DAYS} days "
-            f"({len(archive)})</b> · click to expand</summary>",
-            "",
-            _ARCHIVE_HEADER,
-        ]
-        for a_id, key, first, last, seen, err in (a[:6] for a in archive):
-            tf, _, fn = key.partition("::")
-            span = _days_between(first, last) + 1
-            lines.append(
-                f"| {a_id} | {_test_cell(tf, fn)} | {first} | {last} | {seen}/{span}d | {err} |"
-            )
-        lines += ["", "</details>", ""]
-
-    lines += ["---", f"*Auto-generated by amd-bot · {snapshot_utc}*", BODY_END]
+    lines += [f"*Auto-generated by amd-bot · {snapshot_utc}*", BODY_END]
     return "\n".join(lines)
 
 
@@ -688,7 +866,7 @@ def render_bounded_body(
         # An entry is a few hundred bytes: shed in batches, not one per render.
         batch = max(1, (size - max_bytes) // 300)
         if state["archive"]:
-            state["archive"].sort(key=lambda a: (a[3], a[2]))
+            state["archive"].sort(key=lambda a: (a[2], a[1]))
             n = min(batch, len(state["archive"]))
             del state["archive"][:n]
             dropped += n
@@ -789,6 +967,128 @@ def find_or_create_tracker_issue(token: str, cfg: dict) -> int:
     return issue["number"]
 
 
+def scheduled_runs(token: str, workflow: str, since: str) -> list[tuple[str, str]]:
+    """Completed scheduled runs of ``workflow`` on ``main`` since ``since``, as (id, created_at).
+
+    Cancelled runs are left out; a re-run keeps its run ID and creation time.
+    """
+    out: list[tuple[str, str]] = []
+    page = 1
+    while True:
+        resp = gh_get(
+            f"https://api.github.com/repos/{REPO}/actions/workflows/{workflow}/runs",
+            headers=gh_headers(token),
+            params={"event": "schedule", "branch": "main", "status": "completed",
+                    "created": f">={since}", "per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        batch = resp.json().get("workflow_runs", [])
+        out += [(str(r["id"]), r["created_at"]) for r in batch
+                if r.get("conclusion") in ("success", "failure")]
+        if len(batch) < 100:
+            return out
+        page += 1
+
+
+_VARIANT_RE = re.compile(r"\((rocm\w+)")
+# How far back run counts reach; older failing runs are not counted.
+RUN_WINDOW_DAYS = 45
+
+
+def _run_variant(token: str, run_id: str) -> str:
+    resp = gh_get(
+        f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs",
+        headers=gh_headers(token), params={"per_page": 30},
+    )
+    resp.raise_for_status()
+    names = " ".join(j.get("name") or "" for j in resp.json().get("jobs", []))
+    m = _VARIANT_RE.search(names)
+    return m.group(1) if m else ""
+
+
+def collect_runs(token: str, state: dict, completed: list[tuple[str, str]]) -> dict[str, list]:
+    """Every run the counts need, as run ID → [created_at, variant, listed].
+
+    ``completed`` are the completed scheduled runs in the window. Runs some
+    entry failed in but that are not listed (still running, cancelled, or
+    older than the window) are fetched once. Each run's ROCm variant is read
+    from its job names. Finished runs are cached in ``state["runs"]`` as
+    [created_at, variant], so later ticks only look up new runs; the cache
+    keeps only the runs still needed.
+    """
+    cache = state.get("runs", {})
+    listed = dict(completed)
+    referenced = {r for e in state["active"].values() for r in e.get("fail_runs", [])}
+    out: dict[str, list] = {}
+    keep: dict[str, list] = {}
+    for run_id in set(listed) | referenced:
+        if run_id in cache:
+            made, variant = cache[run_id]
+            done = True
+        elif run_id in listed:
+            made, variant, done = listed[run_id], _run_variant(token, run_id), True
+        else:
+            resp = gh_get(f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}",
+                          headers=gh_headers(token))
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            run = resp.json()
+            made, variant = run["created_at"], _run_variant(token, run_id)
+            done = run.get("status") == "completed"
+        out[run_id] = [made, variant, run_id in listed]
+        if done:
+            keep[run_id] = [made, variant]
+    state["runs"] = keep
+    return out
+
+
+def _runs_since(today: str) -> str:
+    start = datetime.strptime(today, "%Y-%m-%d") - timedelta(days=RUN_WINDOW_DAYS)
+    return start.strftime("%Y-%m-%d")
+
+
+_DAILY_TITLE = "[CI Monitor] Daily Report - "
+
+
+def backfill_runs(token: str, bot_repo: str, state: dict, workflow: str) -> int:
+    """Rebuild ``fail_runs`` once for entries stored before runs were counted.
+
+    Reads the Failed Tests tables of every daily issue since the earliest such
+    entry's first_seen. Returns how many (test, run) pairs were found.
+    """
+    old = [e for e in state["active"].values() if "fail_runs" not in e]
+    if not old:
+        return 0
+    since = min((e.get("first_seen") or "9") for e in old)
+    added = 0
+    page = 1
+    while True:
+        resp = gh_get(
+            f"https://api.github.com/repos/{bot_repo}/issues",
+            headers=gh_headers(token),
+            params={"labels": "ci-monitor", "state": "all", "per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        for issue in batch:
+            title = issue.get("title") or ""
+            if title.startswith(_DAILY_TITLE) and title[len(_DAILY_TITLE):] >= since:
+                analyses = collect_tracked_analyses(token, bot_repo, issue["number"]).get(workflow, [])
+                added += record_table_runs(state, analyses)
+        if len(batch) < 100:
+            break
+        page += 1
+    for e in old:
+        e.setdefault("fail_runs", [])
+        run_id = _run_id(e.get("job_url") or "")
+        if run_id and run_id not in e["fail_runs"]:
+            e["fail_runs"].append(run_id)
+    log.info("[%s] backfilled %d failing runs for %d entries since %s",
+             workflow, added, len(old), since)
+    return added
+
+
 def update_one_workflow(
     token: str,
     workflow: str,
@@ -797,6 +1097,7 @@ def update_one_workflow(
     daily_issue_num: int | None,
     rows: list[dict],
     snapshot_utc: str,
+    analyses: list[dict] | None = None,
 ) -> int | None:
     """Merge one workflow's failures into its own upstream tracker issue."""
     today = snapshot_utc.split(" ")[0]
@@ -809,7 +1110,17 @@ def update_one_workflow(
     issue_num = find_or_create_tracker_issue(token, cfg)
     issue = get_issue(token, REPO, issue_num)
     state = load_state(issue.get("body", ""))
+    if needs_backfill(state):
+        backfill_runs(token, bot_repo, state, workflow)
     state = merge_state(state, rows, today, detail_base)
+    record_table_runs(state, analyses or [])
+    try:
+        since = _runs_since(today)
+        runs = collect_runs(token, state, scheduled_runs(token, workflow, since))
+        apply_run_stats(state, runs, since)
+    except Exception as exc:  # the counts wait for the next tick; the rows still update
+        log.warning("[%s] could not list scheduled runs (%s); run counts not refreshed",
+                    workflow, exc)
     archived, expired = archive_quiet(state, today)
 
     new_body, dropped = render_bounded_body(
@@ -971,10 +1282,12 @@ def update_trackers(
             # Single tracked workflow: tolerate a missing/blank workflow tag.
             by_wf[next(iter(TRACKED_WORKFLOWS))].append(r)
 
-    # The fix PR comes from the job's own analysis, by code, not the agent.
+    # The fix PR and job name come from the job's own analysis, by code, not the agent.
     for wf, wf_rows in by_wf.items():
         fixes = fix_prs_by_job(wf_analyses.get(wf, []))
+        names = {str(ja.get("job_id")): ja.get("job_name") or "" for ja in wf_analyses.get(wf, [])}
         for r in wf_rows:
+            r["job_name"] = names.get(str(r.get("job_id")), "")
             fix = fixes.get(str(r.get("job_id")))
             if fix is not None:
                 r["fix_pr"] = fix
@@ -984,6 +1297,7 @@ def update_trackers(
         try:
             results[wf] = update_one_workflow(
                 token, wf, cfg, bot_repo, issue_num, by_wf[wf], snapshot_utc,
+                analyses=wf_analyses.get(wf, []),
             )
         except Exception as exc:
             log.error("[%s] tracker update failed (%s)", wf, exc)
