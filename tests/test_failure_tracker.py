@@ -82,6 +82,8 @@ class CanonicalTestTest(unittest.TestCase):
             "step Run diffusion unit tests timed out",
             "(step-level) Run diffusion unit tests, run_suite.py --suite unit --partition-id 3",
             "step: Run diffusion unit tests (not a test)",
+            # Seen on #45847 on 2026-11-14.
+            "step: Run diffusion unit tests timeout (retry loop reruns whole partition)",
         ):
             self.assertEqual(ft.canonical_test(desc, "N/A"), ("step: Run diffusion unit tests", ""), desc)
         self.assertEqual(
@@ -201,6 +203,21 @@ class RecordTableRunsTest(unittest.TestCase):
         self.assertEqual(state["active"]["t/a.py::test_1"]["fail_runs"], ["100", "101"])
         self.assertEqual(state["active"]["t/a.py::test_2"]["fail_runs"], ["101"])
         self.assertNotIn("t/new.py::test_n", state["active"])  # only tracked tests are touched
+
+
+class FillJobNamesTest(unittest.TestCase):
+    def test_names_only_entries_without_one(self):
+        # Rows written before job names were stored stayed "[job]" until refilled.
+        state = _state(_entry("a", TODAY, TODAY, job_id=7),
+                       _entry("b", TODAY, TODAY, job_id=8, job_name="kept"),
+                       _entry("c", TODAY, TODAY, job_id=9))
+        ft.fill_job_names(state, [{"job_id": "7", "job_name": "stage-a (rocm10)"},
+                                  {"job_id": 8, "job_name": "other"}])
+        names = {k: e.get("job_name") for k, e in state["active"].items()}
+        self.assertEqual(names, {"test/a.py::test_x": "stage-a (rocm10)",
+                                 "test/b.py::test_x": "kept", "test/c.py::test_x": ""})
+        self.assertIn("[stage-a (rocm10)](", ft._job_cell({**state["active"]["test/a.py::test_x"],
+                                                           "job_url": "u"}))
 
 
 class ApplyRunStatsTest(unittest.TestCase):

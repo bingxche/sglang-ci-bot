@@ -282,7 +282,8 @@ _STEP_RE = re.compile(
     r"^(?:n/a:\s*)?(?:\((?:step|step-level)\)\s*|(?:pre-flight\s+)?step(?:\s+timeout)?\b\s*:?\s*)(.+)$",
     re.IGNORECASE,
 )
-_STEP_OUTCOME_RE = re.compile(r"\s+(?:failed|timed out|timeout)\s*$", re.IGNORECASE)
+# The outcome word and anything after it, e.g. " timeout (retry loop reruns ...)".
+_STEP_OUTCOME_RE = re.compile(r"\s+(?:failed|timed out|timeout)\b.*$", re.IGNORECASE)
 _LOST_PREFIX = "runner lost during "
 # One test name: Class.method or function, an optional parametrize suffix.
 _TEST_NAME_RE = re.compile(r"^[A-Za-z_][\w.*]*(?:\[.*\])?$")
@@ -550,6 +551,14 @@ def record_table_runs(state: dict, analyses: list[dict]) -> int:
                     e["fail_runs"].append(run_id)
                     added += 1
     return added
+
+
+def fill_job_names(state: dict, analyses: list[dict]) -> None:
+    """Name the latest job of entries that have none, from today's analyses."""
+    names = {str(ja.get("job_id")): ja.get("job_name") or "" for ja in analyses}
+    for e in state["active"].values():
+        if not e.get("job_name") and names.get(str(e.get("job_id"))):
+            e["job_name"] = names[str(e.get("job_id"))]
 
 
 def apply_run_stats(state: dict, runs: dict[str, list], since: str) -> None:
@@ -1114,6 +1123,7 @@ def update_one_workflow(
         backfill_runs(token, bot_repo, state, workflow)
     state = merge_state(state, rows, today, detail_base)
     record_table_runs(state, analyses or [])
+    fill_job_names(state, analyses or [])
     try:
         since = _runs_since(today)
         runs = collect_runs(token, state, scheduled_runs(token, workflow, since))
