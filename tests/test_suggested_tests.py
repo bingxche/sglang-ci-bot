@@ -55,8 +55,8 @@ class BlockTest(unittest.TestCase):
         self.assertNotIn("test-selection", ts.strip_block(report))
         result = ts.check(ts.parse_block(report))
         self.assertEqual(result["platforms"], {
-            "nv": {"extra_needed": True, "reason": "python/sglang/srt/x.py changes HiCache"},
-            "amd": {"extra_needed": None, "reason": ""}})  # a non-bool answer counts as not stated
+            "nv": {"extra_needed": True, "reason": "python/sglang/srt/x.py changes HiCache", "next": ""},
+            "amd": {"extra_needed": None, "reason": "", "next": ""}})  # a non-bool answer counts as not stated
 
     def test_a_broken_block_never_shows_its_json(self):
         report = '## CI Status for PR #1\nok\n<!-- test-selection {"nv": {"reason": "a} --> b"}} -->\n'
@@ -89,6 +89,15 @@ class RenderTest(unittest.TestCase):
         self.assertIn("- **AMD**: extra CI needed: **no**. r2", lines)
         self.assertNotIn("/run-extra-ci amd", text)  # no trigger when not needed
         self.assertNotIn("/rerun-test", text)
+
+    def test_next_replaces_the_trigger(self):
+        """Extra that already ran on the PR: the agent's next step, not a second trigger."""
+        text = ts.render(ts.check({"nv": {"extra_needed": True, "reason": "r1",
+                                          "next": "nothing: run 42 already passed"},
+                                   "amd": {"extra_needed": False, "reason": "r2", "next": ""}}))
+        self.assertIn("  - Next: nothing: run 42 already passed", text.splitlines())
+        self.assertNotIn("/run-extra-ci", text)
+        self.assertEqual(text.count("Next:"), 1)  # an empty next adds no line
 
     def test_no_block(self):
         self.assertIn("no readable suggestion", ts.render(ts.check(None)))

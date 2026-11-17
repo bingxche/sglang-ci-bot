@@ -95,14 +95,15 @@ def _text(value, limit: int = 600) -> str:
 
 
 def check(block: dict | None) -> dict:
-    """Per platform: ``extra_needed`` (True / False / None when the agent did not say) and the reason."""
+    """Per platform: ``extra_needed`` (True / False / None when the agent did not say), the reason,
+    and ``next``, the action left for the author (empty when the agent gave none)."""
     platforms = {}
     for key in PLATFORMS:
         raw = block.get(key) if isinstance(block, dict) else None
         raw = raw if isinstance(raw, dict) else {}
         extra = raw.get("extra_needed")
         platforms[key] = {"extra_needed": extra if isinstance(extra, bool) else None,
-                          "reason": _text(raw.get("reason"))}
+                          "reason": _text(raw.get("reason")), "next": _text(raw.get("next"))}
     return {"valid": block is not None, "platforms": platforms}
 
 
@@ -116,7 +117,11 @@ def render(result: dict) -> str:
             sel = result["platforms"][key]
             need = {True: "yes", False: "no", None: "not stated"}[sel["extra_needed"]]
             lines.append(f"- **{name}**: extra CI needed: **{need}**. {sel['reason']}".rstrip())
-            if sel["extra_needed"]:
+            # The agent checked whether extra already ran (labels, extra runs); without its
+            # answer, fall back to the trigger.
+            if sel["next"]:
+                lines.append(f"  - Next: {sel['next']}")
+            elif sel["extra_needed"]:
                 lines.append(f"  - To run it, comment `{trigger}`.")
         lines.append("")
     lines.append(f"> {DISCLAIMER}")
