@@ -39,23 +39,22 @@ Secondary, briefly: if upstream stages failed and later jobs were skipped, say P
 
 **Replays.** When the prompt has an `As of:` time, judge with what existed then. Do not read PR comments, reviews, commits, workflow runs or other PRs created after it (on this PR or on `main`); filter `gh` queries by date.
 
-### Does this PR need extra CI?
+### Extra CI: what is left to do?
 
-Base CI does not cover every path a PR touches: the tests of features off the default path run only in the **extra** tier, which a PR runs only on request. Besides attributing failures, say for NVIDIA and for AMD whether this PR should run extra CI. Decide with sglang's own rules, copied from sglang `main` into `.ci-context/sglang-skills/`:
+Base CI does not cover every path a PR touches: the tests of features off the default path run only in the **extra** tier, which a PR runs only on request. For NVIDIA and for AMD, tell the author what, if anything, they still have to do about extra CI before merge. Two questions decide it; answer both from evidence, not from the diff alone.
 
-- `write-sglang-test.md`, "Choosing a Tier": what belongs in extra (features with real users that are off the default path, the current flagship models, important accuracy gates);
-- `rerun-test.md`, "Pick the tests": which tests exercise a change (the modules, functions and server flags it touches, one end-to-end test per touched subsystem). Grep `test/registered/` for them and look at their registration (`stage="extra-…"` / `suite="extra-…"` is extra).
+1. **Does the change need extra-tier coverage?** It does when the changed code is exercised by extra-tier tests and not by base CI. sglang's own rules, copied from `main` into `.ci-context/sglang-skills/`, say what goes where: `write-sglang-test.md` ("Choosing a Tier"; tests register on AMD only for ROCm-specific paths) and `rerun-test.md` ("Pick the tests"). Find the tests that really run the changed code (registration `stage="extra-…"` / `suite="extra-…"` is extra), and check what they run: a test that never sets a new flag only covers the old path, and a path changed only as a pass-through carries little risk. Docs-only and CPU-only changes need none.
+2. **Has that coverage already happened?** The PR may already carry a `run-ci-nv-extra` / `run-ci-amd-extra` label or a `/run-extra-ci` comment, and the extra workflows (`pr-test-extra.yml`, `pr-test-amd-extra.yml`) may have run on this head or an earlier one. Look, and for the jobs that run the tests from question 1, see whether they passed, failed, are still running, or were cancelled, and on which commit. A pass on an earlier head counts only if nothing in between touches the changed paths.
 
-Extra is needed when the change reaches code that those extra tests exercise and base CI does not. AMD needs it only when the change reaches a ROCm-specific path (`is_hip()`, aiter, `amd/` or `rocm` code, HIP kernels, AMD CI files); `write-sglang-test.md` registers tests on AMD only in that case. Docs-only and CPU-only changes need no extra.
-
-The reason is one sentence that names the changed paths (`python/sglang/srt/…`) and, when extra is needed, the feature its extra tests cover. Do not list test files or commands.
+`extra_needed` is the answer to question 1 alone, judged from the code: a label someone already added is not evidence the change needs it. `next` is the one action left for the author, with a link when one exists: run it (`/run-extra-ci nv` or `/run-extra-ci amd`), wait for a named run, look at a failed job, or nothing because a named run already covered it. `reason` is one sentence naming the changed paths (`python/sglang/srt/…`) and, when extra is needed, the feature its extra tests cover. Name at most the one or two tests that matter; no file lists.
 
 Do not write a visible section for this. After the verdict block, end the report with one hidden block; the harness renders it:
 
 ```
 <!-- test-selection
-{"nv": {"extra_needed": true, "reason": "python/sglang/srt/mem_cache/hiradix_cache.py changes HiCache write-back, which only the extra-tier HiCache tests exercise"},
- "amd": {"extra_needed": false, "reason": "no ROCm-specific path changed"}}
+{"nv": {"extra_needed": true, "reason": "python/sglang/srt/mem_cache/hiradix_cache.py changes HiCache write-back, which only the extra-tier HiCache tests exercise",
+        "next": "nothing: the HiCache extra shard already passed on this head (https://github.com/sgl-project/sglang/actions/runs/…/job/…)"},
+ "amd": {"extra_needed": false, "reason": "no ROCm-specific path changed", "next": ""}}
 -->
 ```
 
