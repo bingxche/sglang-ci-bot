@@ -744,6 +744,7 @@ _KIND_ORDER = {"broken": 0, "flaky": 1, "new": 2}
 CI_FAILURE_MONITOR_URL = (
     "https://github.com/sgl-project/sglang/actions/workflows/ci-failure-monitor.yml"
 )
+NIGHTLY_DASHBOARD_URL = "https://amdsgl.github.io/sglang-ci/nightly-ci/"
 
 
 def _state_blob(state: dict) -> str:
@@ -799,6 +800,8 @@ def render_body(
         "(stack traces, suspected commits, in-flight fixes)",
         f"- **[CI Failure Monitor]({CI_FAILURE_MONITOR_URL})** - sglang's own "
         "failure-streak report across backends",
+        f"- **[Nightly CI dashboard]({NIGHTLY_DASHBOARD_URL})** - AMD nightly CI "
+        "results and trends",
         "",
         "---",
         "",
