@@ -314,6 +314,7 @@ class RenderTest(unittest.TestCase):
                       "2 no longer failing", body)
         self.assertIn(f"- **[Daily report]({DAILY})**", body)
         self.assertIn(f"- **[CI Failure Monitor]({ft.CI_FAILURE_MONITOR_URL})**", body)
+        self.assertIn(f"- **[Nightly CI dashboard]({ft.NIGHTLY_DASHBOARD_URL})**", body)
         self.assertIn("| Fix PR (from AI analysis, may be wrong) |", body)
         self.assertNotIn("| ID |", body)
 
