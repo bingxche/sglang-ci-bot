@@ -41,7 +41,7 @@ Three more things the picture does not show:
 | Feature | Trigger | Workflow → script | Agent tasks | Writes to |
 |---|---|---|---|---|
 | [CI monitor and daily report](#51-ci-monitor-and-the-daily-report) | runner-1, hourly | [`ci-monitor.yml`](.github/workflows/ci-monitor.yml) → [`monitor_ci.py`](scripts/monitor_ci.py), [`daily_cross_workflow_summary.py`](scripts/daily_cross_workflow_summary.py), [`order_daily_comments.py`](scripts/order_daily_comments.py), [`runner_health.py`](scripts/runner_health.py), [`auto_rerun.py`](scripts/auto_rerun.py) | Job Failure Analysis, Cross-Job Summary, Cross-Run Pattern Analysis, Daily Cross-Workflow Summary | Daily issue in this repo |
-| [Suspect PR comments](#52-suspect-pr-comments) | `finalize` job of the CI monitor | [`suspect_pr_comments.py`](scripts/suspect_pr_comments.py) | — | Comments on merged sglang PRs; a log comment on the daily issue |
+| [Suspect PR comments](#52-suspect-pr-comments) | `finalize` job of the CI monitor | [`suspect_pr_comments.py`](scripts/suspect_pr_comments.py) | — | Comments on merged sglang and radixark/miles PRs; a log comment on the daily issue |
 | [Failure Trackers](#53-failure-trackers) | `finalize` job of the CI monitor | [`failure_tracker.py`](scripts/failure_tracker.py) | Failure Tracker Data | One issue per tracked workflow on sgl-project/sglang |
 | [PR commands](#54-pr-commands-the-comment-watcher) | `@amd-bot …` on a sglang PR | runner-1 daemon + [`comment-watcher.yml`](.github/workflows/comment-watcher.yml) → [`watch_comments.py`](scripts/watch_comments.py) | — | Dispatches the two workflows below; help replies |
 | [PR review](#55-pr-review) | `@amd-bot review` | [`pr-review.yml`](.github/workflows/pr-review.yml) → [`review_pr.py`](scripts/review_pr.py) | PR Code Review | One comment on the sglang PR |
@@ -255,8 +255,8 @@ Each agent works in an isolated worktree of a shared sglang clone ([`ensure_sgla
 - **The report date is pinned when a run starts**, so an agent that runs past midnight cannot write into the next day's issue.
 - **Analyses are kept for 4 days** (`STATE_DAYS_KEPT`), longer than the oldest run in view. A job of a long run that appears in a new day's report is therefore copied from the cache, not analysed again.
 - **GitHub reads are retried.** A 5xx, a connection error or a response body cut off mid-transfer from the GitHub API is retried 3 times, after 5, 15 and 45 s ([`gh_get()`](scripts/utils.py)), so a transient 502 no longer fails a whole monitor job. Every read through `gh_get()` has a timeout (`GH_TIMEOUT`: 10 s to connect, 120 s between chunks, so a large job log still downloads) unless the caller sets its own; without one, a stalled connection hung a CI-status check for 2.5 hours on 2026-11-12. Any other `requests` call in `scripts/`, a write included, must pass its own `timeout` (writes use `GH_TIMEOUT`); a unit test checks. Writes are not retried: a write that seemed to fail may have succeeded, and a retry would post a duplicate.
-- **Miles workflows** test radixark/miles images. They appear in the report and summary, but not in the Failure Trackers; their failures are radixark/miles' to triage. radixark/miles' own scheduled PR test, `radixark/miles/pr-test-rocm.yml`, is another repo's workflow (next point): its agents work in the radixark/miles clone the Miles workflows use, at the run's commit.
-- **Other repos' workflows** are named `owner/repo/<file>`, e.g. `sgl-project/sgl-amd-mono/nightly-amd.yml` or `radixark/miles/pr-test-rocm.yml` ([`workflow_repo()`](scripts/utils.py)); sglang's go by their file name alone. Their runs, jobs and logs are read from that repo, and their agents work in a full clone of it at the run's commit ([`ensure_source_repo()`](scripts/utils.py)), with a `Repo:` line in the prompt that the Ground Rules turn into that repo's links. Like Miles, they appear in the report, the summary and Runner health, but not in the Failure Trackers or Suspect PR comments.
+- **Miles workflows** test radixark/miles images. They appear in the report and summary, but not in the Failure Trackers; their failures are radixark/miles' to triage, and a merged radixark/miles PR the summary blames gets a Suspect PR comment (5.2). radixark/miles' own scheduled PR test, `radixark/miles/pr-test-rocm.yml`, is another repo's workflow (next point): its agents work in the radixark/miles clone the Miles workflows use, at the run's commit.
+- **Other repos' workflows** are named `owner/repo/<file>`, e.g. `sgl-project/sgl-amd-mono/nightly-amd.yml` or `radixark/miles/pr-test-rocm.yml` ([`workflow_repo()`](scripts/utils.py)); sglang's go by their file name alone. Their runs, jobs and logs are read from that repo, and their agents work in a full clone of it at the run's commit ([`ensure_source_repo()`](scripts/utils.py)), with a `Repo:` line in the prompt that the Ground Rules turn into that repo's links. Like Miles, they appear in the report, the summary and Runner health, but not in the Failure Trackers. Only radixark/miles PRs, of these repos, get Suspect PR comments.
 
 #### Auto-rerun
 
@@ -282,13 +282,13 @@ Each decision is kept in the monitor state under `auto_rerun`, keyed `<run_id>:<
 
 ### 5.2 Suspect PR comments
 
-**Purpose.** When the daily summary attributes a failure cluster to a merged sglang PR, tell that PR's author on the PR.
+**Purpose.** When the daily summary attributes a failure cluster to a merged sglang or radixark/miles PR, tell that PR's author on the PR. The agent's `suspect-prs` entry names the repo (`"repo": "radixark/miles"`; sglang when left out), and every lookup, link and comment below is in that repo.
 
 **Flow** ([`suspect_pr_comments.py`](scripts/suspect_pr_comments.py), every tick, in `finalize`):
 
 1. **Code checks** ([`check_suspect()`](scripts/suspect_pr_comments.py)), in order. A suspect is dropped at the first check it fails:
    - confidence is `FACT` or `HIGH`;
-   - the cluster has at least 2 failed jobs of sglang's own workflows (another repo's jobs, such as sgl-amd-mono's, do not count);
+   - the cluster has at least 2 failed jobs of sglang's own workflows (another repo's jobs, such as sgl-amd-mono's, do not count); for a radixark/miles PR, of the Miles workflows: `radixark/miles/pr-test-rocm.yml` and sglang's `nightly-test-amd-miles-*` / `release-docker-amd-miles-*` ([`counts_for()`](scripts/suspect_pr_comments.py));
    - the last-passing and first-failing commits are given;
    - the PR was merged within 14 days, and the cited commit is the PR's;
    - the compare API puts the commit inside the window;
@@ -298,7 +298,7 @@ Each decision is kept in the monitor state under `auto_rerun`, keyed `<run_id>:<
    - **Who is mentioned** ([`pr_people()`](scripts/suspect_pr_comments.py)): the PR's author, then a `cc` line naming, with their role, whoever merged the PR, the authors of its commits and of `Co-authored-by` trailers with a GitHub noreply address, and everyone who submitted a review. Bots (account type `Bot`, `[bot]` logins, AI-tool trailers) are dropped, and the cc stops at 6 people. Mentions inside the agent's evidence stay neutralized.
 3. **Log**: one comment on the daily issue records every decision and why.
 
-**Modes**, set by the repository variable `SUSPECT_PR_COMMENTS`: `dry-run` (the default: nothing is posted upstream, only the log), `post`, or `off`.
+**Modes**, set by the repository variable `SUSPECT_PR_COMMENTS`: `dry-run` (the default: nothing is posted upstream, only the log), `post`, or `off`. radixark/miles PRs also need `SUSPECT_PR_COMMENTS_MILES` (same values, `dry-run` by default, R2): until it is `post`, their comments only appear in the log, as "would comment".
 
 ### 5.3 Failure Trackers
 
@@ -491,6 +491,7 @@ Settings → Secrets and variables → Actions.
 |---|---|
 | `USE_AGENT` | `true`: agent mode for review and CI status (API mode otherwise) |
 | `SUSPECT_PR_COMMENTS` | `dry-run` (default), `post`, `off` |
+| `SUSPECT_PR_COMMENTS_MILES` | The same for radixark/miles PRs: `dry-run` (default), `post`, `off` |
 | `AUTO_RERUN` | `on` (default when unset), `dry-run`, `off`. See [Auto-rerun](#auto-rerun) |
 | `AUTOFIX_MODE` | CI autofix's switch: `off` (default, also when unset), `live` |
 | `AUTOFIX_MAX_PER_HOUR` | Optional: problems CI autofix may start per hour (default 3) |
@@ -627,7 +628,7 @@ Agent mode is the default everywhere; `--no-use-agent` (or `USE_AGENT=false`) se
 | `BUILD_DAILY_SUMMARY` | `monitor_ci.py` | `false` skips the summary refresh (legacy alias `BUILD_DAILY_BOARD`) |
 | `MILES_CAUSE_FIX_URL` | Miles analyses | The sglang-ci dashboard's Miles cause/fix payload (default `https://rocm.github.io/sglang-ci/api/miles/cause-fix.json`) |
 | `TRACKER_AGENT_TIMEOUT_SECS` / `TRACKER_AGENT_MAX_TURNS` | `failure_tracker.py` | Tracker extraction budget (1800 s, 80 turns) |
-| `SUSPECT_PR_COMMENTS` | `suspect_pr_comments.py` | Mode: `dry-run`, `post` or `off` |
+| `SUSPECT_PR_COMMENTS` / `SUSPECT_PR_COMMENTS_MILES` | `suspect_pr_comments.py` | Mode: `dry-run`, `post` or `off`; the second for radixark/miles PRs |
 | `AUTOFIX_MODE` / `AUTOFIX_MAX_PER_HOUR` | `autofix_config.py` | The switch, `off` (default) or `live`; problems started per hour (3) |
 | `AUTOFIX_TOKEN` | `autofix.py` (publish job) | bingxche's PAT for branches, dispatches and draft PRs on sglang; the workflow passes the runners' `GH_PAT` |
 | `AUTOFIX_AGENT_TIMEOUT_SECS` / `AUTOFIX_AGENT_MAX_TURNS` | `autofix_config.py` | Fix agent budget (7200 s, 400 turns; effort max is slow) |

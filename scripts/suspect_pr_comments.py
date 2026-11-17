@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comment on merged sglang PRs that today's report ties to an AMD CI break.
+"""Comment on merged sglang and Miles PRs that today's report ties to an AMD CI break.
 
 The Daily Cross-Workflow Summary agent ends its report with a
 ``suspect-prs`` block naming, per cluster, the merged PR it thinks caused
@@ -10,9 +10,12 @@ code whether each suspect is solid enough to tell the PR's author:
 
   - confidence is ``FACT`` or ``HIGH``
   - the cluster has at least ``MIN_FAILED_JOBS`` failed jobs of sglang's own
-    workflows (a job of another repo's, such as sgl-amd-mono's, does not count)
+    workflows (a job of another repo's, such as sgl-amd-mono's, does not count);
+    for a radixark/miles PR, of the Miles workflows instead: radixark/miles'
+    own (``pr-test-rocm.yml``) and sglang's that test Miles images
   - the PR is merged, within ``MAX_PR_AGE_DAYS``, and the cited commit is
-    the PR's
+    the PR's (a suspect's ``repo`` says which repo the PR, its commits and its
+    fix PR are in: sglang, or radixark/miles)
   - the commit lies between the last passing and the first failing commit
     the agent cited (checked with the compare API)
   - the PR has no suspect-PR comment yet, for any cluster: cluster IDs are
@@ -35,6 +38,11 @@ Modes (``--mode`` / ``SUSPECT_PR_COMMENTS``):
     posted, and why the rest was skipped, in one comment on the daily issue
   - ``post``: also post on the PR, at most ``MAX_POSTS_PER_RUN`` per tick
   - ``off``: do nothing
+
+radixark/miles PRs have their own switch (``--miles-mode`` /
+``SUSPECT_PR_COMMENTS_MILES``, ``dry-run`` by default), so the bot's first
+comments in that repo are reviewed in the log before any is posted. It only
+narrows the main mode: with ``SUSPECT_PR_COMMENTS=dry-run`` nothing is posted.
 """
 
 import argparse
@@ -59,7 +67,16 @@ from daily_cross_workflow_summary import (
     parse_suspect_prs_comment,
 )
 from monitor_ci import find_daily_issue, get_issue_comments
-from utils import REPO, get_issue, gh_get, gh_headers, post_comment, update_comment
+from utils import (
+    MILES_REPO,
+    MILES_WORKFLOWS,
+    REPO,
+    get_issue,
+    gh_get,
+    gh_headers,
+    post_comment,
+    update_comment,
+)
 
 log = logging.getLogger("suspect-prs")
 
@@ -96,12 +113,22 @@ def fix_marker(fix_pr: int) -> str:
     return _FIX_MARKER.format(fix_pr=fix_pr)
 
 
-def _pr_url(pr: int) -> str:
-    return f"https://github.com/{REPO}/pull/{pr}"
+def _pr_url(pr: int, repo: str = REPO) -> str:
+    return f"https://github.com/{repo}/pull/{pr}"
 
 
-def _commit_link(sha: str) -> str:
-    return f"[`{sha[:8]}`](https://github.com/{REPO}/commit/{sha})"
+def _pr_ref(pr: int, repo: str = REPO) -> str:
+    """``#123`` for sglang; another repo's PR is always repo-qualified."""
+    return f"#{pr}" if repo == REPO else f"{repo}#{pr}"
+
+
+def _commit_link(sha: str, repo: str = REPO) -> str:
+    return f"[`{sha[:8]}`](https://github.com/{repo}/commit/{sha})"
+
+
+def suspect_repo(suspect: dict) -> str:
+    """The repo of the suspect PR (entries written before Miles have none: sglang)."""
+    return suspect.get("repo") or REPO
 
 
 def neutralize_mentions(text: str) -> str:
@@ -114,13 +141,14 @@ def neutralize_mentions(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 class GitHub:
-    def __init__(self, token: str):
+    def __init__(self, token: str, repo: str = REPO):
         self.token = token
+        self.repo = repo
         self._comments: dict[int, list[dict]] = {}
 
     def _get(self, path: str) -> dict | list | None:
         resp = gh_get(
-            f"https://api.github.com/repos/{REPO}/{path}", headers=gh_headers(self.token),
+            f"https://api.github.com/repos/{self.repo}/{path}", headers=gh_headers(self.token),
         )
         if resp.status_code in (404, 422):
             return None
@@ -143,7 +171,7 @@ class GitHub:
 
     def pr_comments(self, pr: int) -> list[dict]:
         if pr not in self._comments:
-            self._comments[pr] = get_issue_comments(self.token, REPO, pr)
+            self._comments[pr] = get_issue_comments(self.token, self.repo, pr)
         return self._comments[pr]
 
     def pr_commits(self, pr: int) -> list[dict]:
@@ -252,13 +280,28 @@ def _run_repo(run_url: str) -> str:
     return m.group(1) if m else ""
 
 
+def counts_for(repo: str, info: dict) -> bool:
+    """Whether a failed job counts toward a suspect PR of *repo*.
+
+    An sglang PR counts sglang's own jobs. A radixark/miles PR counts the
+    Miles workflows: radixark/miles' own and sglang's that test Miles images
+    (``workflow``, set by ``run()``). A job not in *job_info* counts as
+    sglang's, as before other repos were monitored.
+    """
+    run_repo = _run_repo(info.get("run_url", "")) or REPO
+    if repo == MILES_REPO:
+        return run_repo == MILES_REPO or info.get("workflow") in MILES_WORKFLOWS
+    return run_repo == repo
+
+
 def check_suspect(
     suspect: dict, jobs: list[int], gh: GitHub, now: datetime,
     job_info: dict[int, dict] | None = None,
 ) -> Decision:
     """Run every check on one suspect; the first failure is the reason.
 
-    *job_info* (job ID -> analysis) tells which jobs ran in another repo.
+    *gh* reads the suspect's repo. *job_info* (job ID -> analysis) tells
+    which jobs ran in another repo, or in a Miles workflow.
     """
     d = Decision(suspect, jobs)
 
@@ -269,13 +312,17 @@ def check_suspect(
     s = suspect
     if s["confidence"] not in POSTABLE_CONFIDENCE:
         return skip(f"confidence {s['confidence']} (needs FACT or HIGH)")
-    # A job not in job_info counts as sglang's, as before other repos were monitored.
-    repos = [_run_repo((job_info or {}).get(j, {}).get("run_url", "")) or REPO for j in jobs]
-    if repos.count(REPO) < MIN_FAILED_JOBS:
-        others = sorted(set(repos) - {REPO})
+    repo = suspect_repo(s)
+    infos = [(job_info or {}).get(j, {}) for j in jobs]
+    counted = sum(counts_for(repo, i) for i in infos)
+    if counted < MIN_FAILED_JOBS:
+        label = "Miles" if repo == MILES_REPO else "sglang"
+        others = sorted({
+            _run_repo(i.get("run_url", "")) or REPO for i in infos if not counts_for(repo, i)
+        })
         where = f"; the others are from {', '.join(others)}" if others else ""
         return skip(
-            f"{repos.count(REPO)} failed sglang job(s) in {s['cluster']} "
+            f"{counted} failed {label} job(s) in {s['cluster']} "
             f"(needs {MIN_FAILED_JOBS}){where}"
         )
     if not s.get("last_pass_sha") or not s.get("first_fail_sha"):
@@ -296,7 +343,7 @@ def check_suspect(
         return skip(f"commit {s['sha'][:8]} not found")
     d.full_sha = full
     if pull.get("merge_commit_sha") != full and s["pr"] not in gh.commit_pulls(full):
-        return skip(f"commit {full[:8]} is not from #{s['pr']}")
+        return skip(f"commit {full[:8]} is not from {_pr_ref(s['pr'], repo)}")
 
     after_pass = gh.compare_status(s["last_pass_sha"], full) == "ahead"
     before_fail = gh.compare_status(full, s["first_fail_sha"]) in ("ahead", "identical")
@@ -341,6 +388,7 @@ def check_suspect(
 def render_pr_comment(d: Decision, job_info: dict[int, dict]) -> str:
     """The comment posted on the suspect PR."""
     s = d.suspect
+    repo = suspect_repo(s)
     # The deliberate mentions: the author, and cc the others who worked on the PR.
     ping = f"@{d.pr_author} " if d.pr_author else ""
     if d.fix:
@@ -362,9 +410,9 @@ def render_pr_comment(d: Decision, job_info: dict[int, dict]) -> str:
     if s.get("evidence"):
         lines += [neutralize_mentions(s["evidence"]), ""]
     window = (
-        f"The last passing run was on {_commit_link(s['last_pass_sha'])} and the first "
-        f"failing run on {_commit_link(s['first_fail_sha'])}; this PR's commit "
-        f"{_commit_link(d.full_sha or s['sha'])} is between them."
+        f"The last passing run was on {_commit_link(s['last_pass_sha'], repo)} and the first "
+        f"failing run on {_commit_link(s['first_fail_sha'], repo)}; this PR's commit "
+        f"{_commit_link(d.full_sha or s['sha'], repo)} is between them."
     )
     if s.get("related_prs"):
         window += " Also involved: " + ", ".join(f"#{n}" for n in s["related_prs"]) + "."
@@ -413,16 +461,24 @@ _RESULT_TEXT = {
 }
 
 
-def render_log_comment(decisions: list[Decision], mode: str, snapshot_utc: str) -> str:
+def render_log_comment(
+    decisions: list[Decision], mode: str, snapshot_utc: str, miles_mode: str = DEFAULT_MODE,
+) -> str:
     """The comment on the daily issue recording every decision."""
     title = "Suspect PR comments" + (" (dry run)" if mode == "dry-run" else "")
     if mode == "dry-run":
         note = (
-            "Nothing is posted on sglang PRs in this mode. Set the repository variable "
+            "Nothing is posted on sglang or Miles PRs in this mode. Set the repository variable "
             "`SUSPECT_PR_COMMENTS=post` to post."
         )
+    elif miles_mode == "post":
+        note = f"Comments are posted on sglang and Miles PRs, at most {MAX_POSTS_PER_RUN} per tick."
     else:
-        note = f"Comments are posted on sglang PRs, at most {MAX_POSTS_PER_RUN} per tick."
+        note = (
+            f"Comments are posted on sglang PRs, at most {MAX_POSTS_PER_RUN} per tick. "
+            f"radixark/miles PRs are {'left out' if miles_mode == 'off' else 'in dry run'}: "
+            "set the repository variable `SUSPECT_PR_COMMENTS_MILES=post` to post there too."
+        )
     lines = [
         LOG_COMMENT_MARKER,
         f"## {title}",
@@ -447,15 +503,17 @@ def render_log_comment(decisions: list[Decision], mode: str, snapshot_utc: str) 
             result += f" (review request for #{d.fix['number']})"
         if d.comment_url:
             result = f"[{result}]({d.comment_url})"
+        repo = suspect_repo(s)
         lines.append(
-            f"| {s['cluster']} | [#{s['pr']}]({_pr_url(s['pr'])}) | {s['confidence']} "
+            f"| {s['cluster']} | [{_pr_ref(s['pr'], repo)}]({_pr_url(s['pr'], repo)}) "
+            f"| {s['confidence']} "
             f"| {len(d.jobs)} | {result} |"
         )
     for d in decisions:
         if d.body and d.result in ("post", "held"):
             lines += [
                 "",
-                f"<details><summary>Comment for #{d.suspect['pr']} "
+                f"<details><summary>Comment for {_pr_ref(d.suspect['pr'], suspect_repo(d.suspect))} "
                 f"({d.suspect['cluster']})</summary>",
                 "",
                 d.body,
@@ -473,20 +531,25 @@ def decide_all(
     suspects: list[dict],
     clusters: dict[str, list[int]],
     job_info: dict[int, dict],
-    gh: GitHub,
+    gh,
     now: datetime,
 ) -> list[Decision]:
-    """Check every suspect, strongest first; one decision per (PR, cluster)."""
-    seen: set[tuple[int, str]] = set()
+    """Check every suspect, strongest first; one decision per (repo, PR, cluster).
+
+    *gh* is one ``GitHub`` for every suspect, or a callable that returns the
+    one for a repo.
+    """
+    gh_for = gh if callable(gh) else (lambda _repo: gh)
+    seen: set[tuple[str, int, str]] = set()
     decisions: list[Decision] = []
     for s in suspects:
-        key = (s["pr"], s["cluster"])
+        key = (suspect_repo(s), s["pr"], s["cluster"])
         if key in seen:
             continue
         seen.add(key)
         jobs = sorted(clusters.get(s["cluster"]) or [])
         try:
-            d = check_suspect(s, jobs, gh, now, job_info)
+            d = check_suspect(s, jobs, gh_for(suspect_repo(s)), now, job_info)
         except requests.RequestException as exc:
             d = Decision(s, jobs, result="skip", reason=f"GitHub API error ({exc.__class__.__name__})")
         if d.result == "post":
@@ -497,20 +560,27 @@ def decide_all(
         d.result != "post", rank.get(d.suspect["confidence"], 9), -len(d.jobs),
     ))
     # Two clusters naming the same PR in one tick: only the strongest is posted.
-    posting: dict[int, str] = {}
+    posting: dict[tuple[str, int], str] = {}
     for d in decisions:
         if d.result != "post":
             continue
-        pr = d.suspect["pr"]
-        if pr in posting:
-            d.result, d.reason, d.body = "skip", f"#{pr} gets one comment, for {posting[pr]}", ""
+        key = (suspect_repo(d.suspect), d.suspect["pr"])
+        if key in posting:
+            d.result, d.reason, d.body = (
+                "skip", f"{_pr_ref(key[1], key[0])} gets one comment, for {posting[key]}", "",
+            )
         else:
-            posting[pr] = d.suspect["cluster"]
+            posting[key] = d.suspect["cluster"]
     return decisions
 
 
-def apply_decisions(token: str, decisions: list[Decision], post: bool) -> None:
-    """Post the passing decisions (``post``), or only apply the per-tick cap."""
+def apply_decisions(
+    token: str, decisions: list[Decision], post: bool, dry_repos: frozenset[str] = frozenset(),
+) -> None:
+    """Post the passing decisions (``post``), or only apply the per-tick cap.
+
+    A decision for a PR in *dry_repos* is never posted: it stays "would comment".
+    """
     posted = 0
     for d in decisions:
         if d.result != "post":
@@ -518,20 +588,21 @@ def apply_decisions(token: str, decisions: list[Decision], post: bool) -> None:
         if posted >= MAX_POSTS_PER_RUN:
             d.result = "held"
             continue
-        if not post:
+        if not post or suspect_repo(d.suspect) in dry_repos:
             posted += 1
             continue
         if posted:
             time.sleep(1)  # GitHub asks for >= 1s between content writes
+        ref = _pr_ref(d.suspect["pr"], suspect_repo(d.suspect))
         try:
-            comment = post_comment(token, REPO, d.suspect["pr"], d.body)
+            comment = post_comment(token, suspect_repo(d.suspect), d.suspect["pr"], d.body)
         except requests.RequestException as exc:
             d.result, d.reason = "skip", f"post failed ({exc.__class__.__name__})"
-            log.warning("Comment on #%d failed (%s)", d.suspect["pr"], exc)
+            log.warning("Comment on %s failed (%s)", ref, exc)
             continue
         d.result, d.comment_url = "posted", comment.get("html_url", "")
         posted += 1
-        log.info("Commented on #%d for %s: %s", d.suspect["pr"], d.suspect["cluster"], d.comment_url)
+        log.info("Commented on %s for %s: %s", ref, d.suspect["cluster"], d.comment_url)
 
 
 def upsert_log_comment(token: str, bot_repo: str, issue_num: int, body: str, create: bool) -> None:
@@ -544,7 +615,10 @@ def upsert_log_comment(token: str, bot_repo: str, issue_num: int, body: str, cre
         post_comment(token, bot_repo, issue_num, body)
 
 
-def run(token: str, bot_repo: str, mode: str, date_str: str | None = None) -> int:
+def run(
+    token: str, bot_repo: str, mode: str, date_str: str | None = None,
+    miles_mode: str = DEFAULT_MODE,
+) -> int:
     if mode == "off":
         log.info("SUSPECT_PR_COMMENTS=off; nothing to do")
         return 0
@@ -557,20 +631,33 @@ def run(token: str, bot_repo: str, mode: str, date_str: str | None = None) -> in
 
     summary = extract_summary_from_body(get_issue(token, bot_repo, issue_num).get("body", ""))
     suspects = parse_suspect_prs_comment(summary or "")
+    if miles_mode == "off":
+        suspects = [s for s in suspects if suspect_repo(s) != MILES_REPO]
     clusters = parse_job_cluster_comment(summary or "") or {}
     job_info: dict[int, dict] = {}
     if suspects:
-        for jas in collect_workflow_analyses(token, bot_repo, issue_num).values():
+        for wf, jas in collect_workflow_analyses(token, bot_repo, issue_num).items():
             for ja in jas:
-                job_info[ja["job_id"]] = ja
+                # The workflow tells sglang's Miles workflows from its other ones.
+                job_info[ja["job_id"]] = {**ja, "workflow": wf}
 
-    gh = GitHub(token)
-    decisions = decide_all(suspects, clusters, job_info, gh, now)
-    apply_decisions(token, decisions, post=mode == "post")
+    clients: dict[str, GitHub] = {}
+
+    def gh_for(repo: str) -> GitHub:
+        if repo not in clients:
+            clients[repo] = GitHub(token, repo)
+        return clients[repo]
+
+    decisions = decide_all(suspects, clusters, job_info, gh_for, now)
+    dry_repos = frozenset() if miles_mode == "post" else frozenset({MILES_REPO})
+    apply_decisions(token, decisions, post=mode == "post", dry_repos=dry_repos)
     for d in decisions:
-        log.info("%s #%d: %s %s", d.suspect["cluster"], d.suspect["pr"], d.result, d.reason)
+        log.info(
+            "%s %s: %s %s", d.suspect["cluster"],
+            _pr_ref(d.suspect["pr"], suspect_repo(d.suspect)), d.result, d.reason,
+        )
 
-    body = render_log_comment(decisions, mode, now.strftime("%Y-%m-%d %H:%M UTC"))
+    body = render_log_comment(decisions, mode, now.strftime("%Y-%m-%d %H:%M UTC"), miles_mode)
     upsert_log_comment(token, bot_repo, issue_num, body, create=bool(decisions))
     return 0
 
@@ -583,6 +670,12 @@ def main() -> int:
         "--mode", choices=MODES,
         default=(os.environ.get("SUSPECT_PR_COMMENTS") or DEFAULT_MODE).strip().lower(),
         help=f"off / dry-run / post (default: SUSPECT_PR_COMMENTS or {DEFAULT_MODE})",
+    )
+    parser.add_argument(
+        "--miles-mode", choices=MODES,
+        default=(os.environ.get("SUSPECT_PR_COMMENTS_MILES") or DEFAULT_MODE).strip().lower(),
+        help=f"off / dry-run / post for radixark/miles PRs "
+             f"(default: SUSPECT_PR_COMMENTS_MILES or {DEFAULT_MODE})",
     )
     parser.add_argument(
         "--github-token",
@@ -602,7 +695,7 @@ def main() -> int:
     if mode not in MODES:
         log.warning("Unknown SUSPECT_PR_COMMENTS=%r; using %s", mode, DEFAULT_MODE)
         mode = DEFAULT_MODE
-    return run(args.github_token, args.bot_repo, mode, args.date)
+    return run(args.github_token, args.bot_repo, mode, args.date, args.miles_mode)
 
 
 if __name__ == "__main__":

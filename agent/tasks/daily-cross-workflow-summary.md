@@ -148,17 +148,20 @@ End your output with one fenced block, after the footer, that maps every cluster
 
 ### Suspect PRs (REQUIRED)
 
-After the `job-clusters` block, end with a second fenced block listing every cluster whose top hypothesis names a **merged sglang PR**:
+After the `job-clusters` block, end with a second fenced block listing every cluster whose top hypothesis names a **merged sglang or radixark/miles PR**:
 
 ````
 ```json suspect-prs
 [{"cluster": "R281", "pr": 42229, "sha": "956b9a24eecae92f935672224f8a9561135ebc2b", "confidence": "HIGH",
   "evidence": "Imports _check/_hip_lib/_hipcc/_Kernel, which #45112 removed; every gfx950 FP8 block-scale model fails with that ImportError.",
-  "last_pass_sha": "<sha>", "first_fail_sha": "<sha>", "fix_pr": null, "related_prs": [45112]}]
+  "last_pass_sha": "<sha>", "first_fail_sha": "<sha>", "fix_pr": null, "related_prs": [45112]},
+ {"cluster": "R440", "repo": "radixark/miles", "pr": 4053, "sha": "2766ab0ac1", "confidence": "HIGH",
+  "evidence": "<what fails and how it traces to the change>", "last_pass_sha": "<miles sha>", "first_fail_sha": "<miles sha>", "fix_pr": null, "related_prs": []}]
 ```
 ````
 
-- One entry per (cluster, PR). Write `[]` when no cluster's top hypothesis names a merged sglang PR. Leave out aiter, Docker, and infrastructure causes.
+- One entry per (cluster, PR). Write `[]` when no cluster's top hypothesis names a merged sglang or radixark/miles PR. Leave out aiter, Docker, and infrastructure causes.
+- `repo` is `"radixark/miles"` for a radixark/miles PR; leave it out for an sglang PR. For a Miles entry, `sha`, `last_pass_sha`, `first_fail_sha`, `fix_pr` and `related_prs` are all radixark/miles commits and PRs: the miles commits of the last passing and first failing images (or `radixark/miles/pr-test-rocm.yml` runs). A Miles break caused by an sglang change on `sglang-miles` is an sglang entry, and a PR that only added an already-failing test to a suite exposed the failure, it did not cause it: leave it out.
 - `confidence` is the same label as the cluster's **Top hypothesis**. Do not raise it here.
 - `sha` is the commit the PR landed as on `main`. `last_pass_sha` / `first_fail_sha` are the sglang commits of the last completed run where the cluster's tests passed and the first completed run where they failed. Use `null` when you could not establish one. Verify every SHA as the Ground Rules require.
 - `fix_pr` is the open or merged sglang PR that fixes the cluster, if the In-flight Fix Check found one; else `null`.

@@ -188,12 +188,14 @@ jobs:
           BOT_REPO: ${{ github.repository }}
         run: python scripts/runner_health.py --output daily-issue
 
-      # dry-run unless the SUSPECT_PR_COMMENTS repository variable is "post".
+      # dry-run unless the SUSPECT_PR_COMMENTS repository variable is "post";
+      # radixark/miles PRs also need SUSPECT_PR_COMMENTS_MILES to be "post".
       - name: Comment on suspect PRs
         continue-on-error: true
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           SUSPECT_PR_COMMENTS: ${{ vars.SUSPECT_PR_COMMENTS || 'dry-run' }}
+          SUSPECT_PR_COMMENTS_MILES: ${{ vars.SUSPECT_PR_COMMENTS_MILES || 'dry-run' }}
         run: python scripts/suspect_pr_comments.py --bot-repo ${{ github.repository }}
 
       - name: Update upstream Failure Trackers
