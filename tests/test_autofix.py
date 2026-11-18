@@ -883,6 +883,18 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(why, "")
         self.assertEqual((plan["last_pass"]["date"], plan["stalled_fix_prs"]), ("2026-11-02", [48701]))
 
+    def test_a_weekly_lane_finds_its_previous_runs(self):
+        # sgl-project/sglang#49774: rocm720 runs once a week among 15 other PR Test runs.
+        r10, r720 = SMALL, SMALL.replace("rocm10", "rocm720")
+        start = datetime(2026, 11, 8, 4, tzinfo=timezone.utc)
+        runs = []
+        for i in range(33):
+            at = (start - timedelta(hours=10.5 * i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            runs.append((at, {r720: i == 32} if i % 16 == 0 else {r10: True}))
+        plan, why = self.build(problem(job={"job_name": r720}), TimelineGitHub(runs))
+        self.assertEqual(why, "")
+        self.assertEqual((plan["failing_runs"], plan["last_pass"]["at"]), (2, runs[32][0]))
+
     def test_gpu_memory_is_infrastructure_only_for_the_jobs_first_file(self):
         busy = problem(job={"analysis": problem().jobs[0]["analysis"].replace(
             "AttributeError: no attribute 'layer_router'", "RuntimeError: The memory capacity is unbalanced.")})

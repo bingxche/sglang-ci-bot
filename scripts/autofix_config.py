@@ -33,10 +33,14 @@ REVIEW_MAX_TURNS = int(os.environ.get("AUTOFIX_REVIEW_MAX_TURNS", "150"))
 DISPATCH_TIMEOUT_HOURS = 24
 # Crusoe has no queue to wait in: a run not done by then goes to the ARC fallback.
 SPUR_TIMEOUT_HOURS = 6
-# Scheduled runs read back per job when checking that a failure is not flaky, and how
-# many of the workflow's latest scheduled runs are looked through to find them.
+# Scheduled runs read back per job when checking that a failure is not flaky
+# (HISTORY_RUNS), how many runs of the job itself are looked through to find them
+# (HISTORY_SCAN), and how many of the workflow's latest scheduled runs that may take at
+# most (HISTORY_SCAN_RUNS, one API page). PR Test (AMD) runs 16 times a week but each
+# ROCm 7.2 lane only once (sgl-project/sglang#49774): 50 runs hold three of a 7.2 lane.
 HISTORY_RUNS = 6
 HISTORY_SCAN = 15
+HISTORY_SCAN_RUNS = 50
 # Open PRs whose files are scanned for the test file, newest first.
 MAX_OPEN_PRS_SCANNED = 300
 # A fix PR that was already open while the test still passed, and has stayed open this long,

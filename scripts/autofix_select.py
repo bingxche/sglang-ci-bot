@@ -35,6 +35,7 @@ from autofix_config import (
     FIX_PR_STALE_HOURS,
     HISTORY_RUNS,
     HISTORY_SCAN,
+    HISTORY_SCAN_RUNS,
     NOT_FIXED,
     SPUR_GPU,
 )
@@ -380,7 +381,9 @@ def job_history(gh: GitHub, workflow: str, j: dict, job_tests: list) -> list[tup
     a fix PR is stalled only if it was open while the test still passed, which needs that pass.
     """
     statuses: list[tuple[str, dict]] = []
-    for run in gh.scheduled_runs(workflow, running=True)[:HISTORY_SCAN]:
+    for run in gh.scheduled_runs(workflow, running=True)[:HISTORY_SCAN_RUNS]:
+        if len(statuses) >= HISTORY_SCAN:
+            break
         status, match = run_status(gh, gh.jobs(run["id"]), j, job_tests, read_logs=len(statuses) < HISTORY_RUNS)
         if not status:
             continue  # no job of this run ran the tests: it says nothing
