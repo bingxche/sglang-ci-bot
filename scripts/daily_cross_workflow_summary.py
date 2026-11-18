@@ -71,6 +71,8 @@ from utils import (
     claude_code_available,
     create_anthropic_client,
     delete_comment,
+    MILES_REPO,
+    REPO,
     ensure_sglang_repo,
     get_issue,
     load_prompt_template,
@@ -634,7 +636,8 @@ def attach_job_cluster_map(report: str, wf_analyses: dict[str, list[dict]]) -> s
 # ---------------------------------------------------------------------------
 
 # The agent also ends its report with a fenced ```json suspect-prs``` block:
-# one entry per cluster it attributes to a merged sglang PR. It is stripped
+# one entry per cluster it attributes to a merged sglang or radixark/miles PR
+# (``repo``, sglang when left out). It is stripped
 # from the rendered summary and kept, validated, as a hidden comment that
 # ``suspect_pr_comments.py`` reads in the ``finalize`` job. Deciding whether
 # to comment on the PR is left to that script's checks, not to the agent.
@@ -646,6 +649,18 @@ _SUSPECT_PRS_BLOCK_RE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 _SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+# The repos whose merged PRs a suspect may name, and the short names the agent may use.
+SUSPECT_REPOS = (REPO, MILES_REPO)
+_SUSPECT_REPO_ALIASES = {"sglang": REPO, "miles": MILES_REPO}
+
+
+def _suspect_repo(value) -> str | None:
+    """The suspect PR's repo: sglang when not given, ``None`` when not one we comment on."""
+    value = str(value or "").strip().strip("`").lower()
+    if not value:
+        return REPO
+    value = _SUSPECT_REPO_ALIASES.get(value, value)
+    return value if value in SUSPECT_REPOS else None
 
 
 def _sha(value) -> str | None:
@@ -669,7 +684,8 @@ def normalize_suspect(entry) -> dict | None:
     pr = _pr_number(entry.get("pr"))
     sha = _sha(entry.get("sha"))
     confidence = str(entry.get("confidence") or "").strip().strip("[]`").upper()
-    if not _CLUSTER_ID_RE.fullmatch(cluster) or not pr or not sha:
+    repo = _suspect_repo(entry.get("repo"))
+    if not _CLUSTER_ID_RE.fullmatch(cluster) or not pr or not sha or not repo:
         return None
     if confidence not in CONFIDENCE_LABELS:
         return None
@@ -679,6 +695,7 @@ def normalize_suspect(entry) -> dict | None:
     related = entry.get("related_prs") if isinstance(entry.get("related_prs"), list) else []
     return {
         "cluster": cluster,
+        "repo": repo,
         "pr": pr,
         "sha": sha,
         "confidence": confidence,

@@ -356,5 +356,114 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(decisions[1].body, "")
 
 
+
+MILES_RUN = "https://github.com/radixark/miles/actions/runs/44000000001"
+SGLANG_RUN = "https://github.com/sgl-project/sglang/actions/runs/44000000002"
+
+
+class MilesSuspectTest(unittest.TestCase):
+    """A suspect PR in radixark/miles: same checks, but counted, read and posted in Miles."""
+
+    def _miles(self, **overrides) -> dict:
+        return _suspect(repo="radixark/miles", pr=4862, cluster="R440", **overrides)
+
+    def test_repo_is_kept_and_defaults_to_sglang(self):
+        self.assertEqual(self._miles()["repo"], "radixark/miles")
+        self.assertEqual(_suspect(repo="miles")["repo"], "radixark/miles")
+        self.assertEqual(_suspect()["repo"], "sgl-project/sglang")
+        # A repo the bot does not comment on drops the entry.
+        self.assertIsNone(_suspect(repo="ROCm/aiter"))
+
+    def test_miles_workflow_jobs_count(self):
+        info = {
+            1: {"run_url": MILES_RUN, "workflow": "radixark/miles/pr-test-rocm.yml"},
+            2: {"run_url": SGLANG_RUN, "workflow": "nightly-test-amd-miles-rocm10.yml"},
+            3: {"run_url": SGLANG_RUN, "workflow": "pr-test-amd.yml"},
+        }
+        d = spc.check_suspect(self._miles(), [1, 2, 3], FakeGitHub(), NOW, info)
+        self.assertEqual((d.result, d.reason), ("post", ""))
+
+    def test_sglang_jobs_do_not_count_for_a_miles_pr(self):
+        info = {
+            1: {"run_url": MILES_RUN, "workflow": "radixark/miles/pr-test-rocm.yml"},
+            2: {"run_url": SGLANG_RUN, "workflow": "pr-test-amd.yml"},
+        }
+        d = spc.check_suspect(self._miles(), [1, 2], FakeGitHub(), NOW, info)
+        self.assertEqual(d.result, "skip")
+        self.assertIn("1 failed Miles job(s) in R440", d.reason)
+        self.assertIn("the others are from sgl-project/sglang", d.reason)
+
+    def test_miles_repo_jobs_do_not_count_for_an_sglang_pr(self):
+        info = {1: {"run_url": MILES_RUN}, 2: {"run_url": MILES_RUN}, 3: {"run_url": SGLANG_RUN}}
+        d = spc.check_suspect(_suspect(), [1, 2, 3], FakeGitHub(), NOW, info)
+        self.assertIn("1 failed sglang job(s)", d.reason)
+
+    def test_comment_and_log_link_miles(self):
+        info = {
+            1: {"run_url": MILES_RUN, "job_name": "stage-c-4-gpu-mi350"},
+            2: {"run_url": MILES_RUN, "job_name": "stage-c-8-gpu-mi350"},
+        }
+        d = spc.check_suspect(self._miles(), [1, 2], FakeGitHub(), NOW, info)
+        body = spc.render_pr_comment(d, info)
+        self.assertIn(f"https://github.com/radixark/miles/commit/{SHA}", body)
+        self.assertIn(f"https://github.com/radixark/miles/commit/{PASS}", body)
+        self.assertNotIn("sgl-project/sglang/commit", body)
+        self.assertIn(f"[stage-c-4-gpu-mi350]({MILES_RUN}/job/1)", body)
+        log_body = spc.render_log_comment([d], "post", "2026-11-17 18:00 UTC")
+        self.assertIn("[radixark/miles#4862](https://github.com/radixark/miles/pull/4862)", log_body)
+
+    def test_each_repo_is_read_and_deduplicated_on_its_own(self):
+        sglang_gh, miles_gh = FakeGitHub(), FakeGitHub()
+        asked = []
+
+        def gh_for(repo):
+            asked.append(repo)
+            return miles_gh if repo == "radixark/miles" else sglang_gh
+
+        # The same PR number in two repos is two PRs: both get their comment.
+        suspects = [_suspect(pr=4862), self._miles()]
+        clusters = {"R281": [1, 2], "R440": [3, 4]}
+        info = {3: {"run_url": MILES_RUN}, 4: {"run_url": MILES_RUN}}
+        decisions = spc.decide_all(suspects, clusters, info, gh_for, NOW)
+        self.assertEqual([d.result for d in decisions], ["post", "post"])
+        self.assertEqual(sorted(set(asked)), ["radixark/miles", "sgl-project/sglang"])
+        self.assertGreater(sglang_gh.calls, 0)
+        self.assertGreater(miles_gh.calls, 0)
+
+    def test_post_goes_to_the_miles_repo(self):
+        info = {1: {"run_url": MILES_RUN}, 2: {"run_url": MILES_RUN}}
+        decisions = spc.decide_all([self._miles()], {"R440": [1, 2]}, info, FakeGitHub(), NOW)
+        posted = []
+        original = spc.post_comment
+        spc.post_comment = lambda token, repo, pr, body: posted.append((repo, pr)) or {"html_url": "u"}
+        try:
+            spc.apply_decisions("token", decisions, post=True)
+        finally:
+            spc.post_comment = original
+        self.assertEqual(posted, [("radixark/miles", 4862)])
+        self.assertEqual(decisions[0].result, "posted")
+
+    def test_miles_dry_run_posts_only_sglang(self):
+        info = {3: {"run_url": MILES_RUN}, 4: {"run_url": MILES_RUN}}
+        suspects = [_suspect(), self._miles()]
+        decisions = spc.decide_all(
+            suspects, {"R281": [1, 2], "R440": [3, 4]}, info, FakeGitHub(), NOW,
+        )
+        posted = []
+        original = spc.post_comment
+        spc.post_comment = lambda token, repo, pr, body: posted.append((repo, pr)) or {"html_url": "u"}
+        try:
+            spc.apply_decisions("token", decisions, post=True, dry_repos=frozenset({"radixark/miles"}))
+        finally:
+            spc.post_comment = original
+        self.assertEqual(posted, [("sgl-project/sglang", 42229)])
+        by_repo = {spc.suspect_repo(d.suspect): d.result for d in decisions}
+        self.assertEqual(by_repo, {"sgl-project/sglang": "posted", "radixark/miles": "post"})
+        log_body = spc.render_log_comment(decisions, "post", "2026-11-17 18:00 UTC", "dry-run")
+        self.assertIn("radixark/miles PRs are in dry run", log_body)
+        self.assertIn("SUSPECT_PR_COMMENTS_MILES=post", log_body)
+        self.assertIn("would comment", log_body)
+
+
 if __name__ == "__main__":
     unittest.main()
