@@ -470,7 +470,7 @@ def fails_for_sure(history: list[str]) -> bool:
 def run_history(histories: list[list[tuple[str, dict]]]) -> list[tuple[str, dict]]:
     """One history out of several jobs' (one per family, e.g. rocm10 and rocm720), newest run first.
 
-    Each family runs only in some scheduled runs (PR Test runs rocm720 once a day), so two
+    Each family runs only in some scheduled runs (PR Test runs rocm720 once a week), so two
     failed runs of any of the problem's jobs make it sure, as long as no later run of another
     passed. A run where its jobs disagree counts as its first status that is not ``failed``.
     """

@@ -25,6 +25,7 @@ from autofix_config import (
     MAX_ARTIFACT_FILE_CHARS,
     MAX_ARTIFACT_FILES,
     MAX_ARTIFACT_TOTAL_CHARS,
+    HISTORY_SCAN_RUNS,
     MAX_OPEN_PRS_SCANNED,
 )
 from utils import (
@@ -91,7 +92,7 @@ class GitHub:
         if key not in self._scheduled:
             status = {} if running else {"status": "completed"}
             data = self._get(f"actions/workflows/{workflow}/runs", event="schedule", branch="main",
-                             per_page=30, **status) or {}
+                             per_page=HISTORY_SCAN_RUNS, **status) or {}
             self._scheduled[key] = data.get("workflow_runs") or []
         return self._scheduled[key]
 
